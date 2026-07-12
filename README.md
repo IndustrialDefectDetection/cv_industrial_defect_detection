@@ -1,0 +1,1 @@
+# cv_industrial_defect_detection
