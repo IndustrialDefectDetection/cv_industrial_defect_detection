@@ -1,0 +1,26 @@
+# Core dependencies
+streamlit>=1.42.0
+pandas>=2.2.0
+numpy>=1.24.0
+plotly>=6.0.0
+python-dotenv>=1.0.0
+reportlab>=4.0.0
+
+# Database generator
+Faker>=22.0.0
+SQLAlchemy>=2.0.0
+
+# Agent framework with direct Anthropic/Claude support
+strands-agents[anthropic]
+strands-agents-tools
+anthropic
+
+# AWS support - keep because your email tool still uses boto3 / SES
+boto3[crt]>=1.41.0
+
+# Optional: keep only if you still use Bedrock AgentCore deployment
+bedrock-agentcore<=0.1.5
+bedrock-agentcore-starter-toolkit==0.1.14
+
+# Optional utility
+uv
