@@ -1,7 +1,9 @@
+import datetime
 import os
 import venv
 from pathlib import Path
 import subprocess
+import hashlib
 
 PROJECT_DIR = Path(__file__).resolve().parent;
 VENV_DIR = PROJECT_DIR / '.venv';
@@ -88,21 +90,8 @@ def prompt_api_key():
             print("Exiting...")
             exit(0)
     return user_key
-def main():
-    os.chdir(PROJECT_DIR);
-    python_venv = get_python_venv();
-    # rename incompaitble venv
-    if VENV_DIR.exists() and not python_venv.exists():
-        print("--Creating virtual environment--");
-        VENV_DIR.rename(VENV_DIR.with_suffix('.venv_backup'))
-    print("--Checking environment--")
-    check_env();
-    # create virtual environment if it doesn't exist
-    if not python_venv.exists():
-        print("--Creating virtual environment--")
-        venv.create(VENV_DIR, with_pip=True);
-    
-    # install requirements
+# Installs requirements from requirements.txt
+def install_requirements(python_venv):
     print("--Installing Requirements--")
     subprocess.run(
         [
@@ -115,6 +104,43 @@ def main():
         ],
         check=True
     );
+    
+def main():
+    os.chdir(PROJECT_DIR);
+    python_venv = get_python_venv();
+    # rename incompaitble venv
+    if VENV_DIR.exists() and not python_venv.exists():
+        print("--Creating virtual environment--");
+        # Timestamps to avoid collisions with previous backups
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        VENV_DIR.rename(VENV_DIR.with_suffix(f'.venv_backup{timestamp}'));
+    print("--Checking environment--")
+    check_env();
+    # create virtual environment if it doesn't exist
+    if not python_venv.exists():
+        print("--Creating virtual environment--")
+        venv.create(VENV_DIR, with_pip=True);
+    
+    #Hashes requirements.txt and checks for changes to avoid unnecessary reinstallation of packages
+    with open (REQUIREMENTS, 'rb') as f:
+        requirements_content = f.read()
+        requirements_hash = hashlib.sha256(requirements_content).hexdigest()
+    hash_file = VENV_DIR / 'requirements_hash.txt'
+    if hash_file.exists():
+        with open(hash_file, 'r+') as f:
+            current_hash = f.read()
+            if current_hash != requirements_hash:
+                print("--Requirements changed, reinstalling packages--")
+                install_requirements(python_venv)
+                f.seek(0)
+                f.write(requirements_hash)
+                f.truncate()
+    else:
+        print("--Installing requirements for the first time--")
+        install_requirements(python_venv)
+        with open(hash_file, 'w') as f:
+            f.write(requirements_hash)
+
    
 
     # run streamlit
