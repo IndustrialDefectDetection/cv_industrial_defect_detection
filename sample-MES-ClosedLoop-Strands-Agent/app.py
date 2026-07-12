@@ -9,7 +9,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import sys
 import os
-import json
+import json 
 import logging
 import time
 from pathlib import Path
@@ -259,6 +259,7 @@ def render_defect_selection():
             "Select Event Type for Analysis:",
             options=[None] + defect_types,
             index=0,
+            disabled=st.session_state.analysis_running,
             format_func=lambda x: "-- Select an Event type --" if x is None else x,
             help="Choose a specific defect type to analyze using the AI agent workflow"
         )
@@ -343,16 +344,17 @@ def render_sidebar_configuration():
         time_option = st.selectbox(
             "Look back Period",
             ["Last 3 days", "Last 7 days", "Last 14 days", "Last 30 days","Last 120 days","Last 180 days","Last 365 days"],
-            index=1  # Default to 7 days
+            index=1,  # Default to 7 days
+            disabled=st.session_state.analysis_running
         )
         days_back = int(time_option.split()[1])
         
         # Analysis scope
         st.subheader("🔍 Reasoning Scope")
-        include_oee = st.checkbox("OEE Performance Analysis", value=False)
-        include_downtime = st.checkbox("Downtime & Stoppages", value=False) 
-        include_changeover = st.checkbox("Batch Changeover Analysis", value=False)
-        include_maintenance = st.checkbox("Maintenance Correlation", value=True)
+        include_oee = st.checkbox("OEE Performance Analysis", value=False, disabled=st.session_state.analysis_running)
+        include_downtime = st.checkbox("Downtime & Stoppages", value=False, disabled=st.session_state.analysis_running)
+        include_changeover = st.checkbox("Batch Changeover Analysis", value=False, disabled=st.session_state.analysis_running)
+        include_maintenance = st.checkbox("Maintenance Correlation", value=True, disabled=st.session_state.analysis_running)
    
         # Defect selection (moved here)
         selected_defect = render_defect_selection()
@@ -529,31 +531,6 @@ def render_main_dashboard():
         with st.expander("Detailed Defect Information", expanded=True):
             render_defect_preview(selected_defect)
         
-        # Check if analysis should be triggered
-        if (st.session_state.get('trigger_analysis') or 
-            (selected_defect and not st.session_state.get('analysis_started'))):
-            
-            if st.session_state.get('trigger_analysis'):
-                st.session_state.trigger_analysis = False
-            
-            # Show analysis in progress
-            st.divider()
-            st.subheader(f"🔄 Analyzing Defect Type: {selected_defect}")
-            
-            # Run the analysis
-            analysis_results = run_defect_analysis(
-                defect_type=selected_defect, 
-                days_back=config['days_back'],
-                include_oee=config['include_oee'],
-                include_downtime=config['include_downtime'],
-                include_changeover=config['include_changeover'],
-                include_maintenance=config['include_maintenance']
-            )
-            
-            if analysis_results:
-                st.success("✅ Analysis completed successfully!")
-                render_analysis_results()
-        
         if "analysis_running" not in st.session_state:
             st.session_state.analysis_running = False
 
@@ -565,7 +542,11 @@ def render_main_dashboard():
 
         if run_clicked and not st.session_state.analysis_running:
             st.session_state.analysis_running = True
+            st.session_state.work_pending = True
+            st.rerun()
 
+        if st.session_state.analysis_running and st.session_state.get("work_pending"):
+            st.session_state.work_pending = False
             try:
                 st.divider()
                 st.subheader(f"🔄 Analyzing Defect Type: {selected_defect}")
@@ -581,10 +562,9 @@ def render_main_dashboard():
 
                 if analysis_results:
                     st.success("✅ Analysis completed successfully!")
-                    render_analysis_results()
-
             finally:
                 st.session_state.analysis_running = False
+                st.rerun()
                                 
         elif st.session_state.analysis_started and st.session_state.current_analysis:
             # Show completed results
