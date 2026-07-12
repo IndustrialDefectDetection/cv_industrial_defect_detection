@@ -328,62 +328,6 @@ class MESAgentManager:
 
     def _init_monitor_tools(self):
         """Initialize Monitor Agent tools - Captures & contextualizes operational data"""
-        @tool
-        def fetch_defect_records(defect_type: str, days_back: int = 7):
-            """Fetch individual defect occurrences for ONE defect type from the
-            Defects table, with timestamps and full context. Returns one row per
-            occurrence: check date/time, severity, quantity, location, recorded
-            root cause, action taken, plus the product, machine, work center,
-            operator, and shift involved. Use this for defect timelines and
-            correlating defect timing against maintenance or downtime events.
-            Newest first, capped at 200 rows."""
-            # Validate inputs (match the house style of the other tools)
-            days_back = int(days_back)
-            if days_back < 0 or days_back > 3650:
-                raise ValueError("days_back must be between 0 and 3650")
-
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
-
-            query = """
-            SELECT
-                qc.Date as CheckDate,
-                d.DefectType,
-                d.Severity,
-                d.Quantity as DefectQuantity,
-                d.Location,
-                d.RootCause,
-                d.ActionTaken,
-                p.Name as ProductName,
-                m.Name as MachineName,
-                wc.Name as WorkCenterName,
-                e.Name as OperatorName,
-                s.Name as ShiftName,
-                wo.OrderID
-            FROM
-                Defects d
-            JOIN
-                QualityControl qc ON d.CheckID = qc.CheckID
-            JOIN
-                WorkOrders wo ON qc.OrderID = wo.OrderID
-            JOIN
-                Products p ON wo.ProductID = p.ProductID
-            JOIN
-                Machines m ON wo.MachineID = m.MachineID
-            JOIN
-                WorkCenters wc ON wo.WorkCenterID = wc.WorkCenterID
-            JOIN
-                Employees e ON wo.EmployeeID = e.EmployeeID
-            JOIN
-                Shifts s ON e.ShiftID = s.ShiftID
-            WHERE
-                d.DefectType = ?
-                AND date(qc.Date) >= ?
-            ORDER BY
-                qc.Date DESC
-            LIMIT 200
-            """
-
-            return self._execute_safe_query(query, (defect_type, cutoff_date))
         
         @tool
         def fetch_oee_metrics(days_back: int = 1):
@@ -611,10 +555,8 @@ class MESAgentManager:
             fetch_downtime_events,
             fetch_historical_patterns,
             fetch_work_orders_context,
-            fetch_operator_logs,
-            fetch_defect_records          
+            fetch_operator_logs
         ]
-        
 
     def _init_analyzer_tools(self):
         """Initialize Analyzer Agent tools - Identifies root causes and performs reasoning"""
@@ -1050,23 +992,6 @@ class MESAgentManager:
         ]
 
     def _init_agents(self):
-        OUTPUT_RULES = """
-
-=== OUTPUT FORMAT RULES (mandatory) ===
-- Maximum 600 words total. Be dense, not decorative.
-- Use exactly these sections and nothing else:
-  1. KEY FINDINGS (max 5 bullet points)
-  2. SUPPORTING DATA (max 1 table, max 10 rows)
-  3. GAPS / MISSING DATA (what you could not determine and why)
-  4. HANDOFF NOTES (max 3 bullets for the next agent)
-- No emoji, no ASCII-art charts, no decorative separators.
-- Report only numbers that appear in tool results. Never compute
-  totals, percentages, correlations, confidence percentages, or
-  dollar amounts yourself. If a number was not returned by a tool,
-  write "not available in data" instead.
-- Express certainty only as HIGH / MEDIUM / LOW with a one-line reason.
-"""
-
         """Initialize the specialized agents"""
         
         # Monitor Agent - Captures & contextualizes data
@@ -1094,7 +1019,7 @@ When analyzing events, always:
 - Correlate events with maintenance schedules
 - Provide comprehensive context for analysis
 
-Focus on capturing complete operational context to enable effective root cause analysis.""" + OUTPUT_RULES
+Focus on capturing complete operational context to enable effective root cause analysis."""
         )
         
         # Analyzer Agent - Identifies root causes and performs reasoning
@@ -1121,10 +1046,10 @@ Your reasoning process should:
 2. Look for statistical correlations and patterns
 3. Consider multiple contributing factors
 4. Differentiate between symptoms and root causes
-5. Rate certainty as HIGH / MEDIUM / LOW based on evidence strength
+5. Provide confidence levels for your analysis
 6. Recommend data-driven solutions
 
-Base every claim on tool-returned data and provide actionable insights for the planning phase."""
+Always quantify impact and provide actionable insights for the planning phase."""
         )
         
         # Planner Agent - Suggests actionable plans and creates PDF reports
