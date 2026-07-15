@@ -1,0 +1,65 @@
+# Ham veri ve ara dosyalar (çok büyük)  
+NEU-DET/
+# runs/ - Bu satır kaldırıldı, eğitim sonuçlarını GitHub'a dahil ediyoruz
+
+# Dataset folders (processed data is included)
+# labels/ - Bu satır kaldırıldı, çünkü işlenmiş labels'lar GitHub'da olmalı
+
+# Model weights (büyük dosyalar - runs/detect/*/weights/*.pt files)
+runs/*/weights/*.pt
+runs/*/weights/*.pth
+*.pth
+*.weights
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights (çok büyük olabilir)
+*.pt
+*.pth
+*.weights
+
+# Logs
+*.log
+*.out
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# System files
+desktop.ini
+/models

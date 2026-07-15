@@ -1,0 +1,16 @@
+stages:
+  preprocess:
+    cmd: python src/data_preprocessing/xml_to_yolo.py --root data/NEU-DET --out data/labels
+    deps:
+      - data/NEU-DET
+      - src/data_preprocessing/xml_to_yolo.py
+    outs:
+      - data/labels
+  train:
+    cmd: python src/training/train.py --data configs/neu_defect.yaml --project runs/detect
+    deps:
+      - configs/neu_defect.yaml
+      - data/labels
+      - src/training/train.py
+    outs:
+      - models

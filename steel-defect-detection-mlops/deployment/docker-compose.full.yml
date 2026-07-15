@@ -1,0 +1,139 @@
+version: "3.8"
+
+services:
+  # ========================================
+  # CORE API SERVICE
+  # ========================================
+  defect-api:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    container_name: steel-defect-api
+    ports:
+      - "8080:8080"
+    environment:
+      - MODEL_PATH=/app/models/best.pt
+      - PYTHONUNBUFFERED=1
+      - PROMETHEUS_ENABLED=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - steel-network
+    volumes:
+      - ../uploads:/app/uploads
+
+  # ========================================
+  # MLFLOW TRACKING SERVER
+  # ========================================
+  mlflow:
+    image: python:3.10-slim
+    container_name: mlflow-server
+    ports:
+      - "5000:5000"
+    volumes:
+      - ../mlruns:/mlruns
+      - ../models:/models
+    command: >
+      sh -c "pip install mlflow boto3 && 
+             mlflow server 
+             --backend-store-uri file:///mlruns 
+             --default-artifact-root file:///models
+             --host 0.0.0.0 
+             --port 5000"
+    restart: unless-stopped
+    networks:
+      - steel-network
+
+  # ========================================
+  # PROMETHEUS (Metrics Collection)
+  # ========================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+    networks:
+      - steel-network
+
+  # ========================================
+  # GRAFANA (Visualization Dashboard)
+  # ========================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../monitoring/grafana-dashboard.yml:/etc/grafana/provisioning/dashboards/dashboard.yml
+    restart: unless-stopped
+    networks:
+      - steel-network
+    depends_on:
+      - prometheus
+
+  # ========================================
+  # NODE EXPORTER (System Metrics)
+  # ========================================
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+    networks:
+      - steel-network
+
+  # ========================================
+  # STREAMLIT WEB UI
+  # ========================================
+  streamlit-ui:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.streamlit
+    container_name: streamlit-ui
+    ports:
+      - "8501:8501"
+    volumes:
+      - ../streamlit_app.py:/app/streamlit_app.py
+      - ../runs:/app/runs
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    networks:
+      - steel-network
+    depends_on:
+      - defect-api
+
+# ========================================
+# NETWORKS
+# ========================================
+networks:
+  steel-network:
+    driver: bridge
+
+# ========================================
+# VOLUMES
+# ========================================
+volumes:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,21 @@
+schema: '2.0'
+stages:
+  preprocess:
+    cmd: python src/data_preprocessing/xml_to_yolo.py --root data/NEU-DET --out 
+      data/labels
+    deps:
+    - path: data/NEU-DET
+      hash: md5
+      md5: 7a6e06218ccbf9bea6f9fc8c387b3927.dir
+      size: 28201919
+      nfiles: 3600
+    - path: src/data_preprocessing/xml_to_yolo.py
+      hash: md5
+      md5: 6933a97073b7ef4658849cc855bb175a
+      size: 9155
+    outs:
+    - path: data/labels
+      hash: md5
+      md5: c211147d5597a198f3363ffa4727130c.dir
+      size: 163371
+      nfiles: 1800

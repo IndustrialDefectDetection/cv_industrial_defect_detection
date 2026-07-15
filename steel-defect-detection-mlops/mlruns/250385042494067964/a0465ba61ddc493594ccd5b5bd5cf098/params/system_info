@@ -1,0 +1,1 @@
+{'cuda_available': False, 'device_count': 0, 'device_name': None, 'total_memory': None, 'pytorch_version': '2.9.0+cpu', 'recommended_device': 'cpu'}

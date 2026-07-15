@@ -1,0 +1,45 @@
+# Prometheus Configuration for Steel Defect Detection Monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: "steel-defect-detection"
+    environment: "production"
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# Rule files
+rule_files:
+  - "alerts.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # FastAPI application metrics
+  - job_name: "steel-defect-api"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["defect-api:8080"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: "steel-defect-api"
+
+  # MLflow metrics
+  - job_name: "mlflow"
+    static_configs:
+      - targets: ["mlflow:5000"]
+
+  # Node exporter (system metrics)
+  - job_name: "node"
+    static_configs:
+      - targets: ["node-exporter:9100"]

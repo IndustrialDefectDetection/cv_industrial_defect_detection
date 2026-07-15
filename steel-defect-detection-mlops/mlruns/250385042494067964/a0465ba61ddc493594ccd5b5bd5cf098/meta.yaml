@@ -1,0 +1,14 @@
+artifact_uri: file:///C:/Users/lenovo/Desktop/Yeni_klasör/projects/steel-defect-detection-mlops/mlruns/250385042494067964/a0465ba61ddc493594ccd5b5bd5cf098/artifacts
+end_time: 1763285731156
+entry_point_name: ''
+experiment_id: '250385042494067964'
+lifecycle_stage: active
+run_id: a0465ba61ddc493594ccd5b5bd5cf098
+run_name: steel_defect_experiment_cpu
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1763285729285
+status: 3
+tags: []
+user_id: lenovo
