@@ -4,6 +4,9 @@ import venv
 from pathlib import Path
 import subprocess
 import hashlib
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+
 
 PROJECT_DIR = Path(__file__).resolve().parent;
 VENV_DIR = PROJECT_DIR / '.venv';
@@ -18,6 +21,33 @@ def get_python_venv():
         # Mac/Linux venv location
         return VENV_DIR / "bin" / "python";
 
+# Validates API Key
+def validate_api_key(api_key):
+    url = "https://api.anthropic.com/v1/models"
+    headers = {
+        "x-api-key": api_key,
+        #Latest version according to Anthropic API documentation. Must be updated if API version changes in the future.
+        "anthropic-version": "2023-06-01"
+    }
+    request = Request(url, headers=headers)
+    try:
+        with urlopen(request) as response:
+            if response.status == 200:
+                return True
+    #Checks if API key is valid
+    except HTTPError as e:
+        print(f"HTTP Error: {e.code} - {e.reason}")
+        if(e.code == 401):
+            print("Invalid API key.")
+            return False
+        else:
+            print("URLError: Unable to verify API key due to connection issues. Please check your internet connection and try again.")
+            return None
+    #Checks connection
+    except URLError as e:
+        print(f"URL Error: {e.reason}")
+        return None
+    
 def check_env():
     if(not ENV.exists()):
         print("Error: .env not found. Creating....")
@@ -33,11 +63,17 @@ def check_env():
         updated_lines = []
         rewrite_env = False
         written_keys = set()
-        if("ANTHROPIC_API_KEY" not in env_vars or not env_vars["ANTHROPIC_API_KEY"].startswith("sk-ant-")):
-            print("Error: ANTHROPIC_API_KEY not found or invalid in .env. Please update the .env file with a valid API key.")
-            rewrite_env = True
-            user_key = prompt_api_key()
-            env_vars["ANTHROPIC_API_KEY"] = user_key
+        validKey = validate_api_key(env_vars.get("ANTHROPIC_API_KEY", ""))
+        if("ANTHROPIC_API_KEY" not in env_vars or not env_vars["ANTHROPIC_API_KEY"].startswith("sk-ant-") or len(env_vars["ANTHROPIC_API_KEY"]) < 20 or not validKey):
+            if(validKey is None):
+                print("Unable to verify API key due to connection issues. Please check your internet connection and try again.")
+                print("Stopping....")
+                exit(0)
+            else:
+                print("Error: ANTHROPIC_API_KEY not found or invalid in .env. Please update the .env file with a valid API key.")
+                rewrite_env = True
+                user_key = prompt_api_key()
+                env_vars["ANTHROPIC_API_KEY"] = user_key
         if("MES_MODEL_ID" not in env_vars):
             env_vars["MES_MODEL_ID"] = "claude-sonnet-4-6"
             rewrite_env = True
@@ -83,12 +119,19 @@ def prompt_api_key():
         print("Exiting...")
         exit(0)
     # Validate API key
-    while(not user_key.startswith("sk-ant-") or len(user_key) < 20):
-        print("Invalid API key. Please try again.")
+    validKey = validate_api_key(user_key)
+    while(not user_key.startswith("sk-ant-") or len(user_key) < 20 or not validKey):
+        if(validKey is None):
+            print("Unable to verify API key due to connection issues. Please check your internet connection and try again.")
+            print("Stopping....")
+            exit(0)
+        else:
+            print("Invalid API key. Please try again.")
         user_key = input("Enter your ANTHROPIC_API_KEY (or type exit to quit): ").strip()
         if(user_key.lower() == "exit"):
             print("Exiting...")
             exit(0)
+        validKey = validate_api_key(user_key)
     return user_key
 # Installs requirements from requirements.txt
 def install_requirements(python_venv):
