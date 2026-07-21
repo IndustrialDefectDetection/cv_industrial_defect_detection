@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 import webbrowser
 import time
+import os
+import signal
 
 #Runs using frontend UI, if needed run startup.py @BACKEND_DIR for streamlit.
 ROOT_DIR = Path(__file__).resolve().parent
@@ -16,7 +18,8 @@ def main():
         str(BACKEND_DIR / "startup.py"),
         "--api"
     ],
-    cwd = BACKEND_DIR
+    cwd = BACKEND_DIR,
+    start_new_session=True
     )
    frontend_process = subprocess.Popen(
       [
@@ -24,11 +27,27 @@ def main():
          "run",
          "dev",
       ],
-      cwd = FRONTEND_DIR
+      cwd = FRONTEND_DIR,
+      start_new_session=True
    )
    #Wait for commands to run before opening browser
    time.sleep(1)
    webbrowser.open("http://localhost:3000")
+   try:
+       while backend_process.poll() is None and frontend_process.poll() is None:
+           time.sleep(1)
+   except KeyboardInterrupt:
+       print("Stopping application...")
+   finally:
+       os.killpg(frontend_process.pid,signal.SIGTERM)
+       os.killpg(backend_process.pid,signal.SIGTERM)
+       frontend_process.wait()
+       backend_process.wait()
+
+       
+       
+
 
 if(__name__ == "__main__"):
    main()
+   
