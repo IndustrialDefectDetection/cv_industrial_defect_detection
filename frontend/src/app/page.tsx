@@ -13,7 +13,7 @@ export default function Home() {
   const hasMessages = messages.length > 0;
   const isLoading = messages[messages.length - 1]?.role === "user";
 
-  function handleSend() {
+  async function handleSend() {
     if(input.trim() !== "") {
       const newMessage: Message = {
         id: messages.length + 1,
@@ -22,13 +22,31 @@ export default function Home() {
       };
       setMessages([...messages, newMessage]);
       setInput("");
-      getResponse(newMessage.text);
+      const response = await getResponse(newMessage.text);
+      const chatResponse: Message = {
+        id: newMessage.id+1,
+        text: response.analysis,
+        role: "assistant"
+      } 
+      setMessages(currentMessages => [...currentMessages,chatResponse])
     }
-    return;
   }
-  function getResponse(userInput: string) {
-
-  }
+  async function getResponse(userInput: string) {
+  const response = await fetch(
+    "http://127.0.0.1:8000/chat/",
+    {
+      method:"POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        "user_input" : userInput
+      })
+    }
+  )
+  const data = await response.json()
+  return data
+}
 
   return (
     <main className="relative flex min-h-screen bg-[radial-gradient(circle_at_15%_12%,_#3b82f62e_0%,_transparent_30%),radial-gradient(circle_at_88%_18%,_#8b5cf62b_0%,_transparent_32%),radial-gradient(circle_at_65%_88%,_#14b8a626_0%,_transparent_36%),linear-gradient(135deg,_#f8fafc_0%,_#e8eef8_50%,_#eef2f7_100%)] text-slate-900">
