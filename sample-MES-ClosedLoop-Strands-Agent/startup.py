@@ -6,6 +6,7 @@ import subprocess
 import hashlib
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+import sys
 
 
 PROJECT_DIR = Path(__file__).resolve().parent;
@@ -149,6 +150,7 @@ def install_requirements(python_venv):
     );
     
 def main():
+    api_mode = "--api" in sys.argv
     os.chdir(PROJECT_DIR);
     python_venv = get_python_venv();
     # rename incompaitble venv
@@ -185,10 +187,24 @@ def main():
             f.write(requirements_hash)
 
    
-
-    # run streamlit
-    print("--Starting Streamlit--")
-    subprocess.run(
+    # Connects to Next.Js frontend or streamlit
+    if(api_mode):
+        #Starts Next.Js
+        print("--Connecting to UI--")
+        subprocess.run(
+        [
+            str(python_venv),
+            "-m",
+            "uvicorn",
+            "api:app",
+            "--reload"
+        ],
+        check=True
+    );
+    else:
+        # run streamlit
+        print("--Starting Streamlit--")
+        subprocess.run(
         [
             str(python_venv),
             "-m",
