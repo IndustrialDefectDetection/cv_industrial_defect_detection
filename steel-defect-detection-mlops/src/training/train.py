@@ -170,6 +170,7 @@ class YOLOv8Trainer:
                 config = yaml.safe_load(f)
                 
             # Check required fields
+            # required_fields = ['train', 'val', 'nc', 'names']
             required_fields = ['train', 'val', 'nc', 'names']
             for field in required_fields:
                 if field not in config:
@@ -177,14 +178,20 @@ class YOLOv8Trainer:
                     return False
                     
             # Check if paths exist
+            '''
             for split in ['train', 'val']:
                 if split in config:
                     path = config[split]
+                    # logger.info(f" Train Path {config[path]}")
+                    print("all paths", path)
                     if not os.path.exists(path):
                         logger.error(f"❌ Dataset path not found: {path}")
                         return False
+
+            '''
                         
             logger.info(f"✅ Dataset config validated: {self.data_config}")
+            logger.info(f"   Train path: {config['train']}, {config['val']}")
             logger.info(f"   Classes: {config['nc']} ({config['names']})")
             logger.info(f"   Train path: {config.get('train', 'N/A')}")
             logger.info(f"   Val path: {config.get('val', 'N/A')}")
@@ -302,12 +309,23 @@ class YOLOv8Trainer:
                 **self.train_params
             )
             
-            # Log completion
-            best_model_path = output_dir / 'weights' / 'best.pt'
-            last_model_path = output_dir / 'weights' / 'last.pt'
+            # Get actual save directory from results (YOLO may use a different path due to auto-incrementing)
+            actual_save_dir = Path(results.save_dir) if hasattr(results, 'save_dir') else output_dir
+            best_model_path = actual_save_dir / 'weights' / 'best.pt'
+            last_model_path = actual_save_dir / 'weights' / 'last.pt'
             
+            # Copy best model to canonical models/ directory for DVC tracking
+            models_dir = Path("models")
+            models_dir.mkdir(parents=True, exist_ok=True)
+            import shutil
+            if best_model_path.exists():
+                shutil.copy2(str(best_model_path), str(models_dir / "best.pt"))
+                logger.info(f"✅ Model copied to: {models_dir / 'best.pt'}")
+            if last_model_path.exists():
+                shutil.copy2(str(last_model_path), str(models_dir / "last.pt"))
+
             logger.info("=== Training Completed Successfully! ===")
-            logger.info(f"✅ Results saved to: {output_dir}")
+            logger.info(f"✅ Results saved to: {actual_save_dir}")
             logger.info(f"✅ Best model: {best_model_path}")
             logger.info(f"✅ Last model: {last_model_path}")
             

@@ -17,6 +17,23 @@ data:
   input_size: 640
   classes: 6
 
+
+
+# Class configuration
+nc: 6 # Number of classes
+names:
+  0: crazing # Surface cracking defects
+  1: inclusion # Foreign material inclusion defects
+  2: patches # Surface patch defects
+  3: pitted_surface # Pitted surface defects
+  4: rolled-in_scale # Rolled-in scale defects
+  5: scratches # Surface scratch defects
+
+
+train: images/train
+val: images/valid
+test: images/test
+
 # Training parameters
 training:
   epochs: 100
