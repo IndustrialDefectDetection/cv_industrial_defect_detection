@@ -76,6 +76,69 @@ def run_pgloader():
         print("Quick fix: Run 'brew install pgloader' on your Mac.")
         return False
 
+def create_contract_tables():
+    """Creates the VisionDetections and AgentAlerts tables (CONTRACTS.md §3) in PostgreSQL."""
+    print("\nCreating CONTRACTS.md §3 tables (VisionDetections, AgentAlerts) in PostgreSQL...")
+
+    try:
+        conn = psycopg2.connect(
+            host=PG_HOST,
+            port=PG_PORT,
+            user=PG_USER,
+            password=PG_PASSWORD,
+            dbname=PG_DBNAME
+        )
+        cursor = conn.cursor()
+
+        queries = [
+            """
+            CREATE TABLE IF NOT EXISTS VisionDetections (
+                DetectionID     SERIAL PRIMARY KEY,
+                Timestamp       TIMESTAMPTZ NOT NULL,
+                MachineID       INTEGER NOT NULL,
+                OrderID         INTEGER,
+                DefectType      TEXT NOT NULL,
+                Confidence      DOUBLE PRECISION NOT NULL,
+                BBox            TEXT,
+                ImageName       TEXT,
+                InferenceTimeMs DOUBLE PRECISION
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS AgentAlerts (
+                AlertID         SERIAL PRIMARY KEY,
+                CreatedAt       TIMESTAMPTZ NOT NULL,
+                MachineID       INTEGER NOT NULL,
+                OrderID         INTEGER,
+                DefectType      TEXT NOT NULL,
+                DetectionCount  INTEGER NOT NULL,
+                WindowStart     TIMESTAMPTZ NOT NULL,
+                WindowEnd       TIMESTAMPTZ NOT NULL,
+                Status          TEXT NOT NULL DEFAULT 'pending',
+                Report          TEXT,
+                CompletedAt     TIMESTAMPTZ
+            );
+            """
+        ]
+
+        for query in queries:
+            cursor.execute(query)
+
+        conn.commit()
+        print("Tables 'VisionDetections' and 'AgentAlerts' successfully created!")
+        return True
+
+    except Exception as e:
+        print(f"Error creating contract tables: {e}")
+        if 'conn' in locals():
+            conn.rollback()
+        return False
+    finally:
+        if 'conn' in locals():
+            cursor.close()
+            conn.close()
+
+
 def add_ml_columns():
     """Connects to the target Postgres DB and safely alters the 'defects' table structure."""
     print("\nAdding live-tracking ML columns to the 'defects' table...")
@@ -113,10 +176,12 @@ def add_ml_columns():
             conn.close()
 
 if __name__ == "__main__":
-    # Step 1: check database
+    # Step 1: Check/PostgreSQL database exists
     if ensure_postgres_db_exists():
-        # Step 2: Stream all the tables and historical data across
+        # Step 2: Stream all SQLite tables and historical data across
         if run_pgloader():
-            # Step 3: Mutate the defects table layout for the live camera values
-            add_ml_columns()
-            print("\nAll steps complete! Your live-tracking database is ready to roll.")
+            # Step 3: Create CONTRACTS.md §3 tables (VisionDetections, AgentAlerts)
+            if create_contract_tables():
+                # Step 4: Mutate the defects table layout for the live camera values
+                add_ml_columns()
+                print("\nAll steps complete! Your live-tracking database is ready to roll.")
