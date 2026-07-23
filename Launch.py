@@ -39,8 +39,14 @@ def main():
    except KeyboardInterrupt:
        print("Stopping application...")
    finally:
-       os.killpg(frontend_process.pid,signal.SIGTERM)
-       os.killpg(backend_process.pid,signal.SIGTERM)
+       try:
+           os.killpg(frontend_process.pid, signal.SIGTERM)
+       except ProcessLookupError:
+           pass
+       try:
+           os.killpg(backend_process.pid, signal.SIGTERM)
+       except ProcessLookupError:
+           pass
        frontend_process.wait()
        backend_process.wait()
 
