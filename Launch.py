@@ -80,6 +80,8 @@ def main():
    #Wait for commands to run before opening browser
    time.sleep(1)
    webbrowser.open("http://localhost:3000")
+   if viewer_process is not None:
+       webbrowser.open("http://localhost:8502")
    try:
        while backend_process.poll() is None and frontend_process.poll() is None:
            time.sleep(1)
