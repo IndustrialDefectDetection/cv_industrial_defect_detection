@@ -79,9 +79,14 @@ def main():
        print("Trace viewer not started: backend venv missing — rerun Launch.py once startup.py has finished installing.")
    #Wait for commands to run before opening browser
    time.sleep(1)
-   webbrowser.open("http://localhost:3000")
+   # One tab only: the dashboard has a chat box built in, so it's the whole
+   # workflow. The Next.js chat still runs at localhost:3000 (printed above)
+   # for anyone who prefers it.
    if viewer_process is not None:
        webbrowser.open("http://localhost:8502")
+   else:
+       webbrowser.open("http://localhost:3000")
+   print("Chat UI (optional): http://localhost:3000")
    try:
        while backend_process.poll() is None and frontend_process.poll() is None:
            time.sleep(1)
