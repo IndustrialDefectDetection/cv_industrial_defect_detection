@@ -87,8 +87,25 @@ def main():
    else:
        webbrowser.open("http://localhost:3000")
    print("Chat UI (optional): http://localhost:3000")
+   # The backend is essential; the two UIs are not. If a UI dies (e.g. `next`
+   # missing because npm install was never run), say so and keep the rest
+   # alive instead of silently tearing everything down.
+   ui_processes = {"Next.js chat (port 3000)": frontend_process}
+   if viewer_process is not None:
+       ui_processes["trace dashboard (port 8502)"] = viewer_process
    try:
-       while backend_process.poll() is None and frontend_process.poll() is None:
+       while True:
+           if backend_process.poll() is not None:
+               print(f"Backend exited (code {backend_process.returncode}) - shutting down.")
+               break
+           for name, process in list(ui_processes.items()):
+               if process.poll() is not None:
+                   print(f"WARNING: {name} exited (code {process.returncode}) - "
+                         "see messages above for why; everything else keeps running.")
+                   del ui_processes[name]
+           if not ui_processes:
+               print("Both UIs have exited - shutting down.")
+               break
            time.sleep(1)
    except KeyboardInterrupt:
        print("Stopping application...")
