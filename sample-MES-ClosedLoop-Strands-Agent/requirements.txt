@@ -6,6 +6,7 @@ plotly>=6.0.0
 python-dotenv>=1.0.0
 reportlab>=4.0.0
 fastapi>=0.100.0
+requests>=2.31.0
 pyarrow==24.0.0
 uvicorn>=0.38.0
 

@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 from strands import Agent, tool
 from strands.models.anthropic import AnthropicModel
 
+from agent_tracer import AgentTracer, attach_tracer
+
 load_dotenv(Path(__file__).parent / ".env")
 
 # PDF generation imports
@@ -48,8 +50,15 @@ logger = setup_logging()
 class MESAgentManager:
     """Manager class for MES agents focused on manufacturing quality analysis"""
     
-    def __init__(self, db_path: str = None, model_id: str = None, region_name: str = None):
+    def __init__(self, db_path: str = None, model_id: str = None, region_name: str = None,
+                 tracer: "AgentTracer" = None):
         """Initialize the MES Agent Manager"""
+
+        # Live trace of the multi-agent run ("under the hood" view). Shared,
+        # thread-safe; the workflow can run in a background thread while a UI
+        # polls it. See agent_tracer.AgentTracer. Concurrent-run guarding is
+        # the caller's job (api.py holds the one-run-at-a-time lock).
+        self.tracer = tracer or AgentTracer()
         
         # Get parameters from environment variables with fallbacks
         if db_path is None:
@@ -90,6 +99,7 @@ class MESAgentManager:
         )
 
         self.region_name = region_name
+        self.model_id = model_id
         
         # Define allowed table names for security
         self.allowed_tables = {
@@ -166,8 +176,11 @@ class MESAgentManager:
             }
             
             logger.info(f"Query executed successfully: {len(df)} rows returned")
+            # Surface the actual SQL that ran onto the live trace ("the code
+            # they're running"), attributed to whichever agent/tool is active.
+            self._trace_query(query, params, result)
             return result
-            
+
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error executing SQL query: {error_msg}")
@@ -176,7 +189,18 @@ class MESAgentManager:
                 "error": error_msg,
                 "execution_time_ms": round((time.time() - start_time) * 1000, 2)
             }
+            self._trace_query(query, params, error_result)
             return error_result
+
+    def _trace_query(self, query: str, params, result: dict):
+        """Push the executed SQL to the tracer, never breaking the query path."""
+        tracer = getattr(self, "tracer", None)
+        if tracer is None:
+            return
+        try:
+            tracer.log_query(query, params, result)
+        except Exception as trace_err:  # tracing must never affect analysis
+            logger.debug(f"Tracer log_query failed: {trace_err}")
     
     def _init_database_tools(self):
         """Initialize core database tools"""
@@ -1152,6 +1176,14 @@ When sending email notifications, it is mandatory to pass PDF filename that is p
 Always focus on clear and concise email body with actionable recommendations, ownership, timeline and risks if not done on time."""
         )
 
+        # Wire the live tracer into every sub-agent so the dashboard can watch
+        # their streamed messages, tool calls and results in real time.
+        attach_tracer(self.monitor_agent, "Monitor", self.tracer)
+        attach_tracer(self.analyzer_agent, "Analyzer", self.tracer)
+        attach_tracer(self.planner_agent, "Planner", self.tracer)
+        attach_tracer(self.verifier_agent, "Verifier", self.tracer)
+        attach_tracer(self.executor_agent, "Executor", self.tracer)
+
     def _init_supervisor_agent(self):
         """Initialize the Supervisor Agent that orchestrates the workflow"""
         
@@ -1235,7 +1267,9 @@ Always return a structured analysis result containing:
 Focus on ensuring each agent receives appropriate context and scope parameters, and that the complete workflow produces actionable, validated insights for manufacturing quality improvement within the specified analysis scope. All email notifications should be handled through the Executor Agent with proper PDF filename passing."""
         )
 
-    def run_defect_analysis(self, defect_type: str, days_back: int = 7, include_oee: bool = True, 
+        attach_tracer(self.supervisor_agent, "Supervisor", self.tracer)
+
+    def run_defect_analysis(self, defect_type: str, days_back: int = 7, include_oee: bool = True,
                            include_downtime: bool = True, include_changeover: bool = True, 
                            include_maintenance: bool = True):
         """Run comprehensive defect analysis using supervisor agent orchestration"""
@@ -1251,9 +1285,16 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
             scope_summary.append("Maintenance Correlation")
         
         scope_text = ", ".join(scope_summary) if scope_summary else "Basic Analysis"
-        
+
         start_time = datetime.now()
-        
+
+        # Open a fresh trace for this run so the dashboard shows only this run.
+        self.tracer.reset()
+        self.tracer.run_start(
+            f"Defect analysis: {defect_type}",
+            params={"defect_type": defect_type, "days_back": days_back, "scope": scope_text},
+        )
+
         try:
             # Create comprehensive prompt for supervisor agent
             supervisor_prompt = f"""
@@ -1342,11 +1383,14 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
                 """,
                 'status': 'completed'
             }
-            
+
+            self.tracer.run_end("completed")
             return analysis_results
-            
+
         except Exception as e:
             logger.error(f"Error in supervisor-orchestrated defect analysis workflow: {e}")
+            self.tracer.error(None, f"{type(e).__name__}: {e}")
+            self.tracer.run_end("failed", error=str(e))
             return {
                 'defect_type': defect_type,
                 'analysis_period': days_back,
