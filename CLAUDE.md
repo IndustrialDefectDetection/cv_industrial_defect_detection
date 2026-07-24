@@ -55,6 +55,7 @@ python startup.py     # bootstraps .venv, installs requirements, creates/validat
 ```
 
 - `startup.py` prompts for and validates `ANTHROPIC_API_KEY` against the Anthropic API; `.env` also carries `MES_MODEL_ID`, `MES_MAX_TOKENS`, `MES_TEMPERATURE`.
+- **`trace_viewer.py` (Streamlit, port 8502) is the project's under-the-hood dashboard** — live per-agent timeline, tool calls, SQL, run stats, session Q&A history. Contract: `TRACE_API.md`. Launched by root `Launch.py` alongside `api.py` (port 8000) + the Next.js frontend, or standalone: `streamlit run trace_viewer.py --server.port 8502`.
 - Has its own `mes.db` copy (distinct from the chatbot repo's) and an in-progress SQLite→PostgreSQL migration (`setupdatabase.py`, needs psycopg2 + pgloader, DB name `mescopy_v1`).
 - Entry UI is `app.py` (Streamlit); agents live in `strands_agent.py`.
 

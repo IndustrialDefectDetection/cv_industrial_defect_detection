@@ -1,6 +1,10 @@
-"""Under-the-hood trace viewer for the MES agent backend.
+"""Under-the-hood trace viewer for the MES agent backend — the project's
+observability dashboard for watching what the agents are doing, live.
 
     streamlit run trace_viewer.py --server.port 8502
+
+(Also launched automatically by the repo-root Launch.py alongside the API and
+the Next.js frontend.)
 
 Talks to the FastAPI backend (api.py, port 8000) purely over HTTP — the same
 three endpoints documented in TRACE_API.md that any other frontend would use:
@@ -23,7 +27,8 @@ import requests
 import streamlit as st
 
 DEFAULT_BASE = "http://127.0.0.1:8000"
-POLL_SECONDS = 0.8
+POLL_RUNNING = 0.8  # trace poll cadence while a run is active
+POLL_IDLE = 2.5  # keep polling when idle so runs from other clients appear
 
 # Streamlit markdown accent color per agent, so the timeline is scannable.
 AGENT_COLORS = {
@@ -227,7 +232,20 @@ st.title("Under the Hood")
 st.caption("Live trace of the Supervisor → Monitor / Analyzer / Planner / Verifier / Executor workflow")
 
 chat = st.session_state.setdefault("chat", {"status": "idle"})
+qa_history = st.session_state.setdefault("qa_history", [])
 chat_running = chat["status"] == "running"
+
+# The supervisor Agent keeps conversation state across /chat/ calls, so past
+# turns matter for reading a run. Record each finished turn exactly once.
+if chat["status"] in ("completed", "failed") and not chat.get("recorded"):
+    chat["recorded"] = True
+    qa_history.append(
+        {
+            "question": chat.get("question", "?"),
+            "status": chat["status"],
+            "answer": chat.get("analysis") or chat.get("detail") or "",
+        }
+    )
 
 with st.form("trigger", clear_on_submit=False):
     question = st.text_input(
@@ -243,74 +261,139 @@ if submitted and question.strip() and not chat_running:
         target=post_chat, args=(base_url, question.strip(), chat), daemon=True
     ).start()
 
+# Earlier turns from this session, collapsed, oldest first.
+for turn in qa_history[:-1]:
+    icon = "💬" if turn["status"] == "completed" else "❌"
+    with st.expander(f"{icon} {turn['question']}", expanded=False):
+        st.markdown(turn["answer"] or "*empty response*")
+
 if chat["status"] == "failed":
     st.error(f"Chat request failed — {chat.get('detail')}")
 elif chat["status"] == "completed":
     with st.expander("💬 Final answer from the supervisor", expanded=False):
         st.markdown(chat.get("analysis") or "*empty response*")
 
-# ---------------------------------------------------------------- run header
-snapshot, trace_err = fetch_json(f"{base_url}/trace?since=0", timeout=5)
-if trace_err:
-    st.error(trace_err)
-    st.stop()
+# --------------------------------------------------------------- trace panel
+# The whole trace view lives in a fragment so live polling reruns only this
+# section — the trigger form above is never disturbed. It polls even when
+# idle (slower cadence), so runs triggered from other clients (the Next.js
+# chat, curl) appear without touching the page. When the active/idle state
+# flips — or the background chat thread finishes — the fragment requests a
+# full rerun to re-arm run_every and refresh the chat section above.
+st.session_state["last_chat_status"] = chat["status"]
+trace_active = st.session_state.setdefault("trace_active", False)
+run_every = (POLL_RUNNING if trace_active else POLL_IDLE) if live else None
 
-run = snapshot.get("run", {})
-current = snapshot.get("current", {})
-events = snapshot.get("events", [])
-run_status = run.get("status", "idle")
 
-cols = st.columns([1, 3, 1])
-with cols[0]:
-    badge = {
-        "idle": ":gray[● idle]",
-        "running": ":blue[● running]",
-        "completed": ":green[● completed]",
-        "failed": ":red[● failed]",
-    }.get(run_status, run_status)
-    st.markdown(f"### {badge}")
-with cols[1]:
-    if run.get("label"):
-        st.markdown(f"**{run['label']}**")
-        st.caption(f"run `{run.get('run_id', '?')}` · started {run.get('started_at', '?')}")
-    if run_status == "running" and current.get("agent"):
-        now_line = current["agent"]
-        if current.get("tool"):
-            now_line += f" → `{current['tool']}`"
-        st.markdown(f"⏳ now: **{now_line}**")
-with cols[2]:
-    if run_status == "running" and run.get("started_ts"):
-        st.metric("elapsed", f"{time.time() - run['started_ts']:.0f}s")
-    elif run.get("duration_ms") is not None:
-        st.metric("duration", f"{run['duration_ms'] / 1000:.1f}s")
+def agent_time_line(events: list[dict]) -> str:
+    """'Supervisor 87s · Monitor 12s · …' from agent_start/agent_end pairs.
 
-# ------------------------------------------------------------------ timeline
-if not events:
-    st.info("No trace yet. Send a message above (or from the chat frontend) to watch the agents work.")
-else:
-    groups, ends_by_id = group_events(events)
-    for i, group in enumerate(groups):
-        color = AGENT_COLORS.get(group["agent"], "gray")
-        tick = " · ✓ done" if group["done"] else ""
-        label = f":{color}[**{group['agent']}**] · {len(group['events'])} events{tick}"
-        with st.expander(label, expanded=True):
-            for event in group["events"]:
-                render_event(event, ends_by_id)
+    An agent invoked several times gets its spans summed; one still running
+    counts up to now and is marked with an ellipsis. The Supervisor's span is
+    roughly the whole run, since the sub-agents work inside its tool calls.
+    """
+    open_starts: dict[str, list[float]] = {}
+    totals: dict[str, float] = {}
+    order: list[str] = []
+    for event in events:
+        agent = event["agent"]
+        if event["kind"] == "agent_start":
+            open_starts.setdefault(agent, []).append(event["ts"])
+            if agent not in order:
+                order.append(agent)
+        elif event["kind"] == "agent_end" and open_starts.get(agent):
+            totals[agent] = totals.get(agent, 0.0) + event["ts"] - open_starts[agent].pop()
+    bits = []
+    for agent in order:
+        running = bool(open_starts.get(agent))
+        if running:
+            totals[agent] = totals.get(agent, 0.0) + time.time() - open_starts[agent][-1]
+        if agent in totals:
+            bits.append(f"{agent} {totals[agent]:.0f}s" + ("…" if running else ""))
+    return " · ".join(bits)
 
-    st.divider()
-    raw = json.dumps({"run": run, "current": current, "events": events}, indent=2, default=str)
-    st.download_button(
-        "⬇️ Download trace JSON (attach to bug reports)",
-        data=raw,
-        file_name=f"trace_{run.get('run_id', 'empty')}.json",
-        mime="application/json",
-        key="download-trace",
-    )
-    with st.expander(f"Raw events ({len(events)})", expanded=False):
-        st.json(events, expanded=False)
 
-# ------------------------------------------------------------------ live loop
-# Plain polling: while a run is active, sleep briefly and rerun the script.
-if live and (run_status == "running" or chat["status"] == "running"):
-    time.sleep(POLL_SECONDS)
-    st.rerun()
+@st.fragment(run_every=run_every)
+def trace_section() -> None:
+    snapshot, trace_err = fetch_json(f"{base_url}/trace?since=0", timeout=5)
+    if trace_err:
+        st.error(trace_err)
+        return
+
+    run = snapshot.get("run", {})
+    current = snapshot.get("current", {})
+    events = snapshot.get("events", [])
+    run_status = run.get("status", "idle")
+
+    cols = st.columns([1, 3, 1])
+    with cols[0]:
+        badge = {
+            "idle": ":gray[● idle]",
+            "running": ":blue[● running]",
+            "completed": ":green[● completed]",
+            "failed": ":red[● failed]",
+        }.get(run_status, run_status)
+        st.markdown(f"### {badge}")
+    with cols[1]:
+        if run.get("label"):
+            st.markdown(f"**{run['label']}**")
+            st.caption(f"run `{run.get('run_id', '?')}` · started {run.get('started_at', '?')}")
+        if run_status == "running" and current.get("agent"):
+            now_line = current["agent"]
+            if current.get("tool"):
+                now_line += f" → `{current['tool']}`"
+            st.markdown(f"⏳ now: **{now_line}**")
+    with cols[2]:
+        if run_status == "running" and run.get("started_ts"):
+            st.metric("elapsed", f"{time.time() - run['started_ts']:.0f}s")
+        elif run.get("duration_ms") is not None:
+            st.metric("duration", f"{run['duration_ms'] / 1000:.1f}s")
+
+    # ------------------------------------------------------------ stats strip
+    if events:
+        queries = [e for e in events if e["kind"] == "query"]
+        metrics = st.columns(4)
+        metrics[0].metric("tool calls", sum(1 for e in events if e["kind"] == "tool_start"))
+        metrics[1].metric("SQL queries", len(queries))
+        metrics[2].metric("rows fetched", sum(e.get("row_count") or 0 for e in queries))
+        metrics[3].metric("errors", sum(1 for e in events if e["kind"] == "error"))
+        times = agent_time_line(events)
+        if times:
+            st.caption(f"time per agent: {times}")
+
+    # -------------------------------------------------------------- timeline
+    if not events:
+        st.info("No trace yet. Send a message above (or from the chat frontend) to watch the agents work.")
+    else:
+        groups, ends_by_id = group_events(events)
+        for group in groups:
+            color = AGENT_COLORS.get(group["agent"], "gray")
+            tick = " · ✓ done" if group["done"] else ""
+            label = f":{color}[**{group['agent']}**] · {len(group['events'])} events{tick}"
+            with st.expander(label, expanded=True):
+                for event in group["events"]:
+                    render_event(event, ends_by_id)
+
+        st.divider()
+        raw = json.dumps({"run": run, "current": current, "events": events}, indent=2, default=str)
+        st.download_button(
+            "⬇️ Download trace JSON (attach to bug reports)",
+            data=raw,
+            file_name=f"trace_{run.get('run_id', 'empty')}.json",
+            mime="application/json",
+            key="download-trace",
+        )
+        with st.expander(f"Raw events ({len(events)})", expanded=False):
+            st.json(events, expanded=False)
+
+    # -------------------------------------------------- poll-cadence control
+    chat_status = st.session_state.get("chat", {}).get("status", "idle")
+    active = run_status == "running" or chat_status == "running"
+    if active != st.session_state.get("trace_active") or chat_status != st.session_state.get(
+        "last_chat_status"
+    ):
+        st.session_state["trace_active"] = active
+        st.rerun()  # scope="app": re-arm run_every + refresh the chat section
+
+
+trace_section()

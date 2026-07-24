@@ -11,6 +11,32 @@ ROOT_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = ROOT_DIR / "sample-MES-ClosedLoop-Strands-Agent"
 FRONTEND_DIR = ROOT_DIR / "frontend"
 
+
+def backend_venv_python() -> Path:
+    # Same venv startup.py creates; streamlit lives there, not in the launcher's Python.
+    if os.name == "nt":
+        return BACKEND_DIR / ".venv" / "Scripts" / "python.exe"
+    return BACKEND_DIR / ".venv" / "bin" / "python"
+
+
+def stop(process):
+    if process is None or process.poll() is not None:
+        return
+    if os.name == "nt":
+        # os.killpg doesn't exist on Windows; taskkill /T takes the whole tree
+        # (npm -> node, streamlit workers) so nothing is orphaned.
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+        )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    process.wait()
+
+
 def main():
    backend_process =  subprocess.Popen(
         [
@@ -28,8 +54,29 @@ def main():
          "dev",
       ],
       cwd = FRONTEND_DIR,
-      start_new_session=True
+      start_new_session=True,
+      shell = (os.name == "nt")
    )
+   # Under-the-hood trace viewer (TRACE_API.md) on port 8502.
+   viewer_process = None
+   venv_python = backend_venv_python()
+   if venv_python.exists():
+       viewer_process = subprocess.Popen(
+          [
+             str(venv_python),
+             "-m",
+             "streamlit",
+             "run",
+             "trace_viewer.py",
+             "--server.port", "8502",
+             "--server.headless", "true",
+          ],
+          cwd = BACKEND_DIR,
+          start_new_session=True
+       )
+       print("Under-the-hood trace viewer: http://localhost:8502")
+   else:
+       print("Trace viewer not started: backend venv missing — rerun Launch.py once startup.py has finished installing.")
    #Wait for commands to run before opening browser
    time.sleep(1)
    webbrowser.open("http://localhost:3000")
@@ -39,21 +86,10 @@ def main():
    except KeyboardInterrupt:
        print("Stopping application...")
    finally:
-       try:
-           os.killpg(frontend_process.pid, signal.SIGTERM)
-       except ProcessLookupError:
-           pass
-       try:
-           os.killpg(backend_process.pid, signal.SIGTERM)
-       except ProcessLookupError:
-           pass
-       frontend_process.wait()
-       backend_process.wait()
-
-       
-       
+       stop(frontend_process)
+       stop(backend_process)
+       stop(viewer_process)
 
 
 if(__name__ == "__main__"):
    main()
-   
