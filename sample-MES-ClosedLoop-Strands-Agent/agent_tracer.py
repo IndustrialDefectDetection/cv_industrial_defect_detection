@@ -29,6 +29,7 @@ Attach it to Strands agents with `attach_tracer(agent, label, tracer)`.
 
 from __future__ import annotations
 
+import contextvars
 import threading
 import time
 import uuid
@@ -66,6 +67,19 @@ ERROR = "error"
 _MAX_TEXT = 6000
 _MAX_PREVIEW = 4000
 _MAX_EVENTS = 5000
+
+
+# The (agent, tool_name, tool_use_id) executing on *this* logical thread of
+# control. A ContextVar rather than a field on the tracer because the SDK runs
+# an agent's tool calls concurrently: with a single shared field, whichever
+# tool started last wins and every query gets stamped with its name (observed:
+# five different Monitor queries all labelled "SQL via fetch_work_orders_context",
+# and one orphaned into the agent-less "Run" group when a tool_end cleared the
+# field first). ContextVars follow the SDK's hops between async tasks and
+# worker threads, so each query reads back the tool that actually ran it.
+_ACTIVE_TOOL: contextvars.ContextVar = contextvars.ContextVar(
+    "mes_active_tool", default=(None, None, None)
+)
 
 
 def _now_iso() -> str:
@@ -240,6 +254,10 @@ class AgentTracer:
     ) -> None:
         # Flush any text the agent streamed just before deciding to call a tool.
         self.flush_text(agent)
+        # Per-context, so concurrently-running tools do not overwrite each
+        # other's attribution. _current stays a plain field: it only drives
+        # the "now running" badge, where last-started is the right answer.
+        _ACTIVE_TOOL.set((agent, tool_name, tool_use_id))
         with self._lock:
             self._open_tools[tool_use_id] = (time.time(), agent, tool_name)
             self._current = (agent, tool_name)
@@ -259,6 +277,7 @@ class AgentTracer:
         result: Any,
         exception: Optional[BaseException] = None,
     ) -> None:
+        _ACTIVE_TOOL.set((None, None, None))
         with self._lock:
             started, _, _ = self._open_tools.pop(tool_use_id, (None, agent, tool_name))
             duration_ms = round((time.time() - started) * 1000, 1) if started else None
@@ -289,14 +308,17 @@ class AgentTracer:
 
         This is what surfaces "the code they're running": the literal query
         text, its parameters, the row count and execution time, attributed to
-        whichever agent/tool is currently active.
+        the tool that actually ran it — read from the _ACTIVE_TOOL ContextVar,
+        so parallel tool calls each keep their own attribution. A query with
+        no tool in context (e.g. the pre-run window check) is genuinely
+        agent-less and is shown under the run itself.
         """
-        with self._lock:
-            agent, tool = self._current
+        agent, tool, tool_use_id = _ACTIVE_TOOL.get()
         self._emit(
             agent,
             QUERY,
             tool_name=tool,
+            tool_use_id=tool_use_id,
             sql=_truncate(_dedent_sql(sql), _MAX_PREVIEW),
             params=_jsonable(params),
             row_count=result.get("row_count") if isinstance(result, dict) else None,
