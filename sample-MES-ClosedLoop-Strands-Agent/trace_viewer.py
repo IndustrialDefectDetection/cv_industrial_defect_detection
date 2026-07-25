@@ -90,6 +90,7 @@ def post_analysis(base_url: str, params: dict, holder: dict) -> None:
             holder["status"] = reported if reported in ("failed", "cancelled") else "completed"
             holder["analysis"] = body.get("supervisor_orchestration", "")
             holder["duration_s"] = body.get("total_duration")
+            holder["report_pdf"] = body.get("report_pdf")
             if body.get("error"):
                 holder["detail"] = body["error"]
         else:
@@ -365,6 +366,24 @@ elif chat["status"] == "completed":
         label += f" · {chat['duration_s']:.0f}s"
     with st.expander(label, expanded=False):
         st.markdown(chat.get("analysis") or "*empty response*")
+
+    # The same report as a PDF. Fetched over HTTP rather than read off disk,
+    # so the viewer stays a pure API client and still works if the backend
+    # is on another machine.
+    pdf_name = chat.get("report_pdf")
+    if pdf_name:
+        try:
+            pdf = requests.get(f"{base_url}/report/{pdf_name}", timeout=30)
+            if pdf.ok:
+                st.download_button(f"📄 Download {pdf_name}", data=pdf.content,
+                                   file_name=pdf_name, mime="application/pdf",
+                                   key=f"dl-{pdf_name}")
+            else:
+                st.caption(f"Report PDF unavailable (HTTP {pdf.status_code})")
+        except Exception as e:
+            st.caption(f"Report PDF unavailable: {type(e).__name__}: {e}")
+    else:
+        st.caption("No report PDF was produced for this run.")
 
 # --------------------------------------------------------------- trace panel
 # The whole trace view lives in a fragment so live polling reruns only this

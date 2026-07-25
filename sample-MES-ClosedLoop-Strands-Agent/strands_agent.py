@@ -5,6 +5,7 @@ Contains Monitor, Analyzer, Planner, and Verifier agents for manufacturing quali
 
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -20,6 +21,172 @@ from strands.models.anthropic import AnthropicModel
 from strands.types.exceptions import MaxTokensReachedException
 
 from agent_tracer import AgentTracer, attach_tracer
+
+
+# One reports directory beside this file, so the API can serve what the
+# agents write regardless of the process's working directory.
+REPORTS_DIR = Path(__file__).resolve().parent / "reports"
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _md_inline(text):
+    """Escape XML-unsafe chars, then convert inline markdown to ReportLab tags.
+
+    Escaping first matters: agent text contains <, > and & (SQL, thresholds
+    like "OEE < 0.6"), which ReportLab parses as markup and chokes on.
+    """
+    text = str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)', r'<i>\1</i>', text)
+    text = re.sub(r'`(.+?)`', r'<font face="Courier">\1</font>', text)
+    return text
+
+
+def _markdown_to_flowables(text, styles):
+    """Convert a block of markdown-ish agent text into ReportLab flowables.
+
+    The agents write markdown - headings, bullets, and pipe tables. Rendered
+    with str() it lands in the PDF as literal asterisks and, for nested
+    dicts, raw Python repr with curly braces. This turns it into real
+    headings, bullets and tables.
+    """
+    flowables = []
+    bullet_style = ParagraphStyle('MDBullet', parent=styles['Normal'],
+                                  leftIndent=18, bulletIndent=6, spaceAfter=4)
+    lines = str(text).split('\n')
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line:
+            continue
+        if re.fullmatch(r'[=\-_*]{3,}', line):
+            flowables.append(Spacer(1, 8))
+            continue
+        # Pipe table: gather consecutive rows, drop the |---|---| separator.
+        if line.startswith('|') and line.endswith('|'):
+            rows = [line]
+            while i < len(lines) and lines[i].strip().startswith('|'):
+                rows.append(lines[i].strip())
+                i += 1
+            data = []
+            for r in rows:
+                cells = [c.strip() for c in r.strip('|').split('|')]
+                if all(re.fullmatch(r':?-{2,}:?', c) for c in cells):
+                    continue
+                data.append([Paragraph(_md_inline(c), styles['Normal']) for c in cells])
+            if data:
+                tbl = Table(data, hAlign='LEFT')
+                tbl.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#dbe5f1')),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ]))
+                flowables.append(tbl)
+                flowables.append(Spacer(1, 10))
+            continue
+        m = re.match(r'(#{1,4})\s+(.*)', line)
+        if m:
+            level = min(len(m.group(1)), 3)
+            flowables.append(Paragraph(_md_inline(m.group(2)), styles[f'Heading{level}']))
+            flowables.append(Spacer(1, 6))
+            continue
+        m = re.fullmatch(r'\*\*(.+?)\*\*:?', line)
+        if m:
+            flowables.append(Paragraph(f'<b>{_md_inline(m.group(1))}</b>', styles['Heading3']))
+            flowables.append(Spacer(1, 4))
+            continue
+        m = re.match(r'[-*•]\s+(.*)', line)
+        if m:
+            flowables.append(Paragraph(_md_inline(m.group(1)), bullet_style, bulletText='•'))
+            continue
+        m = re.match(r'(\d+)[.)]\s+(.*)', line)
+        if m:
+            flowables.append(Paragraph(_md_inline(m.group(2)), bullet_style,
+                                       bulletText=f'{m.group(1)}.'))
+            continue
+        flowables.append(Paragraph(_md_inline(line), styles['Normal']))
+        flowables.append(Spacer(1, 6))
+    return flowables
+
+
+def _render_report_value(value, styles, depth=0):
+    """Flatten any agent-supplied value into readable flowables.
+
+    Dicts and lists are walked structurally instead of str()'d, because
+    str({'immediate_actions': [...]}) renders Python's repr - curly braces,
+    quotes and all - into the finished PDF.
+    """
+    flowables = []
+    heading = f"Heading{min(depth + 2, 4)}"
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            label = str(key).replace('_', ' ').title()
+            if isinstance(inner, (dict, list)):
+                flowables.append(Paragraph(_md_inline(label), styles[heading]))
+                flowables.extend(_render_report_value(inner, styles, depth + 1))
+            else:
+                flowables.append(Paragraph(
+                    f"<b>{_md_inline(label)}:</b> {_md_inline(inner)}", styles['Normal']))
+                flowables.append(Spacer(1, 6))
+    elif isinstance(value, (list, tuple)):
+        bullet_style = ParagraphStyle('MDBullet', parent=styles['Normal'],
+                                      leftIndent=18, bulletIndent=6, spaceAfter=4)
+        for item in value:
+            if isinstance(item, (dict, list)):
+                flowables.extend(_render_report_value(item, styles, depth + 1))
+            else:
+                text = str(item).strip()
+                if text:
+                    flowables.append(Paragraph(_md_inline(text), bullet_style,
+                                               bulletText='•'))
+    else:
+        flowables.extend(_markdown_to_flowables(value, styles))
+    return flowables
+
+
+def render_markdown_report_pdf(markdown_text, filename=None):
+    """Render the Supervisor's final markdown report as a PDF.
+
+    This is the report a human actually reads - the eight-section synthesis
+    shown in the dashboard. Previously only the Planner's intermediate
+    action plan was ever written to disk.
+    """
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("ReportLab is not installed; cannot render the report PDF.")
+
+    report_text = str(markdown_text).strip()
+    if not report_text:
+        raise ValueError("Cannot generate a PDF from an empty report.")
+
+    if filename is None:
+        filename = f"MES_Final_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if filename.lower().endswith(".pdf"):
+        filename = filename[:-4]
+
+    filepath = REPORTS_DIR / f"{filename}.pdf"
+    doc = SimpleDocTemplate(str(filepath), pagesize=A4)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "CustomTitle", parent=styles["Title"], fontSize=24, spaceAfter=30,
+        textColor=colors.darkblue, alignment=TA_CENTER)
+
+    story = [
+        Paragraph("Manufacturing Execution System Analysis Report", title_style),
+        Spacer(1, 20),
+        Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}",
+                  styles["Normal"]),
+        Spacer(1, 20),
+    ]
+    story.extend(_markdown_to_flowables(report_text, styles))
+    doc.build(story)
+
+    if not filepath.exists() or filepath.stat().st_size == 0:
+        raise RuntimeError(f"PDF generation produced no usable file: {filepath}")
+
+    logger.info("Final report PDF: %s (%s bytes)", filepath, filepath.stat().st_size)
+    return filepath
 
 
 class RunCancelled(BaseException):
@@ -103,7 +270,9 @@ class MESAgentManager:
         # Email configuration from environment variables
         self.sender_email = os.getenv('MES_SENDER_EMAIL', 'operations.team@example.com')
         self.recipient_email = os.getenv('MES_RECIPIENT_EMAIL', 'operations.team@example.com')
-        self.base_url = os.getenv('MES_BASE_URL', 'https://df4n.cloudfront.net/proxy/8501')
+        # Defaults to this deployment's dashboard, not the upstream sample's
+        # long-dead CloudFront demo host.
+        self.base_url = os.getenv('MES_BASE_URL', 'http://localhost:8502')
         
         # Database path
         self.db_path = db_path
@@ -372,7 +541,10 @@ class MESAgentManager:
             
             # Add PDF link to email body if filename is provided
             if pdf_filename:
-                pdf_link = f"{self.base_url}/pdf={pdf_filename}?pdf={pdf_filename}"
+                # The app serves reports at ?pdf=<filename>, so one query
+                # string - the old form repeated the filename and put the
+                # first pair before the '?', producing a dead link.
+                pdf_link = f"{self.base_url}/?pdf={pdf_filename}"
                 email_body += f"\n\nDetailed PDF Report: {pdf_link}"
             
             # Email content
@@ -1147,16 +1319,8 @@ class MESAgentManager:
                 # Add executive summary if available
                 if 'executive_summary' in report_data:
                     story.append(Paragraph("Executive Summary", styles['Heading1']))
-                    # Clean and format the executive summary text
-                    summary_text = str(report_data['executive_summary']).strip()
-                    if summary_text:
-                        # Split into paragraphs and clean up
-                        paragraphs = summary_text.split('\n')
-                        for para in paragraphs:
-                            para = para.strip()
-                            if para:
-                                story.append(Paragraph(para, styles['Normal']))
-                                story.append(Spacer(1, 12))
+                    story.extend(_markdown_to_flowables(
+                        report_data['executive_summary'], styles))
                     story.append(PageBreak())
                 
                 # Add report content
@@ -1169,37 +1333,13 @@ class MESAgentManager:
                     story.append(Paragraph(section_title, styles['Heading1']))
                     story.append(Spacer(1, 12))
                     
-                    if isinstance(content, str):
-                        # Clean and format string content
-                        content_text = content.strip()
-                        if content_text:
-                            # Split long text into paragraphs
-                            paragraphs = content_text.split('\n')
-                            for para in paragraphs:
-                                para = para.strip()
-                                if para:
-                                    story.append(Paragraph(para, styles['Normal']))
-                                    story.append(Spacer(1, 8))
-                                    
-                    elif isinstance(content, list):
-                        # Handle list content
-                        for item in content:
-                            item_text = str(item).strip()
-                            if item_text:
-                                story.append(Paragraph(f"• {item_text}", styles['Normal']))
-                                story.append(Spacer(1, 6))
-                                
-                    elif isinstance(content, dict):
-                        # Handle dictionary content
-                        for key, value in content.items():
-                            key_formatted = key.replace('_', ' ').title()
-                            story.append(Paragraph(f"<b>{key_formatted}:</b> {str(value)}", styles['Normal']))
-                            story.append(Spacer(1, 6))
-                            
-                    else:
-                        # Handle other data types
-                        story.append(Paragraph(str(content), styles['Normal']))
-                        
+                    # Everything goes through the markdown renderer, which
+                    # escapes XML-unsafe characters and turns headings,
+                    # bullets and pipe tables into real flowables. Nested
+                    # values are unwrapped rather than str()'d - a bare
+                    # str(dict) put Python's {'a': 1} repr, braces and
+                    # quotes included, straight into the PDF.
+                    story.extend(_render_report_value(content, styles))
                     story.append(Spacer(1, 20))
                 
                 # Add footer with timestamp
@@ -1855,7 +1995,22 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
             
             # Extract supervisor response content
             supervisor_results = supervisor_response.message['content'][0]['text']
-            
+
+            # Render the Supervisor's own final report - the eight-section
+            # synthesis a human actually reads. Previously the only PDF a run
+            # produced was the Planner's intermediate action plan, so the
+            # report shown in the dashboard existed nowhere on disk. A PDF
+            # failure must not lose a completed analysis, so it is reported
+            # rather than raised.
+            final_pdf_name = None
+            try:
+                final_pdf = render_markdown_report_pdf(
+                    supervisor_results,
+                    filename=f"MES_Final_Report_{start_time.strftime('%Y%m%d_%H%M%S')}")
+                final_pdf_name = final_pdf.name
+            except Exception as pdf_error:
+                logger.warning(f"Final report PDF generation failed: {pdf_error}")
+
             # Compile comprehensive results
             analysis_results = {
                 'defect_type': defect_type,
@@ -1871,6 +2026,7 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
                 'end_time': end_time.isoformat(),
                 'total_duration': (end_time - start_time).total_seconds(),
                 'supervisor_orchestration': supervisor_results,
+                'report_pdf': final_pdf_name,
                 'workflow_status': 'completed',
                 'executive_summary': f"""
                 Comprehensive defect analysis completed for {defect_type} defects over {days_back} days using supervisor agent orchestration.

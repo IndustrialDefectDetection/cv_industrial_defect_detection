@@ -47,10 +47,11 @@ if sys.platform == "win32":
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from agent_tracer import AgentTracer
-from strands_agent import MESAgentManager
+from strands_agent import REPORTS_DIR, MESAgentManager
 
 # One tracer for the process. It exists even when the manager fails to build,
 # so /trace always answers. MESAgentManager shares this instance.
@@ -160,6 +161,20 @@ def defect_types(days_back: int = 365):
     result = _manager.get_defect_types(days_back)
     rows = (result or {}).get("rows") or []
     return {"defect_types": [r["DefectType"] for r in rows if r.get("DefectType")]}
+
+
+@app.get("/report/{filename}")
+def get_report(filename: str):
+    """Serve a generated PDF so the dashboard stays a pure HTTP client."""
+    # Basename only, and the resolved path must stay inside REPORTS_DIR:
+    # the filename reaches us from a client, so '../' must not escape.
+    safe_name = os.path.basename(filename)
+    if not safe_name.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only .pdf reports are served")
+    path = (REPORTS_DIR / safe_name).resolve()
+    if not str(path).startswith(str(REPORTS_DIR.resolve())) or not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No such report: {safe_name}")
+    return FileResponse(path, media_type="application/pdf", filename=safe_name)
 
 
 @app.post("/cancel")
