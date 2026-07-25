@@ -2,6 +2,24 @@
  Intelligent Agentic AI for Autonomous Manufacturing Operation 
 Implements Monitor -> Analyzer -> Planner -> Verifier workflow with defect type selection
 """
+import asyncio
+import sys
+import warnings
+
+# Windows: use selector-based event loops, not the default proactor. This app
+# runs agents in-process, and the Strands SDK gives every agent call its own
+# short-lived event loop (strands/_async.py: run_async). On Windows those are
+# ProactorEventLoops, whose close() can block indefinitely in _poll() on
+# overlapped I/O - a live stack dump caught a finished run wedged there,
+# never returning and never producing its report. Must run before the SDK is
+# imported. api.py carries the same guard for the FastAPI deployment.
+if sys.platform == "win32":
+    with warnings.catch_warnings():
+        # Deprecated in 3.14, slated for removal in 3.16; no global
+        # replacement exists yet. Revisit when upgrading.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import streamlit as st
 from datetime import datetime, timedelta
 import pandas as pd

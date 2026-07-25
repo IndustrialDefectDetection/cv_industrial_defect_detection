@@ -6,6 +6,7 @@ Contains Monitor, Analyzer, Planner, and Verifier agents for manufacturing quali
 import logging
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,25 @@ from strands.models.anthropic import AnthropicModel
 from strands.types.exceptions import MaxTokensReachedException
 
 from agent_tracer import AgentTracer, attach_tracer
+
+
+class RunCancelled(BaseException):
+    """Raised inside a run's worker thread when the user cancelled it.
+
+    Python cannot kill a thread, so cancellation is cooperative: cancel()
+    sets a flag and the run unwinds at its next checkpoint (a subagent
+    delegation or a database query). Callers should treat this as a normal
+    outcome, not a failure - see run_defect_analysis's 'cancelled' status.
+
+    Deliberately derived from BaseException, not Exception, for the same
+    reason KeyboardInterrupt is: this is a control-flow signal that must
+    unwind the whole run, and the code it passes through is full of broad
+    `except Exception` handlers that log-and-continue (the window-stats
+    pre-check, the per-agent retry loop, the SDK's own tool wrappers). As
+    an Exception it gets swallowed by the first of those and the
+    "cancelled" run carries on into a live API call. Anything catching it
+    must name it explicitly.
+    """
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -60,6 +80,12 @@ class MESAgentManager:
         # polls it. See agent_tracer.AgentTracer. Concurrent-run guarding is
         # the caller's job (api.py holds the one-run-at-a-time lock).
         self.tracer = tracer or AgentTracer()
+
+        # Set by cancel() when the user abandons a run; checked at every
+        # delegation and query checkpoint (see _check_cancelled). This
+        # manager outlives individual runs, so run_defect_analysis clears
+        # it at the start of each run rather than relying on a fresh object.
+        self._cancelled = threading.Event()
         
         # Get parameters from environment variables with fallbacks
         if db_path is None:
@@ -192,6 +218,9 @@ class MESAgentManager:
     
     def _execute_safe_query(self, query: str, params: tuple = None):
         """Execute SQL query safely with parameterized queries"""
+        # Cancellation checkpoint: stops a cancelled agent mid-phase, at its
+        # next query, rather than only between phases.
+        self._check_cancelled()
         logger.info(f"Executing parameterized SQL query")
         start_time = time.time()
         
@@ -1471,6 +1500,39 @@ Always focus on clear and concise email body with actionable recommendations, ow
         attach_tracer(self.verifier_agent, "Verifier", self.tracer)
         attach_tracer(self.executor_agent, "Executor", self.tracer)
 
+    def cancel(self):
+        """Ask an in-flight run on this manager to stop as soon as it can.
+
+        Python cannot kill a thread, so this is cooperative: it sets a flag
+        that _check_cancelled raises on at the next checkpoint (each subagent
+        delegation and each database query), which unwinds the worker within
+        seconds instead of letting it burn the remaining agents' API budget.
+        Safe to call from another thread, and safe when nothing is running.
+        """
+        self._cancelled.set()
+        logger.info("Cancellation requested for the current run")
+
+    def _check_cancelled(self):
+        """Raise RunCancelled if this run has been cancelled. Cheap enough
+        to call at every delegation/query boundary."""
+        if self._cancelled.is_set():
+            raise RunCancelled("Investigation cancelled by the user")
+
+    def _cancelled_result(self, defect_type, days_back, scope_text, start_time):
+        """The outcome dict for a deliberately cancelled run."""
+        self.tracer.run_end("cancelled")
+        end_time = datetime.now()
+        return {
+            'defect_type': defect_type,
+            'analysis_period': days_back,
+            'analysis_scope': {'scope_summary': scope_text},
+            'start_time': start_time.isoformat(),
+            'end_time': end_time.isoformat(),
+            'total_duration': (end_time - start_time).total_seconds(),
+            'supervisor_orchestration': '',
+            'status': 'cancelled',
+        }
+
     def _reset_conversations(self):
         """Clear every agent's message history so a run starts clean."""
         agents = [
@@ -1500,10 +1562,15 @@ Always focus on clear and concise email body with actionable recommendations, ow
         retries once and otherwise hands back an explicit "unavailable"
         string the supervisor is instructed to report as a gap.
         """
+        # Cancellation checkpoint: abandoning a run between phases skips the
+        # remaining agents entirely rather than paying for all five.
+        self._check_cancelled()
         last_error = None
         for attempt in (1, 2):
             try:
                 return agent_obj(prompt)
+            except RunCancelled:
+                raise  # a cancelled run is not a failure to retry - unwind
             except MaxTokensReachedException as e:
                 # Not a failure: the model filled max_tokens mid-reply and the
                 # partial message is already in history, so calling again
@@ -1676,6 +1743,10 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
 
         start_time = datetime.now()
 
+        # This manager is built once and reused for every run, so a previous
+        # cancellation must not carry over and abort the next run instantly.
+        self._cancelled.clear()
+
         # Start every run from a clean conversation. The six Agent objects
         # live for the process, and Strands appends each turn to
         # agent.messages — so without this, run 2 re-reads run 1's entire
@@ -1769,7 +1840,17 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
             
             # Call supervisor agent to orchestrate the workflow
             supervisor_response = self.supervisor_agent(supervisor_prompt)
-            
+
+            # Run-level cancellation guard. The checkpoints inside subagent
+            # delegations raise RunCancelled, but the SDK stringifies
+            # exceptions raised inside the call_*_agent tools and hands them
+            # back to the supervisor as ordinary tool errors - so a cancelled
+            # run's supervisor can keep orchestrating dead agents and write a
+            # confident report about an investigation that never happened.
+            # This check is the guarantee that a cancelled run can never come
+            # back as 'completed', whatever the SDK did internally.
+            self._check_cancelled()
+
             end_time = datetime.now()
             
             # Extract supervisor response content
@@ -1812,7 +1893,23 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
             self.tracer.run_end("completed")
             return analysis_results
 
+        except RunCancelled:
+            # The user abandoned this run. Expected, not an error: log
+            # quietly and report 'cancelled' so the UI never shows a scary
+            # failure for a deliberate action.
+            logger.info("Defect analysis cancelled by the user")
+            return self._cancelled_result(defect_type, days_back, scope_text, start_time)
+
         except Exception as e:
+            if self._cancelled.is_set():
+                # Cancelling lands mid-tool-call more often than not, which
+                # leaves the SDK's conversation inconsistent (a tool_use with
+                # no matching tool_result) and makes the next API call fail
+                # with a 400. That error is a consequence of the cancel, not
+                # a real failure, and the next run starts from a cleared
+                # conversation anyway - so report the user's intent.
+                logger.info(f"Run cancelled; ignoring downstream error: {e}")
+                return self._cancelled_result(defect_type, days_back, scope_text, start_time)
             logger.error(f"Error in supervisor-orchestrated defect analysis workflow: {e}")
             self.tracer.error(None, f"{type(e).__name__}: {e}")
             self.tracer.run_end("failed", error=str(e))

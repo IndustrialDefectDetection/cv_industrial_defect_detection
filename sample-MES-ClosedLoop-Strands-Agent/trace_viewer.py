@@ -86,7 +86,8 @@ def post_analysis(base_url: str, params: dict, holder: dict) -> None:
         )
         if resp.ok:
             body = resp.json()
-            holder["status"] = "failed" if body.get("status") == "failed" else "completed"
+            reported = body.get("status")
+            holder["status"] = reported if reported in ("failed", "cancelled") else "completed"
             holder["analysis"] = body.get("supervisor_orchestration", "")
             holder["duration_s"] = body.get("total_duration")
             if body.get("error"):
@@ -315,6 +316,15 @@ with st.form("trigger", clear_on_submit=False):
         "🚀 Run Analysis", disabled=chat_running, use_container_width=True
     )
 
+if chat_running:
+    if st.button("⏹ Stop this run", type="secondary"):
+        try:
+            r = requests.post(f"{base_url}/cancel", timeout=10)
+            st.warning(r.json().get("detail", "Cancelling")
+                       + " — it stops at the next agent or query, within seconds.")
+        except Exception as e:
+            st.error(f"Could not cancel: {type(e).__name__}: {e}")
+
 if not defect_options:
     st.warning(
         "No defect types available from the backend — is it running, and does mes.db have data?"
@@ -345,7 +355,9 @@ for turn in qa_history[:-1]:
     with st.expander(f"{icon} {turn['question']}", expanded=False):
         st.markdown(turn["answer"] or "*empty response*")
 
-if chat["status"] == "failed":
+if chat["status"] == "cancelled":
+    st.info("Run cancelled. The trace below shows how far it got.")
+elif chat["status"] == "failed":
     st.error(f"Chat request failed — {chat.get('detail')}")
 elif chat["status"] == "completed":
     label = "💬 Final report from the supervisor"
@@ -413,6 +425,7 @@ def trace_section() -> None:
             "running": ":blue[● running]",
             "completed": ":green[● completed]",
             "failed": ":red[● failed]",
+            "cancelled": ":orange[● cancelled]",
         }.get(run_status, run_status)
         st.markdown(f"### {badge}")
     with cols[1]:

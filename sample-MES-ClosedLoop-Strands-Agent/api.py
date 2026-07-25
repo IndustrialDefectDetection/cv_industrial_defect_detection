@@ -2,6 +2,7 @@
 
 Endpoints (full contract with examples: TRACE_API.md):
   POST /analysis       run the structured, traced defect-analysis workflow
+  POST /cancel         stop the in-flight run at its next checkpoint
   POST /chat/          run a traced supervisor-agent chat turn
   GET  /trace?since=N  live "under the hood" event stream (poll this)
   GET  /health         config/readiness report — first stop when debugging
@@ -159,6 +160,22 @@ def defect_types(days_back: int = 365):
     result = _manager.get_defect_types(days_back)
     rows = (result or {}).get("rows") or []
     return {"defect_types": [r["DefectType"] for r in rows if r.get("DefectType")]}
+
+
+@app.post("/cancel")
+def cancel_run():
+    """Ask the in-flight run to stop at its next checkpoint.
+
+    Returns immediately; cancellation is cooperative, so the run unwinds
+    within seconds (at its next subagent delegation or database query) and
+    the original /analysis call returns with status 'cancelled'.
+    """
+    if _manager is None:
+        raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
+    running = _run_guard.locked()
+    _manager.cancel()
+    return {"cancelling": running,
+            "detail": "Cancelling the run" if running else "No run was in progress"}
 
 
 @app.post("/analysis")
