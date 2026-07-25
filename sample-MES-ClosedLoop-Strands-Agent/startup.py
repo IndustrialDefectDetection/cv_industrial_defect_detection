@@ -191,13 +191,23 @@ def main():
     if(api_mode):
         #Starts Next.Js
         print("--Connecting to UI--")
+        # No --reload, deliberately. Two measured reasons:
+        #  1. Its StatReload watcher polls this whole directory - including
+        #     .venv's tens of thousands of files - several times a second,
+        #     pegging a full CPU core for the entire life of the server
+        #     (563 CPU-seconds burned over a 563-second run).
+        #  2. On Windows it runs the app in a multiprocessing spawn worker,
+        #     where agent runs intermittently wedge in the Strands SDK's
+        #     asyncio teardown (ProactorEventLoop.close blocking in _poll),
+        #     leaving the run never returning and the report never produced.
+        # Reload was not useful here anyway: it watches .py files, not .env,
+        # and .env changes need a full restart regardless.
         subprocess.run(
         [
             str(python_venv),
             "-m",
             "uvicorn",
-            "api:app",
-            "--reload"
+            "api:app"
         ],
         check=True
     );
