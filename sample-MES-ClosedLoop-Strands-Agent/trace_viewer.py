@@ -9,10 +9,12 @@ the Next.js frontend.)
 Talks to the FastAPI backend (api.py, port 8000) purely over HTTP — the same
 three endpoints documented in TRACE_API.md that any other frontend would use:
 
-    GET  /health   is the backend usable, and if not, why
-    GET  /trace    the live event stream from agent_tracer.AgentTracer
-    POST /chat/    trigger a traced supervisor run (also triggerable from the
-                   Next.js chat page or curl — runs show up here regardless)
+    GET  /health     is the backend usable, and if not, why
+    GET  /trace      the live event stream from agent_tracer.AgentTracer
+    GET  /defect-types  populates the event-type dropdown
+    POST /analysis   trigger the structured defect-analysis workflow
+    POST /chat/      free-text supervisor run (used by the Next.js chat page;
+                     runs from any client show up here regardless)
 
 Because it never imports strands_agent, this viewer works no matter which
 process or UI started the run, and it doubles as a reference client for the
@@ -61,21 +63,29 @@ def fetch_json(url: str, timeout: float = 3.0):
         return None, f"{type(e).__name__}: {e}"
 
 
-def post_chat(base_url: str, user_input: str, holder: dict) -> None:
-    """POST /chat/ from a background thread; writes only into `holder`.
+def post_analysis(base_url: str, params: dict, holder: dict) -> None:
+    """POST /analysis from a background thread; writes only into `holder`.
+
+    Sends the control values as structured parameters — the backend's
+    run_defect_analysis builds the supervisor prompt itself, so the scope
+    flags arrive as data rather than as prose the model has to interpret.
 
     Must not touch any st.* API — Streamlit objects are not thread-safe. The
-    main script reruns every POLL_SECONDS and reads `holder` instead.
+    main script reruns on its poll interval and reads `holder` instead.
     """
     try:
         resp = requests.post(
-            f"{base_url}/chat/",
-            json={"user_input": user_input},
-            timeout=900,  # supervisor runs take minutes
+            f"{base_url}/analysis",
+            json=params,
+            timeout=1800,  # full five-agent runs take minutes
         )
         if resp.ok:
-            holder["status"] = "completed"
-            holder["analysis"] = resp.json().get("analysis", "")
+            body = resp.json()
+            holder["status"] = "failed" if body.get("status") == "failed" else "completed"
+            holder["analysis"] = body.get("supervisor_orchestration", "")
+            holder["duration_s"] = body.get("total_duration")
+            if body.get("error"):
+                holder["detail"] = body["error"]
         else:
             holder["status"] = "failed"
             try:
@@ -290,30 +300,18 @@ if submitted and not chat_running:
         st.warning("Select an event type first.")
     else:
         days_back = int(period.split()[1])
-        scope_bits = [
-            label
-            for enabled, label in [
-                (include_oee, "OEE performance analysis"),
-                (include_downtime, "downtime and stoppages"),
-                (include_changeover, "batch changeover analysis"),
-                (include_maintenance, "maintenance correlation"),
-            ]
-            if enabled
-        ]
-        prompt = (
-            f"Run a root-cause defect analysis for defect type '{selected_defect}' "
-            f"over the last {days_back} days."
-        )
-        if scope_bits:
-            prompt += " Focus the analysis on: " + ", ".join(scope_bits) + "."
-        prompt += (
-            " Coordinate the full Monitor -> Analyzer -> Planner -> Verifier -> Executor"
-            " workflow and finish with a concise findings report."
-        )
+        params = {
+            "defect_type": selected_defect,
+            "days_back": days_back,
+            "include_oee": include_oee,
+            "include_downtime": include_downtime,
+            "include_changeover": include_changeover,
+            "include_maintenance": include_maintenance,
+        }
         chat = {"status": "running", "question": f"{selected_defect} · last {days_back}d"}
         st.session_state["chat"] = chat
         threading.Thread(
-            target=post_chat, args=(base_url, prompt, chat), daemon=True
+            target=post_analysis, args=(base_url, params, chat), daemon=True
         ).start()
 
 # Earlier turns from this session, collapsed, oldest first.
@@ -325,7 +323,10 @@ for turn in qa_history[:-1]:
 if chat["status"] == "failed":
     st.error(f"Chat request failed — {chat.get('detail')}")
 elif chat["status"] == "completed":
-    with st.expander("💬 Final answer from the supervisor", expanded=False):
+    label = "💬 Final report from the supervisor"
+    if chat.get("duration_s"):
+        label += f" · {chat['duration_s']:.0f}s"
+    with st.expander(label, expanded=False):
         st.markdown(chat.get("analysis") or "*empty response*")
 
 # --------------------------------------------------------------- trace panel

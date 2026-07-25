@@ -1,6 +1,7 @@
 """FastAPI backend for the MES agent system (port 8000).
 
 Endpoints (full contract with examples: TRACE_API.md):
+  POST /analysis       run the structured, traced defect-analysis workflow
   POST /chat/          run a traced supervisor-agent chat turn
   GET  /trace?since=N  live "under the hood" event stream (poll this)
   GET  /health         config/readiness report — first stop when debugging
@@ -44,7 +45,7 @@ class _QuietPollingFilter(logging.Filter):
     only 2xx/3xx responses are hidden.
     """
 
-    _POLLED = ("GET /trace", "GET /health")
+    _POLLED = ("GET /trace", "GET /health", "GET /defect-types")
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
@@ -79,6 +80,17 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     user_input: str
+
+
+class AnalysisRequest(BaseModel):
+    """Structured defect-analysis run — what the dashboard controls collect."""
+
+    defect_type: str
+    days_back: int = 7
+    include_oee: bool = False
+    include_downtime: bool = False
+    include_changeover: bool = False
+    include_maintenance: bool = True
 
 
 @app.get("/health")
@@ -119,6 +131,31 @@ def defect_types(days_back: int = 365):
     result = _manager.get_defect_types(days_back)
     rows = (result or {}).get("rows") or []
     return {"defect_types": [r["DefectType"] for r in rows if r.get("DefectType")]}
+
+
+@app.post("/analysis")
+def run_analysis(request: AnalysisRequest):
+    """Run the structured defect-analysis workflow.
+
+    Preferred over /chat/ for dashboard-driven runs: the scope flags reach
+    the supervisor as parameters instead of being described in prose, and
+    run_defect_analysis handles its own tracer reset/start/end.
+    """
+    if _manager is None:
+        raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
+    if not _run_guard.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A run is already in progress; wait for it to finish.")
+    try:
+        return _manager.run_defect_analysis(
+            defect_type=request.defect_type,
+            days_back=request.days_back,
+            include_oee=request.include_oee,
+            include_downtime=request.include_downtime,
+            include_changeover=request.include_changeover,
+            include_maintenance=request.include_maintenance,
+        )
+    finally:
+        _run_guard.release()
 
 
 @app.post("/chat/")

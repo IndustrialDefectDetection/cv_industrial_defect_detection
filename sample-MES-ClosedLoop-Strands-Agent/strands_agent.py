@@ -81,6 +81,13 @@ class MESAgentManager:
         # Database path
         self.db_path = db_path
 
+        # Newest timestamp in the database. Look-back windows count back from
+        # this anchor instead of from today, so the frozen synthetic dataset
+        # stays inside every window no matter when the demo runs (a "last 7
+        # days" run against data that ends weeks ago otherwise queries an
+        # empty window and the agents speculate about why).
+        self.data_anchor_date = self._load_data_anchor()
+
         # Anthropic API key from .env / environment
         api_key = os.getenv("ANTHROPIC_API_KEY")
 
@@ -90,6 +97,12 @@ class MESAgentManager:
         self.model = AnthropicModel(
             client_args={
                 "api_key": api_key,
+                # Without an explicit timeout the SDK default is 10 minutes,
+                # so one stalled request looks like a permanently frozen run.
+                # 120s comfortably covers a legitimate long generation while
+                # bounding a hang; _call_agent_with_retry handles the retry.
+                "timeout": float(os.getenv("MES_API_TIMEOUT", "120")),
+                "max_retries": int(os.getenv("MES_API_RETRIES", "2")),
             },
             model_id=model_id,
             max_tokens=int(os.getenv("MES_MAX_TOKENS", "4096")),
@@ -136,6 +149,37 @@ class MESAgentManager:
             raise FileNotFoundError(f"Database file not found: {self.db_path}")
         return sqlite3.connect(self.db_path)
     
+    def _load_data_anchor(self):
+        """Newest timestamp across the main time-bearing tables."""
+        try:
+            conn = self.get_db_connection()
+            row = conn.execute(
+                "SELECT MAX(t) FROM ("
+                "SELECT MAX(Date) as t FROM QualityControl "
+                "UNION ALL SELECT MAX(StartTime) FROM Downtimes "
+                "UNION ALL SELECT MAX(ActualEndTime) FROM WorkOrders)"
+            ).fetchone()
+            conn.close()
+            if row and row[0]:
+                anchor = pd.to_datetime(row[0]).to_pydatetime()
+                logger.info(f"  Data anchor (newest record): {anchor:%Y-%m-%d}")
+                return anchor
+        except Exception as e:
+            logger.warning(f"Data anchor detection failed, falling back to now: {e}")
+        return datetime.now()
+
+    def _cutoff_date(self, days_back) -> str:
+        """Start date of a look-back window, counted back from the data
+        anchor (newest database record) rather than from today.
+
+        "Last N days" means N calendar dates ending at the anchor date
+        inclusive, so the subtraction is days_back - 1 (a plain -days_back
+        yields N+1 dates, an off-by-one readers notice in the UI)."""
+        days_back = int(days_back)
+        if days_back < 0 or days_back > 3650:
+            raise ValueError("days_back must be between 0 and 3650")
+        return (self.data_anchor_date - timedelta(days=max(days_back - 1, 0))).strftime('%Y-%m-%d')
+
     def _validate_table_name(self, table_name: str) -> bool:
         """Validate table name against allowed list"""
         return table_name in self.allowed_tables
@@ -354,7 +398,7 @@ class MESAgentManager:
         """Initialize Monitor Agent tools - Captures & contextualizes operational data"""
         
         @tool
-        def fetch_oee_metrics(days_back: int = 1):
+        def fetch_oee_metrics(days_back: int = 7):
             """Fetch OEE metrics and identify drops in performance"""
             # Validate input
             days_back = int(days_back)
@@ -362,7 +406,7 @@ class MESAgentManager:
                 raise ValueError("days_back must be between 0 and 3650")
             
             # Calculate the cutoff date
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            cutoff_date = self._cutoff_date(days_back)
             
             query = """
             SELECT 
@@ -387,14 +431,15 @@ class MESAgentManager:
                 WorkCenters wc ON m.WorkCenterID = wc.WorkCenterID
             WHERE 
                 oee.Date >= ?
-            ORDER BY 
+            ORDER BY
                 oee.OEE ASC, oee.Date DESC
+            LIMIT 100
             """
             
             return self._execute_safe_query(query, (cutoff_date,))
 
         @tool
-        def fetch_downtime_events(days_back: int = 1):
+        def fetch_downtime_events(days_back: int = 7):
             """Fetch downtime events and line stoppages"""
             # Validate input
             days_back = int(days_back)
@@ -402,7 +447,7 @@ class MESAgentManager:
                 raise ValueError("days_back must be between 0 and 3650")
             
             # Calculate the cutoff date
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            cutoff_date = self._cutoff_date(days_back)
             
             query = """
             SELECT 
@@ -433,14 +478,15 @@ class MESAgentManager:
                 Shifts s ON e.ShiftID = s.ShiftID
             WHERE 
                 date(dt.StartTime) >= ?
-            ORDER BY 
+            ORDER BY
                 dt.Duration DESC, dt.StartTime DESC
+            LIMIT 100
             """
             
             return self._execute_safe_query(query, (cutoff_date,))
 
         @tool
-        def fetch_historical_patterns(days_back: int = 30):
+        def fetch_historical_patterns(days_back: int = 7):
             """Fetch historical stoppage patterns and context"""
             # Validate input
             days_back = int(days_back)
@@ -448,7 +494,7 @@ class MESAgentManager:
                 raise ValueError("days_back must be between 0 and 3650")
             
             # Calculate the cutoff date
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            cutoff_date = self._cutoff_date(days_back)
             
             query = """
             SELECT 
@@ -477,8 +523,9 @@ class MESAgentManager:
                 date(dt.StartTime) >= ?
             GROUP BY 
                 date(dt.StartTime), dt.Reason, m.Type, wc.Name, s.Name
-            ORDER BY 
+            ORDER BY
                 EventCount DESC, AvgDuration DESC
+            LIMIT 100
             """
             
             return self._execute_safe_query(query, (cutoff_date,))
@@ -492,7 +539,7 @@ class MESAgentManager:
                 raise ValueError("days_back must be between 0 and 3650")
             
             # Calculate the cutoff date
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            cutoff_date = self._cutoff_date(days_back)
             
             query = """
             SELECT 
@@ -524,10 +571,11 @@ class MESAgentManager:
                 Employees e ON wo.EmployeeID = e.EmployeeID
             JOIN 
                 Shifts s ON e.ShiftID = s.ShiftID
-            WHERE 
+            WHERE
                 date(wo.ActualStartTime) >= ?
-            ORDER BY 
+            ORDER BY
                 wo.ActualStartTime DESC
+            LIMIT 100
             """
             
             return self._execute_safe_query(query, (cutoff_date,))
@@ -541,7 +589,7 @@ class MESAgentManager:
                 raise ValueError("days_back must be between 0 and 3650")
             
             # Calculate the cutoff date
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            cutoff_date = self._cutoff_date(days_back)
             
             query = """
             SELECT 
@@ -566,27 +614,138 @@ class MESAgentManager:
                 Machines m ON wo.MachineID = m.MachineID
             WHERE 
                 date(wo.ActualStartTime) >= ?
-            GROUP BY 
+            GROUP BY
                 date(wo.ActualStartTime), e.EmployeeID, s.ShiftID, wc.WorkCenterID
-            ORDER BY 
+            ORDER BY
                 wo.ActualStartTime DESC
+            LIMIT 100
             """
             
             return self._execute_safe_query(query, (cutoff_date,))
+
+        @tool
+        def fetch_defect_records(defect_type: str, days_back: int = 7):
+            """Fetch individual defect occurrences for ONE defect type from the
+            Defects table, with timestamps and full context. Returns one row per
+            occurrence: check date/time, severity, quantity, location, recorded
+            root cause, action taken, plus the product, machine, work center,
+            operator, and shift involved. Use this for defect timelines and
+            correlating defect timing against maintenance or downtime events.
+            Newest first, capped at 100 rows."""
+            cutoff_date = self._cutoff_date(days_back)
+
+            query = """
+            SELECT
+                qc.Date as CheckDate,
+                d.DefectType,
+                d.Severity,
+                d.Quantity as DefectQuantity,
+                d.Location,
+                d.RootCause,
+                d.ActionTaken,
+                p.Name as ProductName,
+                m.Name as MachineName,
+                wc.Name as WorkCenterName,
+                e.Name as OperatorName,
+                s.Name as ShiftName,
+                wo.OrderID
+            FROM
+                Defects d
+            JOIN
+                QualityControl qc ON d.CheckID = qc.CheckID
+            JOIN
+                WorkOrders wo ON qc.OrderID = wo.OrderID
+            JOIN
+                Products p ON wo.ProductID = p.ProductID
+            JOIN
+                Machines m ON wo.MachineID = m.MachineID
+            JOIN
+                WorkCenters wc ON wo.WorkCenterID = wc.WorkCenterID
+            JOIN
+                Employees e ON wo.EmployeeID = e.EmployeeID
+            JOIN
+                Shifts s ON e.ShiftID = s.ShiftID
+            WHERE
+                d.DefectType = ?
+                AND date(qc.Date) >= ?
+            ORDER BY
+                qc.Date DESC
+            LIMIT 100
+            """
+
+            return self._execute_safe_query(query, (defect_type, cutoff_date))
+
+        @tool
+        def summarize_defect_distribution(defect_type: str, days_back: int = 7):
+            """The ONLY sanctioned source for counts of one defect type.
+            Returns SQL-computed totals of defect records and affected
+            units (SUM of the Quantity column) grouped by machine, shift,
+            calendar date, recorded root cause, and severity - one row per
+            (Dimension, Item). Cite these numbers verbatim; never count
+            raw rows from other tools yourself."""
+            cutoff_date = self._cutoff_date(days_back)
+
+            query = """
+            SELECT 'ByMachine' as Dimension, m.Name as Item,
+                COUNT(*) as DefectRecords, SUM(d.Quantity) as UnitsAffected
+            FROM Defects d
+            JOIN QualityControl qc ON d.CheckID = qc.CheckID
+            JOIN WorkOrders wo ON qc.OrderID = wo.OrderID
+            JOIN Machines m ON wo.MachineID = m.MachineID
+            WHERE d.DefectType = ? AND date(qc.Date) >= ?
+            GROUP BY m.MachineID
+            UNION ALL
+            SELECT 'ByShift', s.Name, COUNT(*), SUM(d.Quantity)
+            FROM Defects d
+            JOIN QualityControl qc ON d.CheckID = qc.CheckID
+            JOIN WorkOrders wo ON qc.OrderID = wo.OrderID
+            JOIN Employees e ON wo.EmployeeID = e.EmployeeID
+            JOIN Shifts s ON e.ShiftID = s.ShiftID
+            WHERE d.DefectType = ? AND date(qc.Date) >= ?
+            GROUP BY s.ShiftID
+            UNION ALL
+            SELECT 'ByDate', date(qc.Date), COUNT(*), SUM(d.Quantity)
+            FROM Defects d
+            JOIN QualityControl qc ON d.CheckID = qc.CheckID
+            WHERE d.DefectType = ? AND date(qc.Date) >= ?
+            GROUP BY date(qc.Date)
+            UNION ALL
+            SELECT 'ByRootCause', d.RootCause, COUNT(*), SUM(d.Quantity)
+            FROM Defects d
+            JOIN QualityControl qc ON d.CheckID = qc.CheckID
+            WHERE d.DefectType = ? AND date(qc.Date) >= ?
+            GROUP BY d.RootCause
+            UNION ALL
+            SELECT 'BySeverity', 'Severity ' || d.Severity, COUNT(*), SUM(d.Quantity)
+            FROM Defects d
+            JOIN QualityControl qc ON d.CheckID = qc.CheckID
+            WHERE d.DefectType = ? AND date(qc.Date) >= ?
+            GROUP BY d.Severity
+            ORDER BY Dimension, DefectRecords DESC
+            LIMIT 200
+            """
+
+            params = (defect_type, cutoff_date) * 5
+            return self._execute_safe_query(query, params)
+
+        # Shared with the Analyzer so both agents cite the same counts.
+        self._summarize_defect_distribution_tool = summarize_defect_distribution
 
         self.monitor_tools = [
             fetch_oee_metrics,
             fetch_downtime_events,
             fetch_historical_patterns,
             fetch_work_orders_context,
-            fetch_operator_logs
+            fetch_operator_logs,
+            fetch_defect_records,
+            summarize_defect_distribution
         ]
 
     def _init_analyzer_tools(self):
         """Initialize Analyzer Agent tools - Identifies root causes and performs reasoning"""
         
         @tool
-        def analyze_downtime_correlations(days_back: int = 30):
+        def analyze_downtime_correlations(days_back: int = 7):
             """Analyze correlations between downtime and specific factors"""
             # Validate input
             days_back = int(days_back)
@@ -594,7 +753,7 @@ class MESAgentManager:
                 raise ValueError("days_back must be between 0 and 3650")
             
             # Calculate the cutoff date
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            cutoff_date = self._cutoff_date(days_back)
             
             query = """
             SELECT 
@@ -625,14 +784,15 @@ class MESAgentManager:
                 date(dt.StartTime) >= ?
             GROUP BY 
                 dt.Reason, s.Name, e.Name, p.Name, m.Type
-            ORDER BY 
+            ORDER BY
                 TotalDuration DESC
+            LIMIT 100
             """
             
             return self._execute_safe_query(query, (cutoff_date,))
 
         @tool
-        def analyze_batch_changeover_time(days_back: int = 30):
+        def analyze_batch_changeover_time(days_back: int = 7):
             """Analyze batch changeover times vs benchmarks"""
             # Validate input
             days_back = int(days_back)
@@ -640,7 +800,7 @@ class MESAgentManager:
                 raise ValueError("days_back must be between 0 and 3650")
             
             # Calculate the cutoff date
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            cutoff_date = self._cutoff_date(days_back)
             
             query = """
             WITH changeover_times AS (
@@ -696,14 +856,15 @@ class MESAgentManager:
                 changeover_times
             GROUP BY 
                 MachineType, MachineName, PrevProductName, NextProductName, ShiftName
-            ORDER BY 
+            ORDER BY
                 AvgChangeoverMinutes DESC
+            LIMIT 100
             """
             
             return self._execute_safe_query(query, (cutoff_date, cutoff_date))
 
         @tool
-        def identify_performance_patterns(days_back: int = 30):
+        def identify_performance_patterns(days_back: int = 7):
             """Identify patterns in machine and operator performance"""
             # Validate input
             days_back = int(days_back)
@@ -711,7 +872,7 @@ class MESAgentManager:
                 raise ValueError("days_back must be between 0 and 3650")
             
             # Calculate the cutoff date
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            cutoff_date = self._cutoff_date(days_back)
             
             query = """
             SELECT 
@@ -749,22 +910,28 @@ class MESAgentManager:
                 date(wo.ActualStartTime) >= ?
             GROUP BY 
                 m.MachineID, e.EmployeeID, s.ShiftID
-            ORDER BY 
+            ORDER BY
                 AvgOEE ASC, TotalDowntime DESC
+            LIMIT 100
             """
             
             return self._execute_safe_query(query, (cutoff_date,))
 
         @tool
-        def analyze_quality_defects(days_back: int = 30):
-            """Analyze quality defects and their root causes"""
+        def analyze_quality_defects(days_back: int = 7, defect_type: str = None):
+            """Analyze quality defects and their recorded root causes,
+            grouped by defect type, root cause, product, machine, operator
+            and shift. Always pass defect_type to restrict the analysis to
+            the defect under investigation; omitting it returns every
+            defect type in the plant, which is a very large payload only
+            useful for deliberate cross-defect comparison."""
             # Validate input
             days_back = int(days_back)
             if days_back < 0 or days_back > 3650:
                 raise ValueError("days_back must be between 0 and 3650")
             
             # Calculate the cutoff date
-            cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            cutoff_date = self._cutoff_date(days_back)
             
             query = """
             SELECT 
@@ -799,21 +966,76 @@ class MESAgentManager:
                 Employees e ON wo.EmployeeID = e.EmployeeID
             JOIN 
                 Shifts s ON e.ShiftID = s.ShiftID
-            WHERE 
+            WHERE
                 date(qc.Date) >= ?
-            GROUP BY 
+                {defect_filter}
+            GROUP BY
                 d.DefectType, d.RootCause, p.ProductID, m.MachineID, e.EmployeeID, s.ShiftID
-            ORDER BY 
+            ORDER BY
                 DefectCount DESC, d.Severity DESC
+            LIMIT 100
             """
-            
+
+            # The filter clause is a fixed literal; the value itself stays
+            # a bound parameter.
+            if defect_type:
+                query = query.format(defect_filter="AND d.DefectType = ?")
+                return self._execute_safe_query(query, (cutoff_date, defect_type))
+            query = query.format(defect_filter="")
             return self._execute_safe_query(query, (cutoff_date,))
+
+        @tool
+        def correlate_defects_with_maintenance(defect_type: str, days_back: int = 7):
+            """Directly match each recorded defect of ONE type to the
+            downtime events (maintenance appears as Reason values) that
+            ended on the SAME machine within the 72 hours before the
+            defect's quality check. Returns one row per defect-downtime
+            pair with machine, reason, both timestamps, and the gap in
+            hours. Use this for maintenance-defect correlation instead of
+            eyeballing separate defect and downtime lists - it is the only
+            tool that enforces same-machine, time-ordered matching."""
+            cutoff_date = self._cutoff_date(days_back)
+
+            query = """
+            SELECT
+                qc.Date as DefectTime,
+                d.DefectType,
+                d.Severity,
+                m.Name as MachineName,
+                m.Type as MachineType,
+                dt.Reason as DowntimeReason,
+                dt.StartTime as DowntimeStart,
+                dt.EndTime as DowntimeEnd,
+                ROUND((julianday(qc.Date) - julianday(dt.EndTime)) * 24, 1) as HoursBeforeDefect
+            FROM
+                Defects d
+            JOIN
+                QualityControl qc ON d.CheckID = qc.CheckID
+            JOIN
+                WorkOrders wo ON qc.OrderID = wo.OrderID
+            JOIN
+                Machines m ON wo.MachineID = m.MachineID
+            JOIN
+                Downtimes dt ON dt.MachineID = wo.MachineID
+                AND dt.EndTime <= qc.Date
+                AND dt.EndTime >= datetime(qc.Date, '-72 hours')
+            WHERE
+                d.DefectType = ?
+                AND date(qc.Date) >= ?
+            ORDER BY
+                qc.Date DESC, HoursBeforeDefect ASC
+            LIMIT 100
+            """
+
+            return self._execute_safe_query(query, (defect_type, cutoff_date))
 
         self.analyzer_tools = [
             analyze_downtime_correlations,
             analyze_batch_changeover_time,
             identify_performance_patterns,
-            analyze_quality_defects
+            analyze_quality_defects,
+            correlate_defects_with_maintenance,
+            self._summarize_defect_distribution_tool
         ]
 
     def _init_planner_tools(self):
@@ -1017,7 +1239,52 @@ class MESAgentManager:
 
     def _init_agents(self):
         """Initialize the specialized agents"""
-        
+
+        # Appended to every subagent prompt. The word cap is the single
+        # biggest latency lever after tool payload size: output tokens are
+        # generated at roughly 50-80/second, so an unbounded report costs a
+        # minute of pure generation per agent, five times per run.
+        OUTPUT_RULES = """
+
+=== OUTPUT FORMAT RULES (mandatory) ===
+- Maximum 600 words total. Be dense, not decorative.
+- Use exactly these sections and nothing else:
+  1. KEY FINDINGS (max 5 bullet points)
+  2. SUPPORTING DATA (max 1 table, max 10 rows)
+  3. GAPS / MISSING DATA (what you could not determine and why)
+  4. HANDOFF NOTES (max 3 bullets for the next agent)
+- No emoji, no ASCII-art charts, no decorative separators.
+- Report only numbers that appear in tool results. Never compute
+  totals, percentages, correlations, confidence percentages, or
+  dollar amounts yourself. If a number was not returned by a tool,
+  write "not available in data" instead.
+- Express certainty only as HIGH / MEDIUM / LOW with a one-line reason.
+- Every KEY FINDING must end with its data source in brackets:
+  [source: <exact tool name>, <row count if known>, <date range>].
+  The source must be the exact name of a tool called in this
+  conversation (e.g. fetch_defect_records). A finding you cannot
+  attribute to a tool result must not be stated.
+- Never count, sum, or take percentages over raw rows yourself - that
+  includes counting how many rows share a machine, shift, date, or
+  cause. Cite counts only from tool columns that contain them
+  (DefectRecords, DefectCount, EventCount, ...); for per-machine,
+  per-shift, per-date, per-cause, or severity totals of a defect, use
+  summarize_defect_distribution. A grouped result's ROW COUNT is not a
+  record count - never present it as one.
+- Row-level tools are capped (100 rows) and ordered: they give examples
+  and timelines, never totals. If a result is at the cap, say so rather
+  than treating it as the complete set.
+- Defect rows are records, not units: one record may cover several units
+  (Quantity column). Say "N defect records"; state a unit count only
+  when it comes from summing Quantity in a tool result.
+- Describe operator findings neutrally as associations ("records
+  associated with operator X"). Never attribute fault to a named
+  person; recommend reviewing procedures or conditions instead.
+- If a tool call fails or a query is rejected, that data is
+  unavailable: write "not available in data". Never estimate or
+  extrapolate what the blocked query would have returned.
+"""
+
         # Monitor Agent - Captures & contextualizes data
         self.monitor_agent = Agent(
             model=self.model,
@@ -1043,7 +1310,9 @@ When analyzing events, always:
 - Correlate events with maintenance schedules
 - Provide comprehensive context for analysis
 
-Focus on capturing complete operational context to enable effective root cause analysis."""
+Focus on capturing complete operational context to enable effective root cause analysis.
+
+DATABASE FACTS: There is no Maintenance, maintenance_log, or CMMS table. Maintenance events are recorded as Reason values (e.g. 'Scheduled Maintenance', 'Cleaning', 'Software Error') inside the Downtimes data, which fetch_downtime_events and fetch_historical_patterns already return. Never query tables not returned by your tools.""" + OUTPUT_RULES
         )
         
         # Analyzer Agent - Identifies root causes and performs reasoning
@@ -1070,10 +1339,12 @@ Your reasoning process should:
 2. Look for statistical correlations and patterns
 3. Consider multiple contributing factors
 4. Differentiate between symptoms and root causes
-5. Provide confidence levels for your analysis
+5. Rate certainty as HIGH / MEDIUM / LOW based on evidence strength
 6. Recommend data-driven solutions
 
-Always quantify impact and provide actionable insights for the planning phase."""
+Base every claim on tool-returned data and provide actionable insights for the planning phase.
+
+DATABASE FACTS: There is no Maintenance, maintenance_log, quality_defects, or CMMS table. Maintenance events are recorded as Reason values inside the Downtimes data returned by analyze_downtime_correlations. For maintenance-defect correlation use correlate_defects_with_maintenance, which enforces same-machine, time-ordered matching, rather than eyeballing separate defect and downtime lists. Never query tables not returned by your tools.""" + OUTPUT_RULES
         )
         
         # Planner Agent - Suggests actionable plans and creates PDF reports
@@ -1108,7 +1379,12 @@ For PDF reports, include:
 
 When generating PDF reports, always return the filename in your response so it can be passed to the Executor Agent for email notifications.
 
-Always focus on measurable, actionable recommendations that improve manufacturing performance."""
+Grounding rule: propose only actions that follow from findings actually
+present in the analysis you were given. Owners, departments, budgets, and
+resource-hour figures are not in the data - if you name one, mark it as a
+proposal requiring human assignment, never as an established fact.
+
+Always focus on measurable, actionable recommendations that improve manufacturing performance.""" + OUTPUT_RULES
         )
         
         # Verifier Agent - Handles human validation only
@@ -1144,7 +1420,7 @@ Human validation criteria:
 - Unusual or unprecedented patterns
 
 Always maintain audit trails and ensure validation results are properly documented. 
-Note: Email notifications are handled by the Executor Agent."""
+Note: Email notifications are handled by the Executor Agent.""" + OUTPUT_RULES
         )
 
         # Executor Agent - Sends email notification and call MES APIs to execute actions
@@ -1173,7 +1449,12 @@ Email report should include:
 
 When sending email notifications, it is mandatory to pass PDF filename that is provided from the Planner Agent, include it in the send_email_notification call to attach the PDF link in format(https://dfmw0zqekwl4n.cloudfront.net/proxy/8501/pdf=pdf_filename.pdf?pdf=pdf_filename.pdf) to the email.
 
-Always focus on clear and concise email body with actionable recommendations, ownership, timeline and risks if not done on time."""
+The email system may run in dry-run mode. Report the notification status
+exactly as the tool returns it: if the result says dry run, state plainly
+that no email was actually sent and the draft is a preview. Never claim
+delivery to recipients that the tool result does not confirm.
+
+Always focus on clear and concise email body with actionable recommendations, ownership, timeline and risks if not done on time.""" + OUTPUT_RULES
         )
 
         # Wire the live tracer into every sub-agent so the dashboard can watch
@@ -1184,33 +1465,76 @@ Always focus on clear and concise email body with actionable recommendations, ow
         attach_tracer(self.verifier_agent, "Verifier", self.tracer)
         attach_tracer(self.executor_agent, "Executor", self.tracer)
 
+    def _reset_conversations(self):
+        """Clear every agent's message history so a run starts clean."""
+        agents = [
+            ("supervisor", getattr(self, "supervisor_agent", None)),
+            ("monitor", self.monitor_agent),
+            ("analyzer", self.analyzer_agent),
+            ("planner", self.planner_agent),
+            ("verifier", self.verifier_agent),
+            ("executor", self.executor_agent),
+        ]
+        for name, agent_obj in agents:
+            if agent_obj is None:
+                continue
+            try:
+                messages = getattr(agent_obj, "messages", None)
+                if messages is not None:
+                    del messages[:]
+            except Exception as e:
+                logger.warning(f"Could not reset {name} conversation: {e}")
+
+    def _call_agent_with_retry(self, agent_name: str, agent_obj, prompt: str):
+        """Run one subagent turn; on failure (timeout/connection), retry once.
+
+        Necessary companion to the bounded API timeout: a timeout raises
+        where it previously hung, and a bare exception reaches the
+        supervisor as a tool error, which it then improvises around. This
+        retries once and otherwise hands back an explicit "unavailable"
+        string the supervisor is instructed to report as a gap.
+        """
+        last_error = None
+        for attempt in (1, 2):
+            try:
+                return agent_obj(prompt)
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"{agent_name} agent attempt {attempt} failed: {e}"
+                    + (" - retrying once" if attempt == 1 else " - giving up"))
+                self.tracer.error(agent_name.capitalize(),
+                                  f"attempt {attempt} failed: {type(e).__name__}: {e}")
+        return (f"[{agent_name} agent unavailable after 2 attempts: {last_error}. "
+                f"Proceed with available information and state this gap explicitly.]")
+
     def _init_supervisor_agent(self):
         """Initialize the Supervisor Agent that orchestrates the workflow"""
-        
+
         @tool
         def call_monitor_agent(prompt: str):
             """Call the Monitor Agent to capture operational data"""
-            return self.monitor_agent(prompt)
-        
+            return self._call_agent_with_retry("monitor", self.monitor_agent, prompt)
+
         @tool
         def call_analyzer_agent(prompt: str):
             """Call the Analyzer Agent to perform root cause analysis"""
-            return self.analyzer_agent(prompt)
-        
+            return self._call_agent_with_retry("analyzer", self.analyzer_agent, prompt)
+
         @tool
         def call_planner_agent(prompt: str):
             """Call the Planner Agent to create action plans"""
-            return self.planner_agent(prompt)
+            return self._call_agent_with_retry("planner", self.planner_agent, prompt)
         
         @tool
         def call_verifier_agent(prompt: str):
             """Call the Verifier Agent to validate findings"""
-            return self.verifier_agent(prompt)
-        
+            return self._call_agent_with_retry("verifier", self.verifier_agent, prompt)
+
         @tool
         def call_executor_agent(prompt: str):
             """Call the Executor Agent to execute actions"""
-            return self.executor_agent(prompt)
+            return self._call_agent_with_retry("executor", self.executor_agent, prompt)
         
         self.supervisor_agent = Agent(
             model=self.model,
@@ -1264,7 +1588,51 @@ Always return a structured analysis result containing:
 - Execution results with notification status
 - Executive summary with key findings and recommendations
 
-Focus on ensuring each agent receives appropriate context and scope parameters, and that the complete workflow produces actionable, validated insights for manufacturing quality improvement within the specified analysis scope. All email notifications should be handled through the Executor Agent with proper PDF filename passing."""
+Focus on ensuring each agent receives appropriate context and scope parameters, and that the complete workflow produces actionable, validated insights for manufacturing quality improvement within the specified analysis scope. All email notifications should be handled through the Executor Agent with proper PDF filename passing.
+
+=== OUTPUT RULES (mandatory) ===
+- No emoji, no ASCII-art charts, no decorative separators.
+- Keep the whole report under 2500 words so it always fits the output
+  limit. Your final report is a synthesis for a human domain expert,
+  not a transcript: never restate a subagent's report wholesale; carry
+  over the load-bearing findings and numbers, attribute each to its
+  agent, and leave full detail to the per-agent reports.
+- Report only numbers that appear in tool results or subagent reports.
+  Never compute totals, percentages, correlations, confidence
+  percentages, or dollar amounts yourself. If a number was not
+  returned by a tool, write "not available in data" instead.
+- Preserve exact numbers from subagent reports verbatim. Never
+  recompute, re-split, or restate counts (such as per-machine splits);
+  copy them as given, with their sources.
+- Never compare values against industry standards, benchmarks, or
+  "world-class" figures unless those values appear in tool results.
+- Express certainty only as HIGH / MEDIUM / LOW with a one-line reason.
+- If a subagent comes back as "[<name> agent unavailable after 2
+  attempts...]", that phase did not run: report it as a gap in section
+  5 and cap the certainty of anything that depended on it at LOW.
+  Never present that phase's conclusions as if they had been produced.
+- When two subagents report conflicting numbers for the same fact, do
+  not present either as validated: put the conflict in Data Reliability
+  Flags, cap dependent certainty at LOW, and name the tool result that
+  would resolve it.
+- Defect counts are record counts, not unit counts, unless a tool
+  summed the Quantity column; keep that distinction wherever counts
+  appear.
+- Never attribute fault to named individuals; keep operator references
+  neutral and aim recommendations at processes and conditions.
+- Structure the final report with exactly these numbered sections, in
+  this order, each heading followed by a line
+  "Source: <the tools/agents the section draws on>":
+  1. Defect Occurrence Summary (summary table by machine or product -
+     never one row per occurrence)
+  2. Maintenance Correlation Findings
+  3. Root Cause Hypotheses (ranked; each with a WHY mechanism and
+     HIGH/MEDIUM/LOW certainty)
+  4. Data Reliability Flags
+  5. Gaps / Missing Data
+  6. Action Plan (immediate / short-term / long-term, from the Planner)
+  7. Verification Outcome and Conditions (from the Verifier)
+  8. Notification Status (from the Executor)"""
         )
 
         attach_tracer(self.supervisor_agent, "Supervisor", self.tracer)
@@ -1288,6 +1656,13 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
 
         start_time = datetime.now()
 
+        # Start every run from a clean conversation. The six Agent objects
+        # live for the process, and Strands appends each turn to
+        # agent.messages — so without this, run 2 re-reads run 1's entire
+        # transcript (including its tool results) and every run is slower
+        # and costlier than the last.
+        self._reset_conversations()
+
         # Open a fresh trace for this run so the dashboard shows only this run.
         self.tracer.reset()
         self.tracer.run_start(
@@ -1296,10 +1671,40 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
         )
 
         try:
+            # Verified data context: without this, an empty or thin window
+            # reads to the agents like a monitoring-infrastructure failure
+            # and they speculate at length; with it, emptiness has a stated,
+            # boring cause and the run ends quickly.
+            data_context = ""
+            try:
+                stats = self.get_defect_window_stats(defect_type, days_back)
+                if stats.get("success") and stats.get("rows"):
+                    row = stats["rows"][0]
+                    window_start = self._cutoff_date(days_back)
+                    window_end = self.data_anchor_date.strftime('%Y-%m-%d')
+                    data_context = f"""
+            Data context (verified directly against the database just before this run):
+            - Analysis window: {window_start} to {window_end}. Windows count back from
+              the newest record in the database ({window_end}), not from today's date.
+              State these window dates exactly; never infer or report a different range.
+            - '{defect_type}' records inside this window: {row.get('WindowCount')}
+            - '{defect_type}' records in the entire database: {row.get('TotalCount')}
+            - Most recent '{defect_type}' record: {row.get('LastOccurrence') or 'none'}
+            If records cluster at the window's start date, treat that as a
+            window-boundary artifact - data from before the boundary was not
+            queried - not as evidence of a sudden process event.
+            If the window holds zero records, the correct finding is that the
+            window does not overlap this defect's data - report that plainly.
+            Do not conclude data-collection or infrastructure failure, and
+            correct any subagent that does.
+            """
+            except Exception as e:
+                logger.warning(f"Window stats pre-check failed: {e}")
+
             # Create comprehensive prompt for supervisor agent
             supervisor_prompt = f"""
-            Execute comprehensive defect analysis workflow for defect type '{defect_type}' over the last {days_back} days.
-            
+            Execute comprehensive defect analysis workflow for defect type '{defect_type}' over the last {days_back} days of recorded data.
+            {data_context}
             Analysis Scope Configuration:
             - OEE Analysis: {'Enabled' if include_oee else 'Disabled'}
             - Downtime Analysis: {'Enabled' if include_downtime else 'Disabled'}
@@ -1439,7 +1844,7 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
             raise ValueError("days_back must be between 0 and 3650")
         
         # Calculate the cutoff date
-        cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+        cutoff_date = self._cutoff_date(days_back)
         
         sql_query = """
         SELECT DISTINCT d.DefectType
@@ -1451,10 +1856,37 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
         
         return self._execute_safe_query(sql_query, (cutoff_date,))
 
+    def get_defect_window_stats(self, defect_type, days_back):
+        """Pre-run check: how many records of this defect the selected
+        look-back window actually holds, and the newest record overall.
+        Gives the Supervisor verified context so an empty result is
+        reported as 'window predates the data' instead of speculation."""
+        cutoff_date = self._cutoff_date(days_back)
+
+        sql_query = """
+        SELECT
+            COUNT(*) as WindowCount,
+            (SELECT COUNT(*)
+             FROM Defects d3
+             JOIN QualityControl qc3 ON d3.CheckID = qc3.CheckID
+             WHERE d3.DefectType = ?) as TotalCount,
+            (SELECT MAX(qc2.Date)
+             FROM Defects d2
+             JOIN QualityControl qc2 ON d2.CheckID = qc2.CheckID
+             WHERE d2.DefectType = ?) as LastOccurrence
+        FROM Defects d
+        JOIN QualityControl qc ON d.CheckID = qc.CheckID
+        WHERE d.DefectType = ?
+            AND date(qc.Date) >= ?
+        """
+
+        return self._execute_safe_query(
+            sql_query, (defect_type, defect_type, defect_type, cutoff_date))
+
     def get_defect_preview(self, defect_type):
         """Execute SQL query directly without going through agent"""
         # Calculate the cutoff date (30 days back)
-        cutoff_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        cutoff_date = self._cutoff_date(30)
         
         sql_query = """
         SELECT 

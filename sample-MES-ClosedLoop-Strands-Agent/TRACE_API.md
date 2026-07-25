@@ -103,6 +103,26 @@ Distinct defect types from the last `days_back` days (default 365), for UI
 dropdowns: `{"defect_types": ["crazing", "inclusion", ...]}`. 503 while the
 agent manager isn't ready.
 
+## `POST /analysis`
+
+The structured entry point the dashboard uses. Scope flags arrive as
+parameters rather than prose, and the backend builds the supervisor prompt
+(including a verified window pre-check) itself.
+
+```json
+{"defect_type": "Battery Cell Variance", "days_back": 7,
+ "include_oee": false, "include_downtime": false,
+ "include_changeover": false, "include_maintenance": true}
+```
+
+Returns the full analysis dict — `status` (`completed`/`failed`),
+`total_duration`, `supervisor_orchestration` (the final report text),
+`analysis_scope`, and timestamps. Blocks for the whole run (minutes); poll
+`/trace` in parallel. Same error codes as `/chat/` (409 busy, 503 not ready).
+
+Look-back windows count back from the **newest record in the database**, not
+from today, so a "last 7 days" run always overlaps the data.
+
 ## `POST /chat/`
 
 Unchanged request/response: `{"user_input": "..."}` → `{"analysis": "..."}`.
