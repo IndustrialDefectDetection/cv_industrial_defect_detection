@@ -22,6 +22,7 @@ trace API contract.
 """
 
 import json
+import os
 import threading
 import time
 
@@ -31,6 +32,10 @@ import streamlit as st
 DEFAULT_BASE = "http://127.0.0.1:8000"
 POLL_RUNNING = 0.8  # trace poll cadence while a run is active
 POLL_IDLE = 2.5  # keep polling when idle so runs from other clients appear
+HEALTH_RETRY_SECONDS = float(os.getenv("MES_VIEWER_HEALTH_RETRY", "2.0"))
+# Bounded: ~30s of auto-retry covers backend startup without spinning forever
+# on a backend that is genuinely down (after the cap, the manual button waits).
+MAX_HEALTH_RETRIES = int(os.getenv("MES_VIEWER_HEALTH_MAX_RETRIES", "15"))
 
 # Streamlit markdown accent color per agent, so the timeline is scannable.
 AGENT_COLORS = {
@@ -226,16 +231,36 @@ else:
 
 st.sidebar.divider()
 st.sidebar.caption(
-    "This viewer only calls the HTTP API (`/health`, `/trace`, `/chat/`) — "
-    "see TRACE_API.md. Runs triggered from any client appear here."
+    "This viewer only calls the HTTP API (`/health`, `/trace`, `/defect-types`, "
+    "`/analysis`) — see TRACE_API.md. Runs triggered from any client appear here."
 )
 
 if health_err:
+    # The backend needs a few seconds after launch to build its six agents,
+    # while Streamlit is serving almost immediately — so the first paint
+    # routinely lands before the API answers. Retry on a timer instead of
+    # dead-ending on a manual button: the page then heals itself, and a
+    # genuinely-down backend still shows the reason on every attempt.
+    attempt = st.session_state.get("health_attempt", 0) + 1
+    st.session_state["health_attempt"] = attempt
     st.title("Under the Hood")
-    st.error(health_err)
-    if st.button("Retry"):
+    retrying = live and attempt <= MAX_HEALTH_RETRIES
+    st.warning(
+        f"{health_err}\n\n"
+        + (f"Retrying automatically — attempt {attempt} of {MAX_HEALTH_RETRIES}. "
+           "The backend takes a few seconds to start up after Launch.py."
+           if retrying else
+           "Gave up retrying automatically. Start the backend, then press Retry now.")
+    )
+    if st.button("Retry now"):
+        st.session_state["health_attempt"] = 0
+        st.rerun()
+    if retrying:
+        time.sleep(HEALTH_RETRY_SECONDS)
         st.rerun()
     st.stop()
+
+st.session_state["health_attempt"] = 0
 
 # ---------------------------------------------------------------- trigger box
 st.title("Under the Hood")

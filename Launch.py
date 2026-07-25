@@ -49,6 +49,29 @@ def check_ports() -> bool:
     return False
 
 
+def wait_for_backend(timeout: int = 90) -> bool:
+    """Block until GET /health answers, so the UI never opens onto a dead API.
+
+    Uses urllib rather than requests: this launcher runs on the system
+    Python, which need not have the backend venv's dependencies.
+    """
+    import urllib.request
+
+    print("Waiting for the backend to finish starting", end="", flush=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2):
+                print(" ready.")
+                return True
+        except Exception:
+            print(".", end="", flush=True)
+            time.sleep(1)
+    print(f"\nBackend did not answer within {timeout}s - opening the UI anyway;"
+          " it will keep retrying on its own.")
+    return False
+
+
 def stop(process):
     if process is None or process.poll() is not None:
         return
@@ -109,8 +132,10 @@ def main():
        print("Under-the-hood trace viewer: http://localhost:8502")
    else:
        print("Trace viewer not started: backend venv missing — rerun Launch.py once startup.py has finished installing.")
-   #Wait for commands to run before opening browser
-   time.sleep(1)
+   # Wait for the backend to actually answer before opening the browser.
+   # It builds six agents at startup (~10s), so a fixed 1s sleep opened the
+   # dashboard onto a backend that was not listening yet.
+   wait_for_backend()
    # One tab only: the dashboard has a chat box built in, so it's the whole
    # workflow. The Next.js chat still runs at localhost:3000 (printed above)
    # for anyone who prefers it.
