@@ -1,108 +1,429 @@
-# README Evidence Notes (rough — keep updating while building)
+# MES Agentic AI Learning Project
 
-Working file. Add to it as you build; the polished README gets assembled from this later.
-Items marked ⚠️ TODO are things not yet captured anywhere — grab them before they're forgotten.
+A supervisor-orchestrated, multi-agent application for investigating manufacturing defects using synthetic Manufacturing Execution System data.
 
----
+The project demonstrates how an agentic AI system can safely query operational data, coordinate specialized analysis agents, produce evidence-backed findings, and generate an auditable final report.
 
-## 1. What I personally changed
 
-- Rerouted 8 predefined SQL queries that joined on a nonexistent `WorkOrders.ShiftID` column — verified the real schema with PRAGMA, joined through `WorkOrders → Employees (EmployeeID) → Shifts (e.ShiftID)` instead.
-- Added time-overlap conditions (`dt.StartTime BETWEEN wo.ActualStartTime AND wo.ActualEndTime`) to the downtime queries to kill a join fan-out.
-- Rewrote the Run-button flow in `app.py`: `analysis_running` flag + one-shot `work_pending` flag so only one entry point can start an analysis (Strands agents are not re-entrant).
-- Wrote a markdown → ReportLab renderer for the PDF generator (was printing raw markdown), with proper escaping.
-- Built the `fetch_defect_records` tool (Monitor previously had no sanctioned path to the Defects table).
-- Wrote `OUTPUT_RULES` / `SUPERVISOR_OUTPUT_RULES` constants appended to every agent system prompt: word caps, fixed report sections, HIGH/MEDIUM/LOW certainty (no invented percentages), every finding must cite its tool/data source, no unsupported benchmark comparisons.
-- Added client timeouts, automatic retries, and `_call_agent_with_retry` (1 def + 5 wrappers) with graceful degradation.
-- DRY refactor: run-capture logic consolidated into `_save_agent_output` (call sites went 6 → 2: def + one call in the helper).
-- Built full run-artifact capture: every analysis writes a `runs/` folder with params, full logs, and each agent's prompts, outputs, and complete tool-call transcripts.
-- Moved config to `.env` via `os.getenv` (model switchable through `MES_MODEL_ID`; max tokens, temperature, log level, email settings).
-- Deployed to Streamlit Community Cloud with private viewer access for review.
-- ⚠️ TODO as you build the demo features: trace panel, cost meter, chaos toggle, provenance click-through — log each here the day you land it.
+## Project Overview
 
-## 2. Important bugs I solved (root cause + fix + symptom — README gold)
+Manufacturing defect investigations often require information from several operational areas:
 
-1. **Schema drift.** 8 queries referenced `WorkOrders.ShiftID`, which doesn't exist in the generated DB. Symptom: silent query failures / blocked agents. Fix: PRAGMA-verified schema, rerouted joins. Lesson: trust PRAGMA over the repo's intuition.
-2. **Join fan-out.** Downtime joins had no time condition → event counts inflated ~20x. Fix: time-overlap BETWEEN conditions. Juiciest single number in the project.
-3. **Streamlit race.** Re-render auto-trigger fired duplicate concurrent agent invocations. Fix: single Run-button path with run/pending flags.
-4. **Hallucinated table names.** Monitor had no legitimate tool for the Defects table, so it invented table names when blocked. Fix: build the tool, not more guardrails. Best story in the repo.
-5. **Fabricated statistics + token-limit retry loops.** Prompts effectively instructed fabrication ("provide confidence levels"). Fix: OUTPUT_RULES. This is what took runs from ~3 h to <10 min.
-6. **Hung connection mid-run.** Fix: timeouts + retry + graceful degradation.
-7. **Raw-markdown PDFs.** Fix: markdown→ReportLab renderer.
+* Defect and inspection records
+* Work orders
+* Machines and production lines
+* Downtime events
+* Maintenance history
+* Employees and shifts
 
-## 3. Architecture decisions and why
+This application allows a user to select an analysis scope through a Streamlit interface. A supervisor agent then coordinates specialized agents that query a synthetic SQLite MES database through controlled, read-only tools.
 
-- **Hub-and-spoke topology** (supervisor as hub), not pipeline (supervisor must skip/reorder agents based on user scope) and not peer-to-peer (traceability + single escalation point beat agent autonomy here).
-- **Categorical certainty (HIGH/MED/LOW) over numeric confidence** — numbers the model can't ground are fabrication by instruction.
-- **Tool coverage over guardrails** — an agent with no legitimate path to data it needs will hallucinate one; give it the tool.
-- **`mes.db` is read-only, always** — fresh data comes from rerunning the generator, never from writes.
-- **Parameterized SQL house style** — `?` placeholders only, `days_back` validated 0–3650, named columns (no `SELECT *`), `ORDER BY`, `LIMIT` cap.
-- **Single entry point for runs** — because Strands agents aren't re-entrant.
-- **Human-approval gate before the Executor** — Executor stays simulated/dry-run.
-- **Run artifacts for every analysis** — debuggability and auditability as a default, not an afterthought.
-- **Planned: read-only MCP server for DB access; JSON-schema handoffs; mini-RAG over SOPs** (from the v2 PRD).
-- ⚠️ TODO: when you make a decision *against* something (e.g., rejecting checkpoint/resume until the schema phase), note it here — "deliberately not built" sections read very well.
+The final output includes:
 
-## 4. Before-and-after measurements
+* A consolidated defect-analysis report
+* Source-backed findings
+* Categorical certainty labels
+* A downloadable PDF
+* Complete run artifacts for debugging and auditability
 
-- End-to-end run: **~3 hours (with failures/retry loops) → under 10 minutes**.
-- Downtime event counts: **~20x inflated → correct** after fan-out fix.
-- Fabricated stats in reports: present → eliminated (findings must cite source).
-- Capture-logic call sites: 6 → 2 after DRY refactor (grep-verified).
-- ⚠️ TODO: tokens + $ cost per run, before vs. after the output-rules fix — capture from run artifacts before memory fades; this is the cost-story number.
-- ⚠️ TODO: one concrete before/after report excerpt (invented percentages vs. cited HIGH/MED/LOW finding). Save the actual text now.
+## Key Results
 
-## 5. Commands needed to run the project
+The following improvements were observed during development on the current synthetic dataset:
 
-```bash
-# from project root, Git Bash on Windows
-source .venv/Scripts/activate        # note: Scripts, not bin, on Windows
-python -m streamlit run app.py       # app at http://localhost:8501
+| Area                | Before                                                                              | After                                                                 |
+| ------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| End-to-end analysis | Runs could become trapped in failure and retry cycles for approximately three hours | Successful runs complete in under ten minutes                         |
+| Downtime analysis   | Event counts were inflated by approximately 20×                                     | Counts corrected with time-overlap conditions                         |
+| Certainty reporting | Reports could contain unsupported numerical confidence claims                       | Findings use `HIGH`, `MEDIUM`, or `LOW` certainty with cited evidence |
+| Database coverage   | Some agents lacked an approved path to required defect data                         | Dedicated read-only defect tools were added                           |
+| Run capture         | Repeated capture logic across six call sites                                        | Consolidated into two verified call sites                             |
+| PDF output          | Markdown syntax appeared as raw text                                                | Markdown is rendered into formatted ReportLab elements                |
+
+Execution time and model usage vary according to the selected scope, model, API availability, and retry behavior.
+
+## How the System Works
+
+```mermaid
+flowchart LR
+    A[User] --> B[Streamlit Interface]
+    B --> C[Supervisor Agent]
+    C --> D[Specialized Analysis Agents]
+    D --> E[Read-Only Tool Layer]
+    E --> F[(Synthetic MES SQLite Database)]
+    F --> E
+    E --> D
+    D --> C
+    C --> G[Evidence-Backed Final Report]
+    G --> H[Streamlit Results]
+    G --> I[PDF Report]
+    G --> J[Run Artifacts]
 ```
 
-- Config read from `.env` at import time (`MES_MODEL_ID` etc.).
-- Fresh data: rerun the generator in the nested `industrial-data-store-simulation-chatbot` repo (`app_factory/data_generator/sqlite-synthetic-mes-data.py`) and copy `mes.db` to project root.
-- Refactor verification greps:
-```bash
-grep -c "MES_API_TIMEOUT" strands_agent.py         # want 1
-grep -c "_call_agent_with_retry" strands_agent.py  # want 6
-grep -c "_save_agent_output" strands_agent.py      # want 2
+A typical analysis follows these steps:
+
+1. The user selects the defect-analysis parameters.
+2. The application validates the requested scope.
+3. The supervisor determines which specialized agents are needed.
+4. Agents retrieve information through fixed, parameterized, read-only tools.
+5. Each agent returns findings and identifies the data source used.
+6. The supervisor consolidates the findings into a structured report.
+7. The application saves the report, prompts, outputs, tool calls, parameters, and logs.
+8. The user can review the result in Streamlit or download it as a PDF.
+
+## Core Features
+
+### Supervisor-Orchestrated Analysis
+
+The system uses a hub-and-spoke architecture. The supervisor acts as the central coordinator and can select, skip, or reorder specialized agents according to the requested analysis.
+
+This was chosen instead of:
+
+* A fixed pipeline, which would run unnecessary stages
+* Peer-to-peer agent communication, which would make execution and escalation harder to trace
+
+### Controlled Database Access
+
+The application treats `mes.db` as read-only.
+
+Database tools follow several rules:
+
+* Parameterized SQL using `?` placeholders
+* Validated date-range inputs
+* Explicit column selection instead of `SELECT *`
+* Defined ordering
+* Result limits
+* No database write operations
+* Fresh data generated by rerunning the synthetic-data generator
+
+The agents do not receive unrestricted SQL write access.
+
+### Evidence-Backed Findings
+
+Every generated finding is expected to identify the tool or data source that supports it.
+
+Agent output rules enforce:
+
+* Fixed report sections
+* Concise output limits
+* No invented benchmark comparisons
+* No unsupported percentages
+* Explicit evidence references
+* `HIGH`, `MEDIUM`, or `LOW` certainty labels
+
+Categorical certainty is used because numerical confidence values generated without a statistical basis can create a false impression of precision.
+
+### Run Artifact Capture
+
+Every analysis produces a run-artifact directory containing the available execution evidence, including:
+
+* Selected parameters
+* Application logs
+* Agent prompts
+* Agent outputs
+* Tool calls
+* Tool arguments
+* Tool results
+* Final supervisor output
+
+These artifacts make it possible to investigate failures and determine how a conclusion was produced.
+
+### Retry and Failure Handling
+
+Agent calls include:
+
+* Client-side timeouts
+* Automatic retries
+* Centralized retry handling
+* Graceful degradation when an individual agent cannot complete its task
+
+A partial, clearly marked result is preferred over leaving the entire interface blocked indefinitely.
+
+### Single-Run Execution
+
+The application allows only one analysis to run at a time.
+
+Streamlit rerenders can otherwise trigger duplicate invocations. The Run-button flow therefore uses explicit running and pending state to ensure that only one entry point can start an analysis.
+
+### PDF Report Generation
+
+The final supervisor report can be exported as a PDF.
+
+A custom Markdown-to-ReportLab renderer converts supported report elements into formatted PDF content instead of printing raw Markdown characters.
+
+## Reliability Fixes
+
+### 1. Schema Drift
+
+Several predefined queries attempted to join using `WorkOrders.ShiftID`, but that column did not exist in the generated database.
+
+The actual relationship was verified using SQLite schema inspection:
+
+```text
+WorkOrders
+    → Employees through EmployeeID
+    → Shifts through Employees.ShiftID
 ```
-- ⚠️ TODO: exact deploy steps you actually used for Community Cloud (repo URL, secrets set, sharing settings) — write them down while fresh.
 
-## 6. Screenshots of good demo runs (⚠️ all TODO — capture on your next clean run)
+The affected queries were updated to use the verified schema.
 
-- [ ] Streamlit UI at defect selection
-- [ ] A run in progress (agent status / trace panel once built)
-- [ ] Final PDF report — a page with cited findings
-- [ ] Before/after report comparison (pull "before" from an old runs/ folder if one survives!)
-- [ ] A `runs/` folder tree + one tool-call transcript open
-- [ ] Deployed Community Cloud app in a browser
-- [ ] (later) MCP server tool list; approval-gate card; cost meter
+**Lesson:** inspect the real database schema instead of relying on assumptions made by application code.
 
-Tip: screenshot the *old, broken* behavior too if any old run artifacts still show it — before-pictures are the rarest asset and the first thing people delete.
+### 2. Downtime Join Fan-Out
 
-## 7. Known limitations and lessons learned
+Downtime records were originally joined to work orders without confirming that the event occurred during the work order.
 
-Limitations:
-- All data synthetic; no factory hardware, no production MES writes, Executor simulated.
-- No auth beyond Community Cloud viewer allow-list; API cost per run is real (private sharing on purpose).
-- Free-text inter-agent handoffs until the schema phase lands; no checkpoint/resume yet (deliberate — parked for the MCP/schema phase).
-- Strands agents non-re-entrant → single-run-at-a-time by design.
+This caused matching rows to multiply and inflated event counts by approximately 20×.
 
-Lessons (the README's personality lives here):
-- Hallucination is often a coverage problem, not a model problem.
-- A prompt asking for confidence percentages is an instruction to fabricate.
-- Trust PRAGMA over intuition — verify the schema the queries assume.
-- Reliability work is invisible when it works; artifacts are how you prove it happened.
-- Fix data bugs in code (SQL conditions), fix reasoning bugs in prompts — know which kind you have.
+The affected queries now include a time-overlap condition:
 
----
+```sql
+dt.StartTime BETWEEN wo.ActualStartTime AND wo.ActualEndTime
+```
 
-## Juiciest README hooks (the shortlist)
+This ensures that downtime events are associated only with work orders active during the relevant period.
 
-1. "~3 hours → under 10 minutes" — the headline metric.
-2. The 20x downtime inflation caught by one missing time condition.
-3. The agent that invented table names because nobody gave it a real tool.
-4. "Provide confidence levels" = instructed fabrication → HIGH/MED/LOW + citations.
-5. Every claim in every report traces back to a logged tool call.
+### 3. Missing Tool Coverage
+
+The monitoring agent originally had no approved tool for retrieving data from the defects table.
+
+When an agent lacks a legitimate path to required information, additional prompt warnings do not solve the underlying problem. A dedicated `fetch_defect_records` tool was therefore added.
+
+**Lesson:** hallucination can be caused by missing tool coverage, not only by the underlying model.
+
+### 4. Unsupported Confidence Statistics
+
+Earlier prompts requested confidence values without providing a statistical method for calculating them. This encouraged unsupported percentages and contributed to long outputs and retry loops.
+
+The output contract now requires:
+
+* `HIGH`, `MEDIUM`, or `LOW` certainty
+* A short explanation
+* The supporting tool or data source
+
+### 5. Duplicate Streamlit Runs
+
+Streamlit rerenders could trigger multiple concurrent agent runs.
+
+The application now uses:
+
+* An `analysis_running` flag
+* A one-shot `work_pending` flag
+* A single Run-button execution path
+
+This prevents concurrent invocation of agent objects that are not re-entrant.
+
+### 6. Interrupted Agent Connections
+
+Long-running model requests could hang or fail midway through an analysis.
+
+Timeouts, centralized retries, and graceful error handling were added so that one failed call does not necessarily invalidate the entire run.
+
+### 7. Raw Markdown in PDFs
+
+The original PDF generator printed Markdown syntax directly.
+
+A Markdown-to-ReportLab renderer now handles supported formatting and escapes report content before generating the PDF.
+
+## Technology Stack
+
+* Python
+* Streamlit
+* Strands Agents
+* Amazon Bedrock
+* SQLite
+* Pandas
+* Plotly
+* SQLAlchemy
+* ReportLab
+* `python-dotenv`
+
+## Running the Project Locally
+
+### Prerequisites
+
+You need:
+
+* Python installed
+* Access to the configured Amazon Bedrock model
+* AWS credentials available to the application
+* A generated `mes.db` file in the project root
+
+### 1. Clone the repository
+
+```bash
+git clone <repository-url>
+cd <repository-directory>
+```
+
+### 2. Create a virtual environment
+
+```bash
+python -m venv .venv
+```
+
+Activate it using the command appropriate for your environment.
+
+#### Windows PowerShell
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+#### Git Bash on Windows
+
+```bash
+source .venv/Scripts/activate
+```
+
+#### macOS or Linux
+
+```bash
+source .venv/bin/activate
+```
+
+### 3. Install dependencies
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 4. Configure the application
+
+Create a `.env` file in the project root.
+
+At minimum, configure the model used by the application:
+
+```env
+MES_MODEL_ID=<your-supported-bedrock-model-id>
+```
+
+Additional application settings, such as timeout, token, temperature, logging, and optional email settings, are loaded through environment variables.
+
+Do not commit API credentials, AWS secrets, or the local `.env` file.
+
+### 5. Start Streamlit
+
+```bash
+python -m streamlit run app.py
+```
+
+The application should open at:
+
+```text
+http://localhost:8501
+```
+
+## Generating Fresh Synthetic Data
+
+The project uses synthetic manufacturing data.
+
+To regenerate the database, run:
+
+```text
+industrial-data-store-simulation-chatbot/
+└── app_factory/
+    └── data_generator/
+        └── sqlite-synthetic-mes-data.py
+```
+
+Copy the generated `mes.db` file into the root of this project before starting the Streamlit application.
+
+The database is regenerated rather than modified by the agents.
+
+## Development Verification
+
+The following commands can be used to verify selected refactoring assumptions:
+
+```bash
+grep -c "MES_API_TIMEOUT" strands_agent.py
+grep -c "_call_agent_with_retry" strands_agent.py
+grep -c "_save_agent_output" strands_agent.py
+```
+
+For the current implementation, the expected counts are:
+
+```text
+MES_API_TIMEOUT:          1
+_call_agent_with_retry:  6
+_save_agent_output:      2
+```
+
+These checks are implementation-specific and should be updated when the relevant code is intentionally refactored.
+
+## Deployment
+
+A review deployment is hosted through Streamlit Community Cloud:
+
+[Open the MES Agentic AI Learning Project](https://mes-agentic-ai-learning-project.streamlit.app/)
+
+Access may be restricted to approved viewers because each analysis can incur model API costs.
+
+Deployment secrets should be configured through the hosting platform and must not be stored in the repository.
+
+## Safety Boundaries
+
+This project deliberately limits what the agent system can do.
+
+* The dataset is synthetic.
+* Database access is read-only.
+* SQL inputs are parameterized and validated.
+* The system does not control factory equipment.
+* The system does not write to a production MES.
+* Outward executor actions are simulated.
+* Generated conclusions should be reviewed by a human.
+* The application is not intended to make safety-critical manufacturing decisions.
+
+## Known Limitations
+
+* All manufacturing data is synthetic.
+* No factory hardware is connected.
+* No production MES writes are supported.
+* The application currently runs one analysis at a time.
+* Inter-agent handoffs may still contain free-form text.
+* Checkpoint and resume support has not yet been implemented.
+* Model output can still be incomplete or incorrect despite tool and prompt controls.
+* Performance depends on model availability and API latency.
+* Community Cloud access control is intended for demonstrations, not enterprise authentication.
+* Current measurements come from development runs rather than a formal benchmark suite.
+
+## Roadmap
+
+Planned learning and reliability features include:
+
+* A read-only MCP server over `mes.db`
+* Visible SQL query and refusal demonstrations
+* A human-approval gate before simulated executor actions
+* Structured JSON-schema handoffs between agents
+* A live agent trace panel
+* Tool-call provenance click-through
+* Token and estimated cost reporting
+* Controlled failure and chaos-testing modes
+* Mini-RAG retrieval over manufacturing SOPs
+* Checkpoint and resume support
+* Additional before-and-after reliability benchmarks
+
+## Engineering Lessons
+
+Several broader lessons emerged while building the project:
+
+1. **Hallucination is sometimes a tool-coverage problem.**
+   An agent cannot reliably use information it has no approved way to retrieve.
+
+2. **Requesting numerical confidence can instruct a model to fabricate precision.**
+   Certainty labels should match the evidence actually available.
+
+3. **The running schema is the source of truth.**
+   Inspect the database before trusting the relationships assumed by existing queries.
+
+4. **Data errors and reasoning errors require different fixes.**
+   Incorrect joins belong in SQL fixes. Unsupported conclusions belong in prompts, tools, or validation logic.
+
+5. **Reliability work must leave evidence.**
+   Logs, prompts, tool transcripts, and run artifacts make invisible engineering work inspectable.
+
+6. **Agent autonomy should not come at the cost of traceability.**
+   Central supervision and restricted tools make the workflow easier to understand, debug, and review.
+
+
+It should not be treated as a production manufacturing system without additional security, authentication, testing, observability, deployment, and human-governance controls.
