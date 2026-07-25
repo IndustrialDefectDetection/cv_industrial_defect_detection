@@ -1,4 +1,4 @@
-# MES Agentic AI Learning Project
+# MES Agentic AI 
 
 A supervisor-orchestrated, multi-agent application for investigating manufacturing defects using synthetic Manufacturing Execution System data.
 
