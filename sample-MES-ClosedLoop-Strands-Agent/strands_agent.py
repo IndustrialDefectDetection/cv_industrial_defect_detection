@@ -16,6 +16,7 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from strands import Agent, tool
 from strands.models.anthropic import AnthropicModel
+from strands.types.exceptions import MaxTokensReachedException
 
 from agent_tracer import AgentTracer, attach_tracer
 
@@ -105,7 +106,12 @@ class MESAgentManager:
                 "max_retries": int(os.getenv("MES_API_RETRIES", "2")),
             },
             model_id=model_id,
-            max_tokens=int(os.getenv("MES_MAX_TOKENS", "4096")),
+            # A cap, not a target: the 600-word output rules keep normal
+            # replies short. 4096 was too low for the Planner, which has to
+            # emit a whole report dict as generate_pdf_report's arguments -
+            # it hit MaxTokensReachedException mid-call and the run paid for
+            # a second full invocation to continue.
+            max_tokens=int(os.getenv("MES_MAX_TOKENS", "16384")),
             params={
                 "temperature": float(os.getenv("MES_TEMPERATURE", "0.2")),
             },
@@ -128,7 +134,7 @@ class MESAgentManager:
         logger.info(f"  Sender Email: {self.sender_email}")
         logger.info(f"  Recipient Email: {self.recipient_email}")
         logger.info(f"  Base URL: {self.base_url}")
-        logger.info(f"  Max Tokens: {os.getenv('MES_MAX_TOKENS', '4096')}")
+        logger.info(f"  Max Tokens: {os.getenv('MES_MAX_TOKENS', '16384')}")
         logger.info(f"  Temperature: {os.getenv('MES_TEMPERATURE', '0.2')}")
         
         # Initialize tools and agents
@@ -1498,6 +1504,20 @@ Always focus on clear and concise email body with actionable recommendations, ow
         for attempt in (1, 2):
             try:
                 return agent_obj(prompt)
+            except MaxTokensReachedException as e:
+                # Not a failure: the model filled max_tokens mid-reply and the
+                # partial message is already in history, so calling again
+                # continues it (the SDK's documented recovery). Say so plainly
+                # rather than showing the trace a scary error.
+                last_error = e
+                logger.warning(
+                    f"{agent_name} agent hit the output token limit; continuing"
+                    if attempt == 1 else
+                    f"{agent_name} agent hit the output token limit twice - giving up")
+                self.tracer.error(
+                    agent_name.capitalize(),
+                    "output token limit reached - continuing the truncated reply "
+                    "(raise MES_MAX_TOKENS if this recurs)")
             except Exception as e:
                 last_error = e
                 logger.warning(
