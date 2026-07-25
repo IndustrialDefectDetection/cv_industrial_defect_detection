@@ -5,6 +5,7 @@ import webbrowser
 import time
 import os
 import signal
+import socket
 
 #Runs using frontend UI, if needed run startup.py @BACKEND_DIR for streamlit.
 ROOT_DIR = Path(__file__).resolve().parent
@@ -17,6 +18,35 @@ def backend_venv_python() -> Path:
     if os.name == "nt":
         return BACKEND_DIR / ".venv" / "Scripts" / "python.exe"
     return BACKEND_DIR / ".venv" / "bin" / "python"
+
+
+def port_is_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            # Windows reports a port held exclusively by another process as
+            # WinError 10013 (access forbidden), not "address in use", which
+            # makes uvicorn's raw traceback very hard to read.
+            return False
+
+
+def check_ports() -> bool:
+    """Refuse to start when a required port is taken, and say which."""
+    busy = [(name, port) for name, port in
+            (("backend API", 8000), ("Next.js chat", 3000), ("trace dashboard", 8502))
+            if not port_is_free(port)]
+    if not busy:
+        return True
+    print("Cannot start - these ports are already in use:")
+    for name, port in busy:
+        print(f"  port {port} ({name})")
+    print("\nSomething is already running - most likely another copy of Launch.py,")
+    print("or a leftover server from an earlier session. Close it and try again.")
+    print("To see what is holding a port:")
+    print("  Get-NetTCPConnection -LocalPort 8000 | Select-Object OwningProcess")
+    return False
 
 
 def stop(process):
@@ -38,6 +68,8 @@ def stop(process):
 
 
 def main():
+   if not check_ports():
+       sys.exit(1)
    backend_process =  subprocess.Popen(
         [
         sys.executable,
