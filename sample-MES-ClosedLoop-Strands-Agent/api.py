@@ -10,6 +10,7 @@ and /health can explain what is broken (missing API key, missing mes.db, ...)
 instead of uvicorn dying with a stack trace before the port even opens.
 """
 
+import logging
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -34,9 +35,30 @@ _manager_error: str | None = None
 _run_guard = threading.Lock()
 
 
+class _QuietPollingFilter(logging.Filter):
+    """Hide access-log lines for the endpoints the dashboard polls.
+
+    The trace dashboard hits /trace roughly once a second for the whole of a
+    run, so without this the console is nothing but 200 OKs and the agents'
+    own streamed output is impossible to read. Failures still get through:
+    only 2xx/3xx responses are hidden.
+    """
+
+    _POLLED = ("GET /trace", "GET /health")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if not any(path in message for path in self._POLLED):
+            return True
+        status = getattr(record, "args", None)
+        code = status[-1] if isinstance(status, tuple) and status else None
+        return not (isinstance(code, int) and 200 <= code < 400)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _manager, _manager_error
+    logging.getLogger("uvicorn.access").addFilter(_QuietPollingFilter())
     try:
         _manager = MESAgentManager(tracer=tracer)
     except Exception as e:
