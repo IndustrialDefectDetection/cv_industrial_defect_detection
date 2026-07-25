@@ -11,10 +11,38 @@ and /health can explain what is broken (missing API key, missing mes.db, ...)
 instead of uvicorn dying with a stack trace before the port even opens.
 """
 
+import asyncio
 import logging
 import os
+import sys
 import threading
+import warnings
 from contextlib import asynccontextmanager
+
+# Windows: use selector-based event loops, not the default proactor.
+#
+# The Strands SDK runs every agent call through asyncio.run() on a worker
+# thread (strands/_async.py: run_async), building and tearing down a fresh
+# event loop each time. On Windows that default loop is ProactorEventLoop,
+# whose close() can block indefinitely in _poll() waiting on overlapped I/O
+# that never settles. A live stack dump of a wedged run caught exactly that:
+#
+#     result (concurrent/futures/_base.py:445)   <- agent call, waiting
+#     ...
+#     close (asyncio/windows_events.py:865)      <- loop teardown, stuck
+#     _poll (asyncio/windows_events.py:775)
+#
+# The agents' work had finished; only the teardown hung, so the run never
+# returned and never produced its report. SelectorEventLoop has no
+# overlapped-I/O teardown path and does not exhibit this.
+if sys.platform == "win32":
+    with warnings.catch_warnings():
+        # Deprecated in 3.14 and slated for removal in 3.16. There is no
+        # global replacement yet (the successor is per-call
+        # asyncio.Runner(loop_factory=...), which we do not control inside
+        # the SDK), so revisit this when moving to 3.16.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
