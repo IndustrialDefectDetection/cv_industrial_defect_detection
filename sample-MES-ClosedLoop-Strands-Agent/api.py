@@ -89,6 +89,16 @@ def trace(since: int = 0):
     return tracer.snapshot(since)
 
 
+@app.get("/defect-types")
+def defect_types(days_back: int = 365):
+    """Distinct defect types seen in the last `days_back` days — feeds UI dropdowns."""
+    if _manager is None:
+        raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
+    result = _manager.get_defect_types(days_back)
+    rows = (result or {}).get("rows") or []
+    return {"defect_types": [r["DefectType"] for r in rows if r.get("DefectType")]}
+
+
 @app.post("/chat/")
 def send_message(message: ChatRequest):
     if _manager is None:

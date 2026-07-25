@@ -97,6 +97,12 @@ render `tool_start` as a card enriched with its matched `tool_end`
 (duration/status/row_count/result), and nest `query` events under the tool that
 ran them.
 
+## `GET /defect-types?days_back=365`
+
+Distinct defect types from the last `days_back` days (default 365), for UI
+dropdowns: `{"defect_types": ["crazing", "inclusion", ...]}`. 503 while the
+agent manager isn't ready.
+
 ## `POST /chat/`
 
 Unchanged request/response: `{"user_input": "..."}` → `{"analysis": "..."}`.

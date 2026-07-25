@@ -247,19 +247,74 @@ if chat["status"] in ("completed", "failed") and not chat.get("recorded"):
         }
     )
 
-with st.form("trigger", clear_on_submit=False):
-    question = st.text_input(
-        "Ask the agent system (POSTs /chat/ and traces the run)",
-        placeholder="e.g. Why are scratch defects up this week?",
-    )
-    submitted = st.form_submit_button("Send", disabled=chat_running)
+@st.cache_data(ttl=300)
+def load_defect_types(base: str) -> list[str]:
+    data, err = fetch_json(f"{base}/defect-types", timeout=10)
+    if err or not data:
+        return []
+    return data.get("defect_types", [])
 
-if submitted and question.strip() and not chat_running:
-    chat = {"status": "running", "question": question.strip()}
-    st.session_state["chat"] = chat
-    threading.Thread(
-        target=post_chat, args=(base_url, question.strip(), chat), daemon=True
-    ).start()
+
+defect_options = load_defect_types(base_url)
+
+with st.form("trigger", clear_on_submit=False):
+    top = st.columns([2, 1])
+    selected_defect = top[0].selectbox(
+        "Event / defect type",
+        options=[None] + defect_options,
+        format_func=lambda x: "-- Select an event type --" if x is None else x,
+        disabled=chat_running,
+    )
+    period = top[1].selectbox(
+        "Look back period",
+        ["Last 3 days", "Last 7 days", "Last 14 days", "Last 30 days", "Last 120 days"],
+        index=1,
+        disabled=chat_running,
+    )
+    scope_cols = st.columns(4)
+    include_oee = scope_cols[0].checkbox("OEE performance", value=False, disabled=chat_running)
+    include_downtime = scope_cols[1].checkbox("Downtime & stoppages", value=False, disabled=chat_running)
+    include_changeover = scope_cols[2].checkbox("Batch changeover", value=False, disabled=chat_running)
+    include_maintenance = scope_cols[3].checkbox("Maintenance correlation", value=True, disabled=chat_running)
+    submitted = st.form_submit_button(
+        "🚀 Run Analysis", disabled=chat_running, use_container_width=True
+    )
+
+if not defect_options:
+    st.warning(
+        "No defect types available from the backend — is it running, and does mes.db have data?"
+    )
+
+if submitted and not chat_running:
+    if selected_defect is None:
+        st.warning("Select an event type first.")
+    else:
+        days_back = int(period.split()[1])
+        scope_bits = [
+            label
+            for enabled, label in [
+                (include_oee, "OEE performance analysis"),
+                (include_downtime, "downtime and stoppages"),
+                (include_changeover, "batch changeover analysis"),
+                (include_maintenance, "maintenance correlation"),
+            ]
+            if enabled
+        ]
+        prompt = (
+            f"Run a root-cause defect analysis for defect type '{selected_defect}' "
+            f"over the last {days_back} days."
+        )
+        if scope_bits:
+            prompt += " Focus the analysis on: " + ", ".join(scope_bits) + "."
+        prompt += (
+            " Coordinate the full Monitor -> Analyzer -> Planner -> Verifier -> Executor"
+            " workflow and finish with a concise findings report."
+        )
+        chat = {"status": "running", "question": f"{selected_defect} · last {days_back}d"}
+        st.session_state["chat"] = chat
+        threading.Thread(
+            target=post_chat, args=(base_url, prompt, chat), daemon=True
+        ).start()
 
 # Earlier turns from this session, collapsed, oldest first.
 for turn in qa_history[:-1]:
@@ -363,7 +418,7 @@ def trace_section() -> None:
 
     # -------------------------------------------------------------- timeline
     if not events:
-        st.info("No trace yet. Send a message above (or from the chat frontend) to watch the agents work.")
+        st.info("No trace yet. Pick an event type above and click Run Analysis to watch the agents work.")
     else:
         groups, ends_by_id = group_events(events)
         for group in groups:
