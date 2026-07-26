@@ -28,11 +28,13 @@ nothing else in this file needs to change.
 """
 
 import logging
+import os
 import threading
 from collections import Counter
 from datetime import datetime, timezone
 
 import psycopg2
+import requests
 
 from bridge.db_config import (
     PG_DBNAME,
@@ -44,14 +46,23 @@ from bridge.db_config import (
 
 logger = logging.getLogger(__name__)
 
-# Flip to False in task 10, once _run_agent actually calls the agent.
-STUB_MODE = True
+# Set MES_ANALYZE_STUB=1 to run the pipeline without spending API credit -
+# the alert still completes its full lifecycle with a placeholder report.
+STUB_MODE = os.getenv("MES_ANALYZE_STUB", "0").strip().lower() in ("1", "true", "yes")
+
+# Where the agent lives. A setting, not a hardcoded address, so the backend
+# can move to another machine without a code change.
+AGENT_URL = os.getenv("MES_AGENT_URL", "http://127.0.0.1:8000").rstrip("/")
+
+# The agent reasons for one to three minutes. An ordinary few-second HTTP
+# timeout would abandon investigations that were about to succeed.
+AGENT_TIMEOUT_SECONDS = int(os.getenv("MES_AGENT_TIMEOUT", "900"))
 
 _STUB_REPORT = (
     "**[stub - no agent run]**\n\n"
     "The seam is wired and this alert completed its full lifecycle "
     "(pending → analyzing → done) without calling an LLM. "
-    "Task 10 replaces this with the real root-cause report."
+    "Unset MES_ANALYZE_STUB to run the real investigation."
 )
 
 
@@ -172,18 +183,59 @@ def _run_agent(alert_id: int, batch: dict) -> None:
                 batch.get("window_start"),
                 batch.get("window_end"),
             )
-            for det in batch.get("detections", []):
-                logger.info(
-                    "[stub]   detection %s %s conf=%.3f %s",
-                    det.get("detection_id"), det.get("class"),
-                    det.get("confidence") or 0.0, det.get("image_name"),
-                )
             _set_status(alert_id, "done", _STUB_REPORT)
             return
 
-        # --- task 10 goes here -------------------------------------------
-        raise NotImplementedError("Real agent run not implemented yet")
+        detections = batch.get("detections") or []
+        payload = {
+            "machine_id": batch.get("machine_id"),
+            "order_id": batch.get("order_id"),
+            "defect_type": _dominant_defect_type(detections),
+            "detection_count": len(detections),
+            "window_start": batch.get("window_start"),
+            "window_end": batch.get("window_end"),
+            "detections": detections,
+        }
 
+        logger.info("Alert %s: asking the agent to investigate %s×%s on machine %s",
+                    alert_id, payload["detection_count"], payload["defect_type"],
+                    payload["machine_id"])
+
+        # The blocking call. This thread waits here for the whole
+        # investigation; the bridge keeps serving the camera meanwhile.
+        resp = requests.post(f"{AGENT_URL}/investigate", json=payload,
+                             timeout=AGENT_TIMEOUT_SECONDS)
+
+        if not resp.ok:
+            # Say WHICH failure it was - "failed" alone tells nobody anything.
+            reason = {
+                409: "the agent was busy with another run",
+                503: "the agent backend is not ready (check its API key and database)",
+            }.get(resp.status_code, f"HTTP {resp.status_code}")
+            try:
+                detail = resp.json().get("detail", "")
+            except ValueError:
+                detail = resp.text[:200]
+            _set_status(alert_id, "failed", f"Investigation not run: {reason}. {detail}")
+            return
+
+        result = resp.json()
+        report = (result.get("report") or "").strip()
+        if result.get("status") != "completed" or not report:
+            _set_status(alert_id, "failed",
+                        f"Agent returned status {result.get('status')!r} with no report.")
+            return
+
+        _set_status(alert_id, "done", report)
+        logger.info("Alert %s investigated in %.0fs (%s chars)",
+                    alert_id, result.get("duration_s") or 0, len(report))
+
+    except requests.exceptions.ConnectionError:
+        _set_status(alert_id, "failed",
+                    f"Could not reach the agent at {AGENT_URL} — is the backend running?")
+    except requests.exceptions.Timeout:
+        _set_status(alert_id, "failed",
+                    f"The agent did not answer within {AGENT_TIMEOUT_SECONDS}s.")
     except Exception as exc:
         logger.error("Agent run failed for alert %s: %s", alert_id, exc, exc_info=True)
         _set_status(alert_id, "failed", f"Agent run failed: {exc}")

@@ -150,6 +150,23 @@ def _to_postgres(sql: str) -> str:
     return sql.replace("?", "%s")
 
 
+def _column_case_map(sql: str) -> dict:
+    """{lowercase: OriginalCase} for every identifier written in the query.
+
+    Used to restore column names after PostgreSQL lower-cases them. The
+    query text is the source of truth for the intended spelling, so no
+    hand-maintained mapping can drift out of date.
+    """
+    mapping = {}
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", sql):
+        low = token.lower()
+        # Keep the first spelling that isn't already all-lowercase, so
+        # 'DefectType' wins over a later bare 'defecttype'.
+        if token != low and low not in mapping:
+            mapping[low] = token
+    return mapping
+
+
 def _render_report_value(value, styles, depth=0):
     """Flatten any agent-supplied value into readable flowables.
 
@@ -363,8 +380,11 @@ class MESAgentManager:
         
         # Define allowed table names for security
         self.allowed_tables = {
-            'OEEMetrics', 'Machines', 'WorkCenters', 'Downtimes', 'WorkOrders', 
-            'Products', 'Shifts', 'Employees', 'Defects', 'QualityControl'
+            'OEEMetrics', 'Machines', 'WorkCenters', 'Downtimes', 'WorkOrders',
+            'Products', 'Shifts', 'Employees', 'Defects', 'QualityControl',
+            # Written by the CV pipeline: the camera's detections, and the
+            # alerts raised from them (CONTRACTS.md §3).
+            'VisionDetections', 'AgentAlerts'
         }
         
         # Log configuration
@@ -473,6 +493,15 @@ class MESAgentManager:
             else:
                 df = pd.read_sql_query(sql, conn)
             conn.close()
+
+            if self.db_backend == "postgres":
+                # PostgreSQL folds unquoted identifiers to lower case, while
+                # SQLite echoes back whatever the query wrote. Without this,
+                # the same tool hands the model 'defecttype' on one backend
+                # and 'DefectType' on the other - and the output rules tell
+                # it to cite specific column names like DefectRecords.
+                # The original query text carries the intended spelling.
+                df = df.rename(columns=_column_case_map(query))
             
             # Process datetime columns
             for col in df.columns:
@@ -1013,8 +1042,56 @@ class MESAgentManager:
             params = (defect_type, cutoff_date) * 5
             return self._execute_safe_query(query, params)
 
+        @tool
+        def get_recent_detections(machine_id: int, hours: int = 2):
+            """Camera detections recorded by the live vision system for ONE
+            machine in the last N hours. This is the CAMERA's own evidence -
+            what the model actually saw on the line - and is separate from
+            the Defects table, which holds human quality-control records.
+
+            Returns one row per detection: timestamp, defect class, the
+            model's confidence (0-1), the image filename, the work order
+            running at the time, and how long inference took. Newest first,
+            capped at 200 rows.
+
+            Use this when investigating a defect burst flagged by the camera,
+            to see exactly which detections triggered it and how confident
+            the model was. Only detections at or above the 0.80 confidence
+            gate are batched into an alert, but this returns every saved
+            detection, including lower-confidence ones."""
+            hours = int(hours)
+            if hours < 0 or hours > 8760:
+                raise ValueError("hours must be between 0 and 8760")
+
+            # The cutoff is computed here rather than in SQL on purpose:
+            # "N hours ago" is spelled differently in SQLite and PostgreSQL,
+            # and passing a plain timestamp as a parameter sidesteps the
+            # difference entirely.
+            cutoff = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+
+            query = """
+            SELECT
+                Timestamp,
+                DefectType,
+                Confidence,
+                ImageName,
+                OrderID,
+                InferenceTimeMs
+            FROM
+                VisionDetections
+            WHERE
+                MachineID = ?
+                AND Timestamp >= ?
+            ORDER BY
+                Timestamp DESC
+            LIMIT 200
+            """
+            return self._execute_safe_query(query, (int(machine_id), cutoff))
+
         # Shared with the Analyzer so both agents cite the same counts.
         self._summarize_defect_distribution_tool = summarize_defect_distribution
+        # The Analyzer needs the camera evidence too, not just the Monitor.
+        self._get_recent_detections_tool = get_recent_detections
 
         self.monitor_tools = [
             fetch_oee_metrics,
@@ -1023,7 +1100,8 @@ class MESAgentManager:
             fetch_work_orders_context,
             fetch_operator_logs,
             fetch_defect_records,
-            summarize_defect_distribution
+            summarize_defect_distribution,
+            get_recent_detections
         ]
 
     def _init_analyzer_tools(self):
@@ -1321,7 +1399,8 @@ class MESAgentManager:
             identify_performance_patterns,
             analyze_quality_defects,
             correlate_defects_with_maintenance,
-            self._summarize_defect_distribution_tool
+            self._summarize_defect_distribution_tool,
+            self._get_recent_detections_tool
         ]
 
     def _init_planner_tools(self):
@@ -1942,6 +2021,94 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
         )
 
         attach_tracer(self.supervisor_agent, "Supervisor", self.tracer)
+
+    def investigate_detection_burst(self, machine_id: int, defect_type: str,
+                                    detection_count: int, window_start: str,
+                                    window_end: str, order_id=None,
+                                    detections: list = None) -> dict:
+        """Investigate a burst of camera detections flagged by the CV pipeline.
+
+        This is the agent half of CONTRACTS.md §6, reached over HTTP from the
+        bridge's analyze_batch. Deliberately narrower than run_defect_analysis:
+        an alert wants a root cause fast, so the supervisor is told to run the
+        Monitor and Analyzer phases only. Planning, verification and
+        notification are what the full workflow is for.
+
+        Returns {'status', 'report', 'duration_s'} and never raises - a failed
+        investigation must still let the bridge mark its alert 'failed'.
+        """
+        start = datetime.now()
+        self._cancelled.clear()
+        self._reset_conversations()
+        self.tracer.reset()
+        self.tracer.run_start(
+            f"Defect burst: {defect_type} on machine {machine_id}",
+            params={"machine_id": machine_id, "defect_type": defect_type,
+                    "detections": detection_count,
+                    "window": f"{window_start} → {window_end}"},
+        )
+
+        sample = ""
+        for d in (detections or [])[:10]:
+            sample += (f"\n              - {d.get('timestamp')} {d.get('class')} "
+                       f"confidence {d.get('confidence')} ({d.get('image_name')})")
+
+        prompt = f"""
+            A live camera on the production line has flagged a burst of defects.
+            Investigate why it happened and report the most likely root cause.
+
+            What the camera saw:
+            - Machine ID: {machine_id}
+            - Work order: {order_id if order_id is not None else 'none active'}
+            - Dominant defect class: {defect_type}
+            - Detections above the 0.80 confidence gate: {detection_count}
+            - Time window: {window_start} to {window_end}
+            {'Sample detections:' + sample if sample else ''}
+
+            How to investigate:
+            1. Call the Monitor Agent. Tell it to use get_recent_detections for
+               machine {machine_id} to see the camera's own evidence, and to
+               pull the surrounding MES context - the work order running at the
+               time, recent downtime and maintenance on that machine, and the
+               quality-control records for '{defect_type}'.
+            2. Call the Analyzer Agent to determine the most likely root cause,
+               using correlate_defects_with_maintenance for the maintenance
+               link and summarize_defect_distribution for any counts.
+            3. Do NOT call the Planner, Verifier or Executor agents. This is a
+               fast root-cause alert, not the full improvement workflow.
+
+            Then write the report yourself, under 600 words, with exactly these
+            sections:
+            1. What the camera saw (the burst, in plain terms)
+            2. Machine and work-order context
+            3. Most likely root cause (ranked, each with a WHY mechanism and
+               HIGH/MEDIUM/LOW certainty)
+            4. What a human should check first
+            5. Gaps / missing data
+
+            The camera detections are evidence that something occurred; they do
+            not by themselves explain why. Ground every claim in a tool result.
+            """
+
+        try:
+            response = self.supervisor_agent(prompt)
+            self._check_cancelled()
+            report = response.message['content'][0]['text']
+            duration = (datetime.now() - start).total_seconds()
+            self.tracer.run_end("completed")
+            logger.info("Burst investigation finished in %.0fs (%s chars)",
+                        duration, len(report))
+            return {"status": "completed", "report": report, "duration_s": duration}
+        except RunCancelled:
+            self.tracer.run_end("cancelled")
+            return {"status": "cancelled", "report": "", "duration_s":
+                    (datetime.now() - start).total_seconds()}
+        except Exception as e:
+            logger.exception("Burst investigation failed")
+            self.tracer.error(None, f"{type(e).__name__}: {e}")
+            self.tracer.run_end("failed", error=str(e))
+            return {"status": "failed", "report": f"Investigation failed: {e}",
+                    "duration_s": (datetime.now() - start).total_seconds()}
 
     def run_defect_analysis(self, defect_type: str, days_back: int = 7, include_oee: bool = True,
                            include_downtime: bool = True, include_changeover: bool = True, 

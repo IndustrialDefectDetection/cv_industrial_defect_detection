@@ -2,6 +2,7 @@
 
 Endpoints (full contract with examples: TRACE_API.md):
   POST /analysis       run the structured, traced defect-analysis workflow
+  POST /investigate    root-cause a camera-flagged defect burst (the bridge)
   POST /cancel         stop the in-flight run at its next checkpoint
   POST /chat/          run a traced supervisor-agent chat turn
   GET  /trace?since=N  live "under the hood" event stream (poll this)
@@ -175,6 +176,44 @@ def get_report(filename: str):
     if not str(path).startswith(str(REPORTS_DIR.resolve())) or not path.is_file():
         raise HTTPException(status_code=404, detail=f"No such report: {safe_name}")
     return FileResponse(path, media_type="application/pdf", filename=safe_name)
+
+
+class BurstRequest(BaseModel):
+    """A camera-flagged defect burst, as the bridge's analyze_batch sends it."""
+
+    machine_id: int
+    defect_type: str
+    detection_count: int
+    window_start: str
+    window_end: str
+    order_id: int | None = None
+    detections: list[dict] = []
+
+
+@app.post("/investigate")
+def investigate(request: BurstRequest):
+    """Root-cause a defect burst detected by the CV pipeline (CONTRACTS.md §6).
+
+    Called by the bridge over HTTP so the agent stack stays in this project -
+    one toolchain, one set of credentials - and every investigation shows up
+    in the live trace dashboard like any other run.
+    """
+    if _manager is None:
+        raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
+    if not _run_guard.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A run is already in progress; wait for it to finish.")
+    try:
+        return _manager.investigate_detection_burst(
+            machine_id=request.machine_id,
+            defect_type=request.defect_type,
+            detection_count=request.detection_count,
+            window_start=request.window_start,
+            window_end=request.window_end,
+            order_id=request.order_id,
+            detections=request.detections,
+        )
+    finally:
+        _run_guard.release()
 
 
 @app.post("/cancel")
