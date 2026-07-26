@@ -30,6 +30,7 @@ dependencies = [
     "strands-agents>=1.0",
     "Faker>=33.0.0",
     "SQLAlchemy>=2.0.36",
+    "psycopg2-binary>=2.9.9",
 ]
 
 [project.optional-dependencies]
