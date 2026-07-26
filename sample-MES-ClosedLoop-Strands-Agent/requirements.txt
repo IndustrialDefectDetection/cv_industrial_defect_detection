@@ -14,6 +14,11 @@ uvicorn>=0.38.0
 Faker>=22.0.0
 SQLAlchemy>=2.0.0
 
+# PostgreSQL driver — setupdatabase.py imports psycopg2 to build mescopy_v1,
+# and the pipeline's bridge/analyze_batch seam talks to the same database.
+# The -binary wheel avoids needing local Postgres build tooling.
+psycopg2-binary>=2.9.9
+
 # Agent framework with direct Anthropic/Claude support
 strands-agents[anthropic]
 strands-agents-tools
