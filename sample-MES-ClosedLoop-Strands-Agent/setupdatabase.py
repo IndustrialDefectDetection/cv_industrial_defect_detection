@@ -6,13 +6,18 @@ from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SQLITE_FILE = "mescopy_v1.db"  # Replace with your actual SQLite file path
+# Read from the same MES_PG_* environment variables the bridge uses
+# (industrial-data-store-simulation-chatbot/bridge/db_config.py), so the
+# migration and the services that read the result cannot drift apart.
+# Previously these were hardcoded empty strings, which no server accepts -
+# meaning this script could never have run as committed.
+SQLITE_FILE = os.getenv("MES_SQLITE_FILE", "mes.db")  # source db in this folder
 
-PG_HOST = "localhost"
-PG_PORT = "5432"
-PG_USER = ""   # replace with username
-PG_PASSWORD = ""     # replace with password
-PG_DBNAME = "mescopy_v1"          # target database name
+PG_HOST = os.getenv("MES_PG_HOST", "localhost")
+PG_PORT = os.getenv("MES_PG_PORT", "5432")
+PG_USER = os.getenv("MES_PG_USER", "postgres")
+PG_PASSWORD = os.getenv("MES_PG_PASSWORD", "postgres")
+PG_DBNAME = os.getenv("MES_PG_DBNAME", "mescopy_v1")  # target database name
 
 def ensure_postgres_db_exists():
     """Connects to the default 'postgres' database and creates the target DB if missing."""
@@ -72,8 +77,11 @@ def run_pgloader():
         print(e.stderr)
         return False
     except FileNotFoundError:
-        print("Error: 'pgloader' utility is not installed or not in your system PATH.")
-        print("Quick fix: Run 'brew install pgloader' on your Mac.")
+        print("'pgloader' is not installed or not on PATH — skipping the MES data copy.")
+        print("  macOS:   brew install pgloader")
+        print("  Linux:   apt install pgloader")
+        print("  Windows: no official build; use WSL, Docker "
+              "(ghcr.io/dimitri/pgloader), or copy the tables another way.")
         return False
 
 def create_contract_tables():
@@ -176,12 +184,35 @@ def add_ml_columns():
             conn.close()
 
 if __name__ == "__main__":
-    # Step 1: Check/PostgreSQL database exists
-    if ensure_postgres_db_exists():
-        # Step 2: Stream all SQLite tables and historical data across
-        if run_pgloader():
-            # Step 3: Create CONTRACTS.md §3 tables (VisionDetections, AgentAlerts)
-            if create_contract_tables():
-                # Step 4: Mutate the defects table layout for the live camera values
-                add_ml_columns()
-                print("\nAll steps complete! Your live-tracking database is ready to roll.")
+    # Step 1 is the only hard prerequisite: without the database, nothing else
+    # can run.
+    if not ensure_postgres_db_exists():
+        raise SystemExit(1)
+
+    # Step 2 copies the historical MES tables across. It needs pgloader, which
+    # has no official Windows build, so it is allowed to fail.
+    migrated = run_pgloader()
+
+    # Step 3 must NOT depend on step 2. The two contract tables are created
+    # directly here and are what the bridge and the analyze_batch seam
+    # actually write to - gating them behind pgloader meant that on any
+    # machine without it the pipeline had no tables at all and could not run.
+    tables_ok = create_contract_tables()
+
+    # Step 4 only makes sense once the MES tables exist (it alters 'defects',
+    # which pgloader brings over).
+    if migrated:
+        add_ml_columns()
+
+    print()
+    if migrated and tables_ok:
+        print("All steps complete! Your live-tracking database is ready to roll.")
+    elif tables_ok:
+        print("Partial setup: VisionDetections and AgentAlerts exist, so the "
+              "bridge and analyze_batch can run now.")
+        print("The historical MES tables were NOT copied, so work-order and "
+              "machine lookups will return nothing (OrderID stays NULL) until "
+              "pgloader runs.")
+    else:
+        print("Setup failed: the contract tables could not be created.")
+        raise SystemExit(1)
