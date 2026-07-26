@@ -111,6 +111,45 @@ def _markdown_to_flowables(text, styles):
     return flowables
 
 
+def _to_postgres(sql: str) -> str:
+    """Translate this file's SQLite-dialect SQL to PostgreSQL.
+
+    Every query runs through one chokepoint (_execute_safe_query), so the
+    dialect gap is closed in one place rather than by hand-editing ~90 sites
+    across fifteen tool queries - where a mistranslated date cast returns the
+    wrong rows silently instead of raising. The differential test compares
+    both backends row for row.
+
+    Handled (the only SQLite-specific constructs this file uses):
+      date(X)                  -> CAST(X AS DATE)
+      strftime('%w', X)        -> day-of-week as text, as SQLite returns
+      strftime('%H', X)        -> zero-padded hour as text
+      julianday(X)             -> days as a float; differences stay correct
+                                  because the shared epoch offset cancels
+      datetime(X, '-72 hours') -> X - INTERVAL '72 hours'
+      ?                        -> %s
+    """
+    # julianday first: it wraps expressions the date() rule would also match.
+    sql = re.sub(r"julianday\(\s*([^()]+?)\s*\)",
+                 r"(EXTRACT(EPOCH FROM \1) / 86400.0)", sql, flags=re.I)
+    def _interval(m):
+        # SQLite's datetime(X, '-72 hours') means 72 hours BEFORE X. Getting
+        # this sign wrong does not raise - it silently searches the wrong
+        # direction in time and returns no rows.
+        target, sign, amount, unit = m.group(1), m.group(2), m.group(3), m.group(4)
+        op = "-" if sign == "-" else "+"
+        return f"({target} {op} INTERVAL '{amount} {unit}')"
+
+    sql = re.sub(r"datetime\(\s*([^,]+?)\s*,\s*'([+-]?)(\d+)\s+(\w+?)s?'\s*\)",
+                 _interval, sql, flags=re.I)
+    sql = re.sub(r"strftime\(\s*'%w'\s*,\s*([^()]+?)\s*\)",
+                 r"EXTRACT(DOW FROM \1)::int::text", sql, flags=re.I)
+    sql = re.sub(r"strftime\(\s*'%H'\s*,\s*([^()]+?)\s*\)",
+                 r"TO_CHAR(\1, 'HH24')", sql, flags=re.I)
+    sql = re.sub(r"\bdate\(\s*([^()]+?)\s*\)", r"CAST(\1 AS DATE)", sql, flags=re.I)
+    return sql.replace("?", "%s")
+
+
 def _render_report_value(value, styles, depth=0):
     """Flatten any agent-supplied value into readable flowables.
 
@@ -277,6 +316,13 @@ class MESAgentManager:
         # Database path
         self.db_path = db_path
 
+        # 'sqlite' (default, unchanged behaviour) or 'postgres' to run against
+        # the migrated mescopy_v1 the CV pipeline's bridge writes into.
+        self.db_backend = os.getenv("MES_DB_BACKEND", "sqlite").strip().lower()
+        if self.db_backend not in ("sqlite", "postgres"):
+            raise ValueError(
+                f"MES_DB_BACKEND must be 'sqlite' or 'postgres', got {self.db_backend!r}")
+
         # Newest timestamp in the database. Look-back windows count back from
         # this anchor instead of from today, so the frozen synthetic dataset
         # stays inside every window no matter when the demo runs (a "last 7
@@ -344,22 +390,47 @@ class MESAgentManager:
         self._init_supervisor_agent()
     
     def get_db_connection(self):
-        """Get a database connection"""
+        """Open a connection to whichever backend is configured.
+
+        SQLite stays the default so existing setups keep working; set
+        MES_DB_BACKEND=postgres to run against the migrated mescopy_v1 that
+        the CV pipeline's bridge also writes to.
+        """
+        if self.db_backend == "postgres":
+            import psycopg2
+            return psycopg2.connect(
+                host=os.getenv("MES_PG_HOST", "localhost"),
+                port=os.getenv("MES_PG_PORT", "5432"),
+                user=os.getenv("MES_PG_USER", "postgres"),
+                password=os.getenv("MES_PG_PASSWORD", "postgres"),
+                dbname=os.getenv("MES_PG_DBNAME", "mescopy_v1"),
+            )
         if not os.path.exists(self.db_path):
             logger.warning(f"Database file not found: {self.db_path}")
             raise FileNotFoundError(f"Database file not found: {self.db_path}")
         return sqlite3.connect(self.db_path)
-    
+
     def _load_data_anchor(self):
         """Newest timestamp across the main time-bearing tables."""
         try:
             conn = self.get_db_connection()
-            row = conn.execute(
-                "SELECT MAX(t) FROM ("
-                "SELECT MAX(Date) as t FROM QualityControl "
-                "UNION ALL SELECT MAX(StartTime) FROM Downtimes "
-                "UNION ALL SELECT MAX(ActualEndTime) FROM WorkOrders)"
-            ).fetchone()
+            sql = ("SELECT MAX(t) FROM ("
+                   "SELECT MAX(Date) as t FROM QualityControl "
+                   "UNION ALL SELECT MAX(StartTime) FROM Downtimes "
+                   "UNION ALL SELECT MAX(ActualEndTime) FROM WorkOrders)")
+            if self.db_backend == "postgres":
+                # Postgres requires a name for a derived table, and its
+                # UNION arms must share a type - the columns are all
+                # timestamps, so cast them explicitly.
+                sql = ("SELECT MAX(t) FROM ("
+                       "SELECT MAX(Date)::timestamp as t FROM QualityControl "
+                       "UNION ALL SELECT MAX(StartTime)::timestamp FROM Downtimes "
+                       "UNION ALL SELECT MAX(ActualEndTime)::timestamp FROM WorkOrders"
+                       ") AS newest")
+            cur = conn.cursor()
+            cur.execute(sql)
+            row = cur.fetchone()
+            cur.close()
             conn.close()
             if row and row[0]:
                 anchor = pd.to_datetime(row[0]).to_pydatetime()
@@ -395,10 +466,12 @@ class MESAgentManager:
         
         try:
             conn = self.get_db_connection()
+            # One place to close the dialect gap - see _to_postgres.
+            sql = _to_postgres(query) if self.db_backend == "postgres" else query
             if params:
-                df = pd.read_sql_query(query, conn, params=params)
+                df = pd.read_sql_query(sql, conn, params=params)
             else:
-                df = pd.read_sql_query(query, conn)
+                df = pd.read_sql_query(sql, conn)
             conn.close()
             
             # Process datetime columns
@@ -728,8 +801,10 @@ class MESAgentManager:
                 Shifts s ON e.ShiftID = s.ShiftID
             WHERE 
                 date(dt.StartTime) >= ?
-            GROUP BY 
-                date(dt.StartTime), dt.Reason, m.Type, wc.Name, s.Name
+            GROUP BY
+                date(dt.StartTime), strftime('%w', dt.StartTime),
+                strftime('%H', dt.StartTime),
+                dt.Reason, m.Type, wc.Name, s.Name
             ORDER BY
                 EventCount DESC, AvgDuration DESC
             LIMIT 100
@@ -799,8 +874,8 @@ class MESAgentManager:
             cutoff_date = self._cutoff_date(days_back)
             
             query = """
-            SELECT 
-                wo.ActualStartTime as WorkDate,
+            SELECT
+                MAX(wo.ActualStartTime) as WorkDate,
                 e.Name as OperatorName,
                 e.Role as OperatorRole,
                 s.Name as ShiftName,
@@ -822,9 +897,10 @@ class MESAgentManager:
             WHERE 
                 date(wo.ActualStartTime) >= ?
             GROUP BY
-                date(wo.ActualStartTime), e.EmployeeID, s.ShiftID, wc.WorkCenterID
+                date(wo.ActualStartTime), e.EmployeeID, s.ShiftID, wc.WorkCenterID,
+                e.Name, e.Role, s.Name, wc.Name, m.Type
             ORDER BY
-                wo.ActualStartTime DESC
+                WorkDate DESC
             LIMIT 100
             """
             
@@ -911,7 +987,9 @@ class MESAgentManager:
             WHERE d.DefectType = ? AND date(qc.Date) >= ?
             GROUP BY s.ShiftID
             UNION ALL
-            SELECT 'ByDate', date(qc.Date), COUNT(*), SUM(d.Quantity)
+            -- cast to text so this arm matches the TEXT of the other UNION
+            -- arms; PostgreSQL will not union a DATE with a name column
+            SELECT 'ByDate', CAST(date(qc.Date) AS TEXT), COUNT(*), SUM(d.Quantity)
             FROM Defects d
             JOIN QualityControl qc ON d.CheckID = qc.CheckID
             WHERE d.DefectType = ? AND date(qc.Date) >= ?
@@ -989,8 +1067,8 @@ class MESAgentManager:
                 Shifts s ON e.ShiftID = s.ShiftID
             WHERE 
                 date(dt.StartTime) >= ?
-            GROUP BY 
-                dt.Reason, s.Name, e.Name, p.Name, m.Type
+            GROUP BY
+                dt.Reason, s.Name, e.Name, p.Name, m.Type, wc.Name
             ORDER BY
                 TotalDuration DESC
             LIMIT 100
@@ -1115,8 +1193,8 @@ class MESAgentManager:
                 AND date(dt.StartTime) = date(wo.ActualStartTime)
             WHERE 
                 date(wo.ActualStartTime) >= ?
-            GROUP BY 
-                m.MachineID, e.EmployeeID, s.ShiftID
+            GROUP BY
+                m.MachineID, e.EmployeeID, s.ShiftID, wc.Name
             ORDER BY
                 AvgOEE ASC, TotalDowntime DESC
             LIMIT 100
@@ -1177,7 +1255,8 @@ class MESAgentManager:
                 date(qc.Date) >= ?
                 {defect_filter}
             GROUP BY
-                d.DefectType, d.RootCause, p.ProductID, m.MachineID, e.EmployeeID, s.ShiftID
+                d.DefectType, d.RootCause, p.ProductID, m.MachineID, e.EmployeeID, s.ShiftID,
+                d.Severity, d.Location, d.ActionTaken, wc.Name
             ORDER BY
                 DefectCount DESC, d.Severity DESC
             LIMIT 100
