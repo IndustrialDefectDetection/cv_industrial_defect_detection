@@ -11,6 +11,7 @@ import socket
 ROOT_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = ROOT_DIR / "sample-MES-ClosedLoop-Strands-Agent"
 FRONTEND_DIR = ROOT_DIR / "frontend"
+CHATBOT_DIR = ROOT_DIR / "industrial-data-store-simulation-chatbot"
 
 
 def backend_venv_python() -> Path:
@@ -35,7 +36,8 @@ def port_is_free(port: int) -> bool:
 def check_ports() -> bool:
     """Refuse to start when a required port is taken, and say which."""
     busy = [(name, port) for name, port in
-            (("backend API", 8000), ("Next.js chat", 3000), ("trace dashboard", 8502))
+            (("backend API", 8000), ("Next.js chat", 3000),
+             ("trace dashboard", 8502), ("detection bridge", 8081))
             if not port_is_free(port)]
     if not busy:
         return True
@@ -93,6 +95,12 @@ def stop(process):
 def main():
    if not check_ports():
        sys.exit(1)
+   # Everything speaks to the same PostgreSQL database. The camera pipeline
+   # writes detections there, so an agent left on SQLite would look in the
+   # wrong place and report that no defects were found.
+   pipeline_env = dict(os.environ)
+   pipeline_env.setdefault("MES_DB_BACKEND", "postgres")
+
    backend_process =  subprocess.Popen(
         [
         sys.executable,
@@ -100,6 +108,7 @@ def main():
         "--api"
     ],
     cwd = BACKEND_DIR,
+    env = pipeline_env,
     start_new_session=True
     )
    frontend_process = subprocess.Popen(
@@ -112,9 +121,27 @@ def main():
       start_new_session=True,
       shell = (os.name == "nt")
    )
+   # The camera-side bridge (CONTRACTS.md): receives detections, applies the
+   # 0.80 gate, batches them, and hands each burst to the agent. Runs from the
+   # backend venv because that is where psycopg2 and fastapi are installed.
+   bridge_process = None
+   venv_python = backend_venv_python()
+   if venv_python.exists():
+       bridge_process = subprocess.Popen(
+          [
+             str(venv_python),
+             "-m", "uvicorn",
+             "bridge.bridge:app",
+             "--port", "8081",
+          ],
+          cwd = CHATBOT_DIR,
+          env = pipeline_env,
+          start_new_session=True
+       )
+       print("Detection bridge: http://localhost:8081")
+
    # Under-the-hood trace viewer (TRACE_API.md) on port 8502.
    viewer_process = None
-   venv_python = backend_venv_python()
    if venv_python.exists():
        viewer_process = subprocess.Popen(
           [
@@ -150,6 +177,8 @@ def main():
    ui_processes = {"Next.js chat (port 3000)": frontend_process}
    if viewer_process is not None:
        ui_processes["trace dashboard (port 8502)"] = viewer_process
+   if bridge_process is not None:
+       ui_processes["detection bridge (port 8081)"] = bridge_process
    try:
        while True:
            if backend_process.poll() is not None:
@@ -170,6 +199,7 @@ def main():
        stop(frontend_process)
        stop(backend_process)
        stop(viewer_process)
+       stop(bridge_process)
 
 
 if(__name__ == "__main__"):

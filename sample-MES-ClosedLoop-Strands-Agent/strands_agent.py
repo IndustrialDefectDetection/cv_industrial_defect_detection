@@ -333,12 +333,16 @@ class MESAgentManager:
         # Database path
         self.db_path = db_path
 
-        # 'sqlite' (default, unchanged behaviour) or 'postgres' to run against
-        # the migrated mescopy_v1 the CV pipeline's bridge writes into.
-        self.db_backend = os.getenv("MES_DB_BACKEND", "sqlite").strip().lower()
+        # PostgreSQL is the default: the CV pipeline's bridge writes camera
+        # detections there, so an agent on SQLite cannot see them and would
+        # report "no detections" when it simply looked in the wrong database.
+        # MES_DB_BACKEND=sqlite still runs against the local mes.db.
+        self.db_backend = os.getenv("MES_DB_BACKEND", "postgres").strip().lower()
         if self.db_backend not in ("sqlite", "postgres"):
             raise ValueError(
                 f"MES_DB_BACKEND must be 'sqlite' or 'postgres', got {self.db_backend!r}")
+        if self.db_backend == "postgres":
+            self._verify_postgres_ready()
 
         # Newest timestamp in the database. Look-back windows count back from
         # this anchor instead of from today, so the frozen synthetic dataset
@@ -429,6 +433,50 @@ class MESAgentManager:
             logger.warning(f"Database file not found: {self.db_path}")
             raise FileNotFoundError(f"Database file not found: {self.db_path}")
         return sqlite3.connect(self.db_path)
+
+    def _verify_postgres_ready(self):
+        """Fail at startup, with instructions, if Postgres is not usable.
+
+        Deliberately loud rather than falling back to SQLite: a silent
+        fallback would read a different database than the one the camera
+        writes to, and the agent would confidently report "no detections"
+        for defects that were recorded perfectly well.
+        """
+        dbname = os.getenv("MES_PG_DBNAME", "mescopy_v1")
+        setup = "python setupdatabase.py   (from sample-MES-ClosedLoop-Strands-Agent)"
+        try:
+            conn = self.get_db_connection()
+        except Exception as e:
+            raise RuntimeError(
+                f"MES_DB_BACKEND=postgres but the database '{dbname}' is not reachable: {e}\n"
+                f"  * Is the PostgreSQL server running?\n"
+                f"  * Has the database been created and populated? Run:\n"
+                f"      {setup}\n"
+                f"  * Credentials come from MES_PG_USER / MES_PG_PASSWORD "
+                f"(defaults: postgres/postgres).\n"
+                f"  * To use the local SQLite copy instead, set MES_DB_BACKEND=sqlite."
+            ) from e
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='public'")
+                tables = {r[0].lower() for r in cur.fetchall()}
+        finally:
+            conn.close()
+
+        missing_mes = {"machines", "workorders", "defects"} - tables
+        if missing_mes:
+            raise RuntimeError(
+                f"Database '{dbname}' is missing the MES tables {sorted(missing_mes)}.\n"
+                f"  The historical data has not been copied across yet. Run:\n"
+                f"      {setup}")
+        if "visiondetections" not in tables:
+            # Not fatal - the MES tools still work - but the camera tool will not.
+            logger.warning(
+                "VisionDetections is missing from '%s'; get_recent_detections "
+                "will be unavailable. Run %s", dbname, setup)
+        logger.info("  Backend: PostgreSQL '%s' (%d tables)", dbname, len(tables))
 
     def _load_data_anchor(self):
         """Newest timestamp across the main time-bearing tables."""
@@ -1062,6 +1110,21 @@ class MESAgentManager:
             hours = int(hours)
             if hours < 0 or hours > 8760:
                 raise ValueError("hours must be between 0 and 8760")
+
+            if self.db_backend != "postgres":
+                # A raw "no such table" error invites the model to conclude
+                # that no defects were detected - a false finding rather
+                # than a gap. Say what is actually true.
+                return {
+                    "success": False,
+                    "error": (
+                        "Camera detections are unavailable: this agent is running "
+                        "against SQLite, and VisionDetections is written by the "
+                        "vision pipeline into PostgreSQL. This is a tool limitation, "
+                        "NOT evidence that no detections occurred - classify it as "
+                        "'not exposed by available tools'."
+                    ),
+                }
 
             # The cutoff is computed here rather than in SQL on purpose:
             # "N hours ago" is spelled differently in SQLite and PostgreSQL,
