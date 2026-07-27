@@ -269,17 +269,17 @@ export default function Home() {
       </main>
 
       {shouldGateChat && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-white/10 px-6 dark:bg-black/15">
+        <div className="session-gate-overlay fixed inset-0 z-50 flex items-center justify-center px-6">
           {isSessionPending ? (
             <div
               role="status"
               aria-live="polite"
-              className="session-typing-status"
+              className="session-check-status"
             >
-              <span className="sr-only">Checking session...</span>
-              <span className="session-typing" aria-hidden="true">
-                Checking session...
+              <span className="session-loader-frame" aria-hidden="true">
+                <span className="session-grid-loader" />
               </span>
+              <span className="session-check-label">Checking session</span>
             </div>
           ) : (
             <section className="w-full max-w-sm rounded-2xl border border-white/75 bg-white/82 p-7 text-center shadow-[0_24px_70px_rgba(30,41,59,0.24)] backdrop-blur-2xl dark:border-[#303238] dark:bg-[#111216]/94 dark:shadow-[0_28px_80px_rgba(0,0,0,0.58)]">
