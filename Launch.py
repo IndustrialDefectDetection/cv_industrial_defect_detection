@@ -91,6 +91,28 @@ def stop(process):
             return
     process.wait()
 
+def manage_frontend_dependencies():
+    bin_dir = FRONTEND_DIR / "node_modules" / ".bin"
+    next_installed = (
+        (bin_dir / "next").exists()
+        or (bin_dir / "next.cmd").exists()
+    )
+    if next_installed:
+        return True
+    print("Installing frontend dependencies")
+    try:
+        subprocess.run(
+            ["npm", "ci"],
+            cwd=FRONTEND_DIR,
+            check=True,
+            shell=(os.name == "nt"),
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to install frontend dependencies: {e}")
+    except FileNotFoundError:
+        print("npm not found. Please install Node.js and npm.")
+    return False
 
 def main():
    if not check_ports():
@@ -98,6 +120,8 @@ def main():
    # Everything speaks to the same PostgreSQL database. The camera pipeline
    # writes detections there, so an agent left on SQLite would look in the
    # wrong place and report that no defects were found.
+   if not manage_frontend_dependencies():
+        sys.exit(1)
    pipeline_env = dict(os.environ)
    pipeline_env.setdefault("MES_DB_BACKEND", "postgres")
 
