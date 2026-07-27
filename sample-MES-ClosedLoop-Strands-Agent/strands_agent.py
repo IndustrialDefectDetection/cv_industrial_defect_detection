@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from strands import Agent, tool
 from strands.models.anthropic import AnthropicModel
 from strands.types.exceptions import MaxTokensReachedException
+from chat_agent import build_conversational_agent
 
 from agent_tracer import AgentTracer, attach_tracer
 
@@ -342,6 +343,15 @@ class MESAgentManager:
         self._init_verifier_tools()
         self._init_agents()
         self._init_supervisor_agent()
+        self.conversational_agent = build_conversational_agent(
+            self.model,
+            self.supervisor_agent,
+            self.tracer,
+        )
+
+    def get_conversational_agent(self):
+        """Return the conversational agent for external use"""
+        return self.conversational_agent
     
     def get_db_connection(self):
         """Get a database connection"""

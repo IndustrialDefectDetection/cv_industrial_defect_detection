@@ -229,7 +229,8 @@ def send_message(message: ChatRequest):
         tracer.reset()
         tracer.run_start(f"Chat: {query[:80]}", params={"user_input": query[:200]})
         try:
-            response = _manager.get_supervisor_agent()(query)
+            chat_agent = _manager.get_conversational_agent()
+            response = chat_agent(query)
             analysis_text = response.message["content"][0]["text"]
         except Exception as e:
             tracer.error(None, f"{type(e).__name__}: {e}")
