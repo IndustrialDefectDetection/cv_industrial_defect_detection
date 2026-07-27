@@ -1,6 +1,10 @@
 "use client";
-import { shouldUseReactServerCondition } from "next/dist/build/utils";
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { authClient } from "@/lib/auth-client";
+import AppSidebar from "@/components/app-sidebar";
 
 type Message = {
   id: number;
@@ -16,10 +20,12 @@ export default function Home() {
   const [isWaiting, setIsWaiting] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>("system")
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const { data: session, isPending: isSessionPending } = authClient.useSession();
+  const shouldGateChat = !session;
 
   //System theme handling
   useEffect(() => {
-    const systemTheme = window.matchMedia("(prefers-color-scheme: dark");
+    const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
     const applyTheme = () => {
       const useDarkMode = themeMode === "dark" || (themeMode === "system" && systemTheme.matches);
       document.documentElement.classList.toggle(
@@ -42,6 +48,7 @@ export default function Home() {
       block: "end",
     });
   }, [messages, isWaiting]);
+
 
   async function handleSend() {
     if (input.trim() !== "") {
@@ -68,7 +75,7 @@ export default function Home() {
   }
   async function getResponse(userInput: string) {
     const response = await fetch(
-      "http://127.0.0.1:8000/chat/",
+      "/api/chat",
       {
         method: "POST",
         headers: {
@@ -84,7 +91,11 @@ export default function Home() {
   }
 
   return (
-    <main className="relative flex min-h-screen bg-[radial-gradient(circle_at_15%_12%,_#3b82f62e_0%,_transparent_30%),radial-gradient(circle_at_88%_18%,_#8b5cf62b_0%,_transparent_32%),radial-gradient(circle_at_65%_88%,_#14b8a626_0%,_transparent_36%),linear-gradient(135deg,_#f8fafc_0%,_#e8eef8_50%,_#eef2f7_100%)] text-slate-900 dark:bg-[linear-gradient(145deg,_#0d0e10_0%,_#090a0c_55%,_#0c0d0f_100%)] dark:text-zinc-100">
+    <>
+      <main
+        className={`relative flex min-h-screen bg-[radial-gradient(circle_at_15%_12%,_#3b82f62e_0%,_transparent_30%),radial-gradient(circle_at_88%_18%,_#8b5cf62b_0%,_transparent_32%),radial-gradient(circle_at_65%_88%,_#14b8a626_0%,_transparent_36%),linear-gradient(135deg,_#f8fafc_0%,_#e8eef8_50%,_#eef2f7_100%)] text-slate-900 transition-[filter,opacity] duration-300 dark:bg-[linear-gradient(145deg,_#0d0e10_0%,_#090a0c_55%,_#0c0d0f_100%)] dark:text-zinc-100 ${shouldGateChat ? "pointer-events-none select-none blur-[3px]" : ""
+          }`}
+      >
 
       <div
         aria-hidden="true"
@@ -97,7 +108,10 @@ export default function Home() {
       <header
         className={`absolute z-20 flex items-center gap-2.5 whitespace-nowrap font-semibold tracking-tight text-slate-800 transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] dark:text-slate-100 ${hasMessages
             ? "left-5 top-[1.125rem] translate-x-0 text-2xl"
-            : "left-[calc(50%+8rem)] top-[calc(50%-6rem)] -translate-x-1/2 text-4xl"
+            : `${session
+              ? "left-[calc(50%+var(--app-sidebar-half-width))]"
+              : "left-1/2"
+            } top-[calc(50%-6rem)] -translate-x-1/2 text-4xl`
           }`}
       >
         <span
@@ -141,22 +155,7 @@ export default function Home() {
         </fieldset>
       </div>
 
-      <aside
-        className={`relative z-[5] flex w-64 shrink-0 flex-col overflow-hidden border-r border-slate-200/60 p-5 pt-24 backdrop-blur-2xl transition-[background-color,box-shadow] duration-700 ease-[cubic-bezier(0.22,1,0.36,1)] dark:border-[#1b1c20] dark:bg-[linear-gradient(180deg,_#101114_0%,_#090a0c_100%)] ${hasMessages
-            ? "bg-white/38 shadow-[10px_0_36px_rgba(71,85,105,0.09)] dark:shadow-[8px_0_24px_rgba(0,0,0,0.18)]"
-            : "bg-white/28 shadow-[8px_0_30px_rgba(71,85,105,0.07)] dark:shadow-[6px_0_20px_rgba(0,0,0,0.14)]"
-          }`}
-      >
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-x-4 top-[4.5rem] h-px bg-gradient-to-r from-transparent via-slate-300/70 to-transparent dark:via-zinc-800/50"
-        />
-        <div
-          aria-hidden="true"
-          className={`pointer-events-none absolute -left-20 top-24 h-56 w-56 rounded-full bg-blue-400/10 blur-3xl transition-opacity duration-700 dark:bg-transparent ${hasMessages ? "opacity-100" : "opacity-60"
-            }`}
-        />
-      </aside>
+      {session && <AppSidebar hasMessages={hasMessages} />}
       <section className="flex flex-1 relative flex-col justify-center items-center">
         {/*User and assistant messages*/}
         <div
@@ -174,7 +173,26 @@ export default function Home() {
                   Analysis
                 </div>
                 <div className="whitespace-pre-wrap [overflow-wrap:anywhere] text-left text-base leading-7 text-slate-800 dark:text-zinc-200">
-                  {message.text}
+                  <Markdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      strong: ({ children }) => (
+                        <strong className="font-semibold text-slate-950 dark:text-white">
+                          {children}
+                        </strong>
+                      ),
+                      ul: ({ children }) => (
+                        <ul className="my-3 list-disc space-y-2 pl-6">
+                          {children}
+                        </ul>
+                      ),
+                      p: ({ children }) => (
+                        <p className="mb-3 last:mb-0">{children}</p>
+                      ),
+                    }}
+                  >
+                    {message.text}
+                  </Markdown>
                 </div>
               </div>
             )
@@ -212,7 +230,7 @@ export default function Home() {
           <div className="flex w-full items-center gap-3">
             <input
               className="flex-1 bg-transparent px-4
-           placeholder:text-slate-600 outline-0 dark:placeholder:text-zinc-500"
+             placeholder:text-slate-600 outline-0 dark:placeholder:text-zinc-500"
               type="text"
               placeholder="Type here...."
               value={input ?? ""}
@@ -245,10 +263,50 @@ export default function Home() {
               </svg>
             </button>
           </div>
-
         </footer>
 
       </section>
-    </main>
+      </main>
+
+      {shouldGateChat && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-white/10 px-6 dark:bg-black/15">
+          {isSessionPending ? (
+            <div
+              role="status"
+              aria-live="polite"
+              className="session-typing-status"
+            >
+              <span className="sr-only">Checking session...</span>
+              <span className="session-typing" aria-hidden="true">
+                Checking session...
+              </span>
+            </div>
+          ) : (
+            <section className="w-full max-w-sm rounded-2xl border border-white/75 bg-white/82 p-7 text-center shadow-[0_24px_70px_rgba(30,41,59,0.24)] backdrop-blur-2xl dark:border-[#303238] dark:bg-[#111216]/94 dark:shadow-[0_28px_80px_rgba(0,0,0,0.58)]">
+              <h2 className="text-2xl font-semibold tracking-tight text-slate-900 dark:text-zinc-100">
+                Welcome
+              </h2>
+              <p className="mt-2 text-sm leading-6 text-slate-600 dark:text-zinc-400">
+                Sign in or create an account to start a manufacturing analysis.
+              </p>
+              <div className="mt-6 grid gap-3">
+                <Link
+                  href="/sign-in"
+                  className="rounded-xl bg-slate-900 px-5 py-3 font-medium text-white shadow-lg transition hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-white"
+                >
+                  Sign in
+                </Link>
+                <Link
+                  href="/sign-in?mode=signUp"
+                  className="rounded-xl border border-slate-300/80 bg-white/55 px-5 py-3 font-medium text-slate-700 transition hover:border-slate-400 hover:bg-white/85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:border-zinc-700 dark:bg-zinc-900/70 dark:text-zinc-200 dark:hover:border-zinc-500 dark:hover:bg-zinc-800"
+                >
+                  Create account
+                </Link>
+              </div>
+            </section>
+          )}
+        </div>
+      )}
+    </>
   );
 }

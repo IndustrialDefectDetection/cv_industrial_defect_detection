@@ -2,6 +2,8 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
+  --app-sidebar-width: 16rem;
+  --app-sidebar-half-width: 8rem;
   --background: #ffffff;
   --foreground: #171717;
 }
@@ -22,6 +24,30 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+@keyframes app-sidebar-reveal {
+  from {
+    width: 0;
+    opacity: 0;
+    transform: translateX(-18px);
+  }
+
+  to {
+    width: var(--app-sidebar-width);
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.app-sidebar-reveal {
+  animation: app-sidebar-reveal 560ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-sidebar-reveal {
+    animation: none;
+  }
 }
 
 @keyframes message-enter-user {
@@ -142,6 +168,50 @@ body {
   color: #09090b;
   background: linear-gradient(135deg, #fafafa, #d4d4d8);
   box-shadow: 0 5px 16px rgb(0 0 0 / 45%);
+}
+
+/* Adapted from Uiverse.io by H_K_MENON and JkHuger */
+.session-typing-status {
+  display: grid;
+  place-items: center;
+}
+
+.session-typing {
+  width: 19ch;
+  overflow: hidden;
+  border-right: 0.1em solid #475569;
+  color: #475569;
+  font-family: Consolas, Monaco, "SFMono-Regular", monospace;
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  animation:
+    session-typing 2.2s steps(19, end),
+    session-caret 600ms step-end infinite alternate;
+}
+
+.dark .session-typing {
+  border-right-color: #d4d4d8;
+  color: #d4d4d8;
+}
+
+@keyframes session-typing {
+  from {
+    width: 0;
+  }
+}
+
+@keyframes session-caret {
+  50% {
+    border-color: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-typing {
+    animation: none;
+  }
 }
 
 /* Adapted from Uiverse.io by pradip_1434 */
