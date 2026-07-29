@@ -232,14 +232,18 @@ def main():
    # It builds six agents at startup (~10s), so a fixed 1s sleep opened the
    # dashboard onto a backend that was not listening yet.
    wait_for_backend()
-   # One tab only: the dashboard has a chat box built in, so it's the whole
-   # workflow. The Next.js chat still runs at localhost:3000 (printed above)
-   # for anyone who prefers it.
-   if viewer_process is not None:
-       webbrowser.open("http://localhost:8502")
-   else:
+   # Open the chat, because that is where you ask the system something. The
+   # dashboard used to carry a chat box of its own, which is why this used to
+   # open the dashboard instead - it now holds only the dropdowns and the Run
+   # Analysis button, so opening it left the actual chatbot unopened and
+   # looking like it had not started.
+   if frontend_process.poll() is None:
        webbrowser.open("http://localhost:3000")
-   print("Chat UI (optional): http://localhost:3000")
+   elif viewer_process is not None:
+       webbrowser.open("http://localhost:8502")
+   print("\nChat with the agents:   http://localhost:3000")
+   print("Watch them work:        http://localhost:8502  (live trace, "
+         "defect-type dropdown, Run Analysis)")
    # The backend is essential; the two UIs are not. If a UI dies (e.g. `next`
    # missing because npm install was never run), say so and keep the rest
    # alive instead of silently tearing everything down.
