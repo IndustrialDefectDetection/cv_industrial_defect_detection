@@ -338,16 +338,19 @@ The following commands can be used to verify selected refactoring assumptions:
 ```bash
 grep -c "MES_API_TIMEOUT" strands_agent.py
 grep -c "_call_agent_with_retry" strands_agent.py
-grep -c "_save_agent_output" strands_agent.py
 ```
 
 For the current implementation, the expected counts are:
 
 ```text
 MES_API_TIMEOUT:          1
-_call_agent_with_retry:  6
-_save_agent_output:      2
+_call_agent_with_retry:   9
 ```
+
+`_call_agent_with_retry` rose from 6 to 9 when the chat path started routing
+through it as well. The `_save_agent_output` check was dropped: that helper
+belongs to the upstream sample, not to this implementation, so its documented
+count of 2 had never matched.
 
 These checks are implementation-specific and should be updated when the relevant code is intentionally refactored.
 

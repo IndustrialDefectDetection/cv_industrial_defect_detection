@@ -268,6 +268,9 @@ def send_message(message: ChatRequest):
         tracer.reset()
         tracer.run_start(f"Chat: {query[:80]}", params={"user_input": query[:200]})
         try:
+            # Trims the chat history and clears a stale cancel flag. The
+            # supervisor's own reset happens per delegation, inside the tool.
+            _manager.prepare_chat_turn()
             chat_agent = _manager.get_conversational_agent()
             response = chat_agent(query)
             analysis_text = response.message["content"][0]["text"]

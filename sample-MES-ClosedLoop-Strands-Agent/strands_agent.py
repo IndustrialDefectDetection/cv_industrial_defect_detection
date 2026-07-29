@@ -402,7 +402,32 @@ class MESAgentManager:
 
         self.region_name = region_name
         self.model_id = model_id
-        
+
+        # How many tries each agent gets before it is declared unavailable.
+        # Three rather than two because the usual cause is the output token
+        # limit, where an attempt *continues* the previous partial reply
+        # instead of redoing it - so a long Planner report can genuinely need
+        # a third. Every attempt is a full billed call, hence the cap of 5.
+        self._agent_max_attempts = max(1, min(
+            int(os.getenv("MES_AGENT_MAX_ATTEMPTS", "3")), 5))
+
+        # Chat is multi-turn, so the conversational agent keeps its history -
+        # but unbounded it re-sends every earlier report on every turn.
+        self._chat_history_limit = max(2, int(
+            os.getenv("MES_CHAT_HISTORY_MESSAGES", "12")))
+
+        # How many times one chat question may delegate to the supervisor.
+        # The chat agent decides for itself when to call ask_mes_supervisor,
+        # and nothing in the model stops it deciding twice - but a delegation
+        # is a full multi-agent workflow costing minutes and real credit, so
+        # the budget is enforced here rather than merely requested in a
+        # prompt. One is the right default for a chat box: a question earns an
+        # analysis, and anything further is a follow-up the user should choose
+        # to ask.
+        self._chat_supervisor_budget = max(1, min(
+            int(os.getenv("MES_CHAT_SUPERVISOR_CALLS", "1")), 3))
+        self._chat_supervisor_calls = 0
+
         # Define allowed table names for security
         self.allowed_tables = {
             'OEEMetrics', 'Machines', 'WorkCenters', 'Downtimes', 'WorkOrders',
@@ -422,6 +447,7 @@ class MESAgentManager:
         logger.info(f"  Base URL: {self.base_url}")
         logger.info(f"  Max Tokens: {os.getenv('MES_MAX_TOKENS', '16384')}")
         logger.info(f"  Temperature: {os.getenv('MES_TEMPERATURE', '0.2')}")
+        logger.info(f"  Agent attempts: {self._agent_max_attempts}")
         
         # Initialize tools and agents
         self._init_database_tools()
@@ -437,6 +463,7 @@ class MESAgentManager:
             self.model,
             self.supervisor_agent,
             self.tracer,
+            call_supervisor=self._call_supervisor_for_chat,
         )
 
     def get_conversational_agent(self):
@@ -1945,19 +1972,23 @@ Always focus on clear and concise email body with actionable recommendations, ow
                 logger.warning(f"Could not reset {name} conversation: {e}")
 
     def _call_agent_with_retry(self, agent_name: str, agent_obj, prompt: str):
-        """Run one subagent turn; on failure (timeout/connection), retry once.
+        """Run one subagent turn, retrying on failure.
 
         Necessary companion to the bounded API timeout: a timeout raises
         where it previously hung, and a bare exception reaches the
-        supervisor as a tool error, which it then improvises around. This
-        retries once and otherwise hands back an explicit "unavailable"
+        supervisor as a tool error, which it then improvises around. Once
+        the attempts are spent this hands back an explicit "unavailable"
         string the supervisor is instructed to report as a gap.
+
+        MES_AGENT_MAX_ATTEMPTS (default 3) sets the budget.
         """
         # Cancellation checkpoint: abandoning a run between phases skips the
         # remaining agents entirely rather than paying for all five.
         self._check_cancelled()
+        max_attempts = self._agent_max_attempts
         last_error = None
-        for attempt in (1, 2):
+        for attempt in range(1, max_attempts + 1):
+            final = attempt == max_attempts
             try:
                 return agent_obj(prompt)
             except RunCancelled:
@@ -1966,25 +1997,110 @@ Always focus on clear and concise email body with actionable recommendations, ow
                 # Not a failure: the model filled max_tokens mid-reply and the
                 # partial message is already in history, so calling again
                 # continues it (the SDK's documented recovery). Say so plainly
-                # rather than showing the trace a scary error.
+                # rather than showing the trace a scary error. This is also why
+                # extra attempts help here where they would not help a genuine
+                # error - each one resumes rather than restarts.
                 last_error = e
                 logger.warning(
-                    f"{agent_name} agent hit the output token limit; continuing"
-                    if attempt == 1 else
-                    f"{agent_name} agent hit the output token limit twice - giving up")
+                    f"{agent_name} agent hit the output token limit "
+                    f"(attempt {attempt}/{max_attempts})"
+                    + (" - giving up" if final else " - continuing the reply"))
                 self.tracer.error(
                     agent_name.capitalize(),
-                    "output token limit reached - continuing the truncated reply "
-                    "(raise MES_MAX_TOKENS if this recurs)")
+                    f"output token limit reached on attempt {attempt}/{max_attempts}"
+                    + ("" if final else " - continuing the truncated reply")
+                    + " (raise MES_MAX_TOKENS, or MES_AGENT_MAX_ATTEMPTS to keep"
+                      " continuing, if this recurs)")
             except Exception as e:
                 last_error = e
                 logger.warning(
-                    f"{agent_name} agent attempt {attempt} failed: {e}"
-                    + (" - retrying once" if attempt == 1 else " - giving up"))
-                self.tracer.error(agent_name.capitalize(),
-                                  f"attempt {attempt} failed: {type(e).__name__}: {e}")
-        return (f"[{agent_name} agent unavailable after 2 attempts: {last_error}. "
-                f"Proceed with available information and state this gap explicitly.]")
+                    f"{agent_name} agent attempt {attempt}/{max_attempts} failed: {e}"
+                    + (" - giving up" if final else " - retrying"))
+                self.tracer.error(
+                    agent_name.capitalize(),
+                    f"attempt {attempt}/{max_attempts} failed: {type(e).__name__}: {e}")
+        return (f"[{agent_name} agent unavailable after {max_attempts} attempts: "
+                f"{last_error}. Proceed with available information and state this "
+                f"gap explicitly.]")
+
+    def _call_supervisor_for_chat(self, request: str) -> str:
+        """Delegate a chat question to the supervisor and return its text.
+
+        Two things the bare call in chat_agent.py did not do. It resets the
+        workflow agents first: the supervisor and its five subagents are a
+        work engine, not a conversation, so without this the third question
+        of a session re-reads the first two answers' entire transcripts,
+        tool results included. And it goes through _call_agent_with_retry,
+        so a token-limit or timeout inside the supervisor comes back as the
+        documented "unavailable" sentence rather than as a raw tool error
+        the chat agent has to improvise around.
+
+        The conversational agent's own history is deliberately untouched -
+        that is what makes follow-up questions work.
+
+        Refuses past MES_CHAT_SUPERVISOR_CALLS delegations for one question,
+        so a model that decides to "check one more thing" cannot quietly turn
+        a single chat message into several multi-minute billed workflows.
+        """
+        if self._chat_supervisor_calls >= self._chat_supervisor_budget:
+            logger.warning(
+                "chat turn tried delegation %d; budget is %d - refusing",
+                self._chat_supervisor_calls + 1, self._chat_supervisor_budget)
+            self.tracer.error(
+                "Chat",
+                f"supervisor delegation budget of {self._chat_supervisor_budget} "
+                f"reached for this question - answering from what was gathered "
+                f"(raise MES_CHAT_SUPERVISOR_CALLS to allow more)")
+            return (f"[The MES supervisor has already run "
+                    f"{self._chat_supervisor_calls} time(s) for this question, "
+                    f"which is the limit. Do not call this tool again. Answer the "
+                    f"user now using the findings you already have; if something "
+                    f"is still missing, say plainly what it is and invite them to "
+                    f"ask for it as a follow-up.]")
+
+        self._chat_supervisor_calls += 1
+        logger.info("chat delegating to supervisor (%d/%d)",
+                    self._chat_supervisor_calls, self._chat_supervisor_budget)
+        self._reset_conversations()
+        result = self._call_agent_with_retry("supervisor", self.supervisor_agent, request)
+        if isinstance(result, str):
+            return result          # the "unavailable" sentence
+        try:
+            return result.message["content"][0]["text"]
+        except (AttributeError, KeyError, IndexError, TypeError):
+            # A reply whose first block is not text (e.g. an unresolved tool
+            # use) would otherwise raise inside the tool and reach the chat
+            # agent as a stack trace.
+            return ("[supervisor returned no readable text. Report this as a gap "
+                    "rather than answering from memory.]")
+
+    def prepare_chat_turn(self):
+        """Get the conversational agent ready for one more turn.
+
+        Trims its history so a long session does not re-send every earlier
+        report, refreshes the per-question delegation budget, and clears any
+        cancel flag left over from a previous run.
+        """
+        self._cancelled.clear()
+        self._chat_supervisor_calls = 0
+        messages = getattr(self.conversational_agent, "messages", None)
+        if not messages or len(messages) <= self._chat_history_limit:
+            return
+        # Cut from the front, then walk forward to the first message that can
+        # legally begin a conversation: a user message that is not a
+        # toolResult. Sending a toolResult whose toolUse has been trimmed away
+        # is a 400 from the API, so if no safe cut point exists, cut nothing.
+        start = len(messages) - self._chat_history_limit
+        while start < len(messages):
+            message = messages[start]
+            content = message.get("content") or []
+            is_tool_result = any(isinstance(block, dict) and "toolResult" in block
+                                 for block in content)
+            if message.get("role") == "user" and not is_tool_result:
+                break
+            start += 1
+        if start < len(messages):
+            del messages[:start]
 
     def _init_supervisor_agent(self):
         """Initialize the Supervisor Agent that orchestrates the workflow"""
