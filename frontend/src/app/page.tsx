@@ -1,5 +1,4 @@
 "use client";
-import { shouldUseReactServerCondition } from "next/dist/build/utils";
 import { useEffect, useRef, useState } from "react";
 
 type Message = {
@@ -54,33 +53,75 @@ export default function Home() {
       setInput("");
       setIsWaiting(true);
       try {
-        const response = await getResponse(newMessage.text);
+        const text = await getResponse(newMessage.text);
         const chatResponse: Message = {
           id: newMessage.id + 1,
-          text: response.analysis,
+          text,
           role: "assistant"
         }
         setMessages(currentMessages => [...currentMessages, chatResponse]);
+      } catch (error) {
+        // Without this the promise rejects unhandled, the spinner stops and
+        // nothing is added — the page looks like it simply ignored you.
+        setMessages(currentMessages => [...currentMessages, {
+          id: newMessage.id + 1,
+          text: error instanceof Error ? error.message : String(error),
+          role: "assistant",
+        }]);
       } finally {
         setIsWaiting(false)
       }
     }
   }
+  // Always resolves to text to show, or throws an Error whose message is
+  // meant to be read by the user. The backend answers non-200 with
+  // {detail: ...} and no `analysis` field, so reading response.analysis
+  // unconditionally rendered an empty bubble for every failure.
   async function getResponse(userInput: string) {
-    const response = await fetch(
-      "http://127.0.0.1:8000/chat/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          "user_input": userInput
-        })
+    let response: Response;
+    try {
+      response = await fetch(
+        "http://127.0.0.1:8000/chat/",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            "user_input": userInput
+          })
+        }
+      )
+    } catch {
+      throw new Error(
+        "Can't reach the agent backend on port 8000. Is `python Launch.py` still running?"
+      );
+    }
+
+    let data: { analysis?: string; detail?: string } = {};
+    try {
+      data = await response.json();
+    } catch {
+      // A proxy error page or an empty body — status is all we have.
+    }
+
+    if (!response.ok) {
+      const detail = data.detail ? ` (${data.detail})` : "";
+      if (response.status === 409) {
+        throw new Error(
+          "The agents are busy with another run — wait for it to finish, then ask again."
+        );
       }
-    )
-    const data = await response.json()
-    return data
+      if (response.status === 503) {
+        throw new Error(`The agent backend isn't ready yet${detail}.`);
+      }
+      throw new Error(`The request failed with HTTP ${response.status}${detail}.`);
+    }
+
+    if (!data.analysis) {
+      throw new Error("The backend returned an empty answer.");
+    }
+    return data.analysis;
   }
 
   return (
