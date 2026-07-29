@@ -2584,6 +2584,59 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
         
         return self._execute_safe_query(sql_query, (cutoff_date,))
 
+    def get_recent_alerts(self, limit: int = 20):
+        """Alerts the CV pipeline raised, newest first (CONTRACTS.md §3).
+
+        A plain read rather than an agent tool: this feeds the dashboard, and
+        nothing about it should cost a model call. AgentAlerts only exists
+        once the bridge has run, so a missing table means "no camera has run
+        yet" and is reported as an empty list, not an error.
+        """
+        limit = max(1, min(int(limit), 200))
+        if self.db_backend != "postgres":
+            return {"alerts": [],
+                    "note": "AgentAlerts lives in PostgreSQL; set MES_DB_BACKEND=postgres."}
+
+        sql = """
+        SELECT AlertID, CreatedAt, MachineID, OrderID, DefectType,
+               DetectionCount, WindowStart, WindowEnd, Status, Report, CompletedAt
+        FROM AgentAlerts
+        ORDER BY AlertID DESC
+        LIMIT %s
+        """
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (limit,))
+                columns = [c[0] for c in cur.description]
+                rows = cur.fetchall()
+        except Exception as e:
+            # psycopg2 poisons the transaction on error, so the caller cannot
+            # reuse this connection either way.
+            logger.info("AgentAlerts unavailable: %s", e)
+            return {"alerts": [], "note": "No alerts yet - the bridge has not run."}
+        finally:
+            conn.close()
+
+        # PostgreSQL folds unquoted identifiers to lower case; the query text
+        # is the source of truth for the intended spelling.
+        case = _column_case_map(sql)
+        alerts = []
+        for row in rows:
+            record = {case.get(col, col): value for col, value in zip(columns, row)}
+            for field in ("CreatedAt", "WindowStart", "WindowEnd", "CompletedAt"):
+                if record.get(field) is not None:
+                    record[field] = str(record[field])
+            # Seconds from raising the alert to finishing it - the number the
+            # README wants to quote, and it is only derivable here.
+            record["DurationSeconds"] = None
+            alerts.append(record)
+        for record, row in zip(alerts, rows):
+            created, completed = row[1], row[10]
+            if created is not None and completed is not None:
+                record["DurationSeconds"] = round((completed - created).total_seconds(), 1)
+        return {"alerts": alerts}
+
     def get_defect_window_stats(self, defect_type, days_back):
         """Pre-run check: how many records of this defect the selected
         look-back window actually holds, and the newest record overall.

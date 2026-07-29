@@ -103,6 +103,33 @@ Distinct defect types from the last `days_back` days (default 365), for UI
 dropdowns: `{"defect_types": ["crazing", "inclusion", ...]}`. 503 while the
 agent manager isn't ready.
 
+## `GET /alerts?limit=20`
+
+Alerts the CV pipeline raised (CONTRACTS.md §3), newest first, so the
+dashboard can show camera-triggered investigations without opening its own
+database connection.
+
+```json
+{"alerts": [{
+  "AlertID": 1, "CreatedAt": "2026-07-28 23:41:04-07:00",
+  "MachineID": 1, "OrderID": 4901,
+  "DefectType": "patches", "DetectionCount": 6,
+  "WindowStart": "...", "WindowEnd": "...",
+  "Status": "done", "Report": "## Root Cause Investigation Report…",
+  "CompletedAt": "...", "DurationSeconds": 37.0
+}]}
+```
+
+`Status` is one of `pending`, `analyzing`, `done`, `failed`, `cancelled`.
+`DurationSeconds` is `CreatedAt`→`CompletedAt`, null until the run finishes.
+
+Deliberately **not** behind the one-run-at-a-time guard: reading the alert
+list has to keep working while an investigation is in flight, which is
+exactly when someone is watching it. Cheap to poll — a plain SELECT, no
+model call. On SQLite, or before the bridge has ever run, returns
+`{"alerts": [], "note": "..."}` rather than an error: no alerts yet is a
+normal state, not a failure. 503 while the agent manager isn't ready.
+
 ## `POST /analysis`
 
 The structured entry point the dashboard uses. Scope flags arrive as

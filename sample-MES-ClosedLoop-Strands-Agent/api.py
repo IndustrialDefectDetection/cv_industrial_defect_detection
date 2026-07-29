@@ -164,6 +164,21 @@ def defect_types(days_back: int = 365):
     return {"defect_types": [r["DefectType"] for r in rows if r.get("DefectType")]}
 
 
+@app.get("/alerts")
+def alerts(limit: int = 20):
+    """Alerts raised by the CV pipeline, newest first (CONTRACTS.md §3).
+
+    Exists so the dashboard stays a pure HTTP client rather than opening its
+    own database connection. Cheap enough to poll: a plain SELECT, no model
+    call, and it does not touch the one-run-at-a-time guard - reading the
+    alert list must keep working while an investigation is in flight, which
+    is exactly when someone is watching it.
+    """
+    if _manager is None:
+        raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
+    return _manager.get_recent_alerts(limit)
+
+
 @app.get("/report/{filename}")
 def get_report(filename: str):
     """Serve a generated PDF so the dashboard stays a pure HTTP client."""
