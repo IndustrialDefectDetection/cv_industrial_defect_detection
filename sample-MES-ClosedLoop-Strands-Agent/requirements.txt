@@ -33,3 +33,6 @@ bedrock-agentcore-starter-toolkit==0.1.14
 
 # Optional utility
 uv
+
+# Tests (tests/). pytest tests/ runs free; RUN_FULL=1 spends API credit.
+pytest
