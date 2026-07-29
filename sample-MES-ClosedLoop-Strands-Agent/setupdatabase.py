@@ -4,20 +4,20 @@ import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION — defaults to Supabase
 # ==========================================
-# Read from the same MES_PG_* environment variables the bridge uses
-# (industrial-data-store-simulation-chatbot/bridge/db_config.py), so the
-# migration and the services that read the result cannot drift apart.
-# Previously these were hardcoded empty strings, which no server accepts -
-# meaning this script could never have run as committed.
-SQLITE_FILE = os.getenv("MES_SQLITE_FILE", "mes.db")  # source db in this folder
+# Override any of these via MES_PG_* environment variables.
+# The Supabase pooler (port 6543) is the default so that
+#   python3 setupdatabase.py
+# works without any flags.  To target a local Postgres instead:
+#   MES_PG_HOST=localhost MES_PG_PORT=5432 MES_PG_USER=... python3 setupdatabase.py
+SQLITE_FILE = os.getenv("MES_SQLITE_FILE", "mescopy_v1.db")
 
-PG_HOST = os.getenv("MES_PG_HOST", "localhost")
-PG_PORT = os.getenv("MES_PG_PORT", "5432")
-PG_USER = os.getenv("MES_PG_USER", "postgres")
-PG_PASSWORD = os.getenv("MES_PG_PASSWORD", "postgres")
-PG_DBNAME = os.getenv("MES_PG_DBNAME", "mescopy_v1")  # target database name
+PG_HOST     = os.getenv("MES_PG_HOST",     "aws-0-ca-central-1.pooler.supabase.com")
+PG_PORT     = os.getenv("MES_PG_PORT",     "6543")
+PG_USER     = os.getenv("MES_PG_USER",     "postgres.isdhddsgfuzvymrxfiox")
+PG_PASSWORD = os.getenv("MES_PG_PASSWORD", "cv_industrial_defect_detection")
+PG_DBNAME   = os.getenv("MES_PG_DBNAME",   "postgres")
 
 def ensure_postgres_db_exists():
     """Connects to the default 'postgres' database and creates the target DB if missing."""
