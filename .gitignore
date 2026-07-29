@@ -8,3 +8,8 @@
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# Virtualenvs. venv writes a self-ignoring .gitignore of its own, but that is
+# a side effect to rely on rather than a rule.
+.venv/
+

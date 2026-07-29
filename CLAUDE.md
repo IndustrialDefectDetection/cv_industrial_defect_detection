@@ -18,14 +18,16 @@ The repo is a monorepo of three upstream projects (converted from submodules to 
 YOLOv8n detecting 6 NEU-DET defect classes (`crazing`, `inclusion`, `patches`, `pitted_surface`, `rolled-in_scale`, `scratches`). Plain pip project.
 
 ```bash
-pip install -r requirements.txt
+python -m venv .venv && .venv/Scripts/activate        # own venv; do not reuse the agent's
+pip install ultralytics fastapi uvicorn python-multipart prometheus-client
 uvicorn deployment.api:app --port 8080     # inference API; docs at /docs
 streamlit run streamlit_app.py             # standalone upload-and-detect UI
 dvc repro                                  # preprocess (xml_to_yolo) + train pipeline
 mlflow ui --port 5000
 ```
 
-- **Model weights are not in git.** `deployment/api.py` expects `runs/detect/steel_defect_colab_50_epochs/weights/best.pt` (override with `MODEL_PATH` env var); training happens on Colab via `notebooks/steel_defect_colab_50_epochs.ipynb`-style notebooks. Without the file, `/predict` 503s.
+- The five packages above are all `deployment/api.py` imports — enough to serve `/predict`. `requirements.txt` additionally pulls jupyter, mlflow, tensorboard, black, mypy and pre-commit; install it only when you need training or experiment tracking.
+- **Model weights are not in git**, but `best.pt` **is present on this machine** (6.3 MB). `deployment/api.py` expects `runs/detect/steel_defect_colab_50_epochs/weights/best.pt` (override with `MODEL_PATH`); training happens on Colab via `notebooks/steel_defect_colab_50_epochs.ipynb`-style notebooks. Without the file, `/predict` 503s — so a fresh clone still needs it copied across.
 - Test images: `data/dataset/images/test/`.
 
 ### industrial-data-store-simulation-chatbot — the MES side (bridge, agent, and dashboard land here)
@@ -74,8 +76,8 @@ Two-person build: **A** = agentic side (agent runner, tools, prompts, dashboard 
 
 Execution order, with status (✅ done · 🟡 partial · ⬜ open):
 
-1. 🟡 **Train YOLO on Colab (B)** — training ran (50/100-epoch artifacts committed in `runs/detect/`) but `best.pt` was never copied to this machine, so `/predict` still 503s. *This blocks everything.*
-2. ⬜ Verify API with one test image (B) — first checkpoint: a curl returns real detections.
+1. ✅ **Train YOLO on Colab (B)** — `best.pt` (6.3 MB) is now at `runs/detect/steel_defect_colab_50_epochs/weights/best.pt`. No longer blocks anything.
+2. ✅ Verify API with one test image (B) — `POST /predict` returns `pitted_surface` at 0.92 confidence with a well-formed bbox, and the payload matches the fields `simulator.py` reads. Measured across one image per class: 5 of 6 classes detected, ~50 ms inference. **Crazing detected nothing** — it is the subtle-texture class and the weakest of the six; don't build a demo around it. Only 4 of 14 detections cleared the 0.80 pipeline gate, so use `patches`, `pitted_surface` or `scratches` images to trigger a burst reliably.
 3. 🟡 CONTRACTS.md — drafted by A, awaiting B's approval.
 4. ⬜ Create `VisionDetections` + `AgentAlerts` tables (B) — note `mes.db` doesn't exist in the chatbot repo yet; run `make setup-db` first.
 5. ⬜ Lookup helpers `get_frame_machines()` / `get_active_work_order()` (B).
