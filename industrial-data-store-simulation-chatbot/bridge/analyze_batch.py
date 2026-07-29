@@ -210,6 +210,8 @@ def _run_agent(alert_id: int, batch: dict) -> None:
             # Say WHICH failure it was - "failed" alone tells nobody anything.
             reason = {
                 409: "the agent was busy with another run",
+                429: "the hourly investigation cap was reached, so this burst "
+                     "was skipped to bound spend",
                 503: "the agent backend is not ready (check its API key and database)",
             }.get(resp.status_code, f"HTTP {resp.status_code}")
             try:

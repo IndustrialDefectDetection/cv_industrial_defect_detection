@@ -66,6 +66,31 @@ _manager_error: str | None = None
 # both. A second /chat/ while one is in flight gets a 409.
 _run_guard = threading.Lock()
 
+# Rolling one-hour cap on camera-triggered investigations (CLAUDE.md: agent
+# runs cost real money). The one-at-a-time guard bounds concurrency but not
+# spend: a simulator left looping, or a genuinely faulty machine, produces a
+# burst every 30 seconds and each one is a paid multi-agent run. This bounds
+# the hour instead. Only /investigate is capped - /analysis and /chat/ are a
+# human pressing a button, which is self-limiting, and silently refusing to
+# answer someone who is sitting there watching would be worse than the spend.
+_MAX_RUNS_PER_HOUR = max(1, int(os.getenv("MES_MAX_RUNS_PER_HOUR", "20")))
+_run_times: list[float] = []
+_rate_lock = threading.Lock()
+
+
+def _claim_investigation_slot() -> tuple[bool, int]:
+    """Take an hourly slot. Returns (allowed, seconds_until_one_frees)."""
+    import time
+
+    now = time.time()
+    with _rate_lock:
+        cutoff = now - 3600
+        _run_times[:] = [t for t in _run_times if t > cutoff]
+        if len(_run_times) >= _MAX_RUNS_PER_HOUR:
+            return False, int(3600 - (now - _run_times[0])) + 1
+        _run_times.append(now)
+        return True, 0
+
 
 class _QuietPollingFilter(logging.Filter):
     """Hide access-log lines for the endpoints the dashboard polls.
@@ -141,6 +166,9 @@ def health():
         "anthropic_api_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
         "agent_manager_ready": _manager is not None,
         "agent_manager_error": _manager_error,
+        "run_in_progress": _run_guard.locked(),
+        "investigations_last_hour": len(_run_times),
+        "max_runs_per_hour": _MAX_RUNS_PER_HOUR,
     }
 
 
@@ -215,7 +243,22 @@ def investigate(request: BurstRequest):
     """
     if _manager is None:
         raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
+    allowed, retry_after = _claim_investigation_slot()
+    if not allowed:
+        # 429 rather than 409: the caller should not retry this burst shortly,
+        # it should give up on it. The bridge records the reason on the alert.
+        raise HTTPException(
+            status_code=429,
+            detail=(f"Hourly investigation cap of {_MAX_RUNS_PER_HOUR} reached. "
+                    f"A slot frees in about {retry_after}s. "
+                    f"Raise MES_MAX_RUNS_PER_HOUR to allow more."),
+            headers={"Retry-After": str(retry_after)},
+        )
     if not _run_guard.acquire(blocking=False):
+        # Hand the slot back - nothing was spent.
+        with _rate_lock:
+            if _run_times:
+                _run_times.pop()
         raise HTTPException(status_code=409, detail="A run is already in progress; wait for it to finish.")
     try:
         return _manager.investigate_detection_burst(
