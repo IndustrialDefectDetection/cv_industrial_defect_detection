@@ -94,11 +94,13 @@ Execution order, with status (✅ done · 🟡 partial · ⬜ open):
 16. ⬜ One-command startup script (B).
 17. ⬜ README + demo GIF + latency numbers (A).
 
-**Explicitly cut — don't let these creep back in:** Postgres migration (use WAL mode if SQLite locks), Kafka/queues, WebSockets, Grafana polish, steelMLOps CI fixes. *Drift note: recent commits added a SQLite→Postgres migration (`mescopy`/pgloader) in sample-MES — that's on the cut list; park until after task 17.*
+**Explicitly cut — don't let these creep back in:** Kafka/queues, WebSockets, Grafana polish, steelMLOps CI fixes.
+
+*The Postgres migration was on this list and is now done and shipped.* It stopped being optional once the camera and the agent needed one database: the bridge wrote detections to Postgres while the agent read SQLite, so the agent reported `no such table: VisionDetections` while every service claimed to be healthy. `MES_DB_BACKEND=postgres` is the default and `mescopy_v1` is the shared database.
 
 ## Cross-cutting gotchas
 
 - Three Python toolchains coexist: uv (chatbot), plain venv via `startup.py` (sample-MES), pip requirements (mlops). Don't mix them.
 - Two Claude access paths coexist: Bedrock/boto3 (chatbot repo, original code) and direct Anthropic API via `.env` (sample-MES, the direction the project is moving).
-- Agent runs cost real money and take ~60s. The design guards against spam by contract: confidence gate ≥ 0.80, 30-second batching, one run at a time, max-runs-per-hour cap, failures mark alerts `failed` rather than crashing (see CONTRACTS.md §5–6).
-- If SQLite write-locks appear with multiple services on `mes.db`, enable WAL mode (`PRAGMA journal_mode=WAL`) — Postgres migration is explicitly out of scope for the pipeline.
+- Agent runs cost real money and take ~40–260s. The design guards against spam by contract, and all of it is implemented: confidence gate ≥ 0.80 and 30-second batching in the bridge; one run at a time (`_run_guard`) and an hourly cap (`MES_MAX_RUNS_PER_HOUR`, default 20 → HTTP 429) on `/investigate`; one supervisor delegation per chat question (`MES_CHAT_SUPERVISOR_CALLS`); failures mark alerts `failed` with a reason rather than crashing (CONTRACTS.md §5–6).
+- Everything reads and writes PostgreSQL `mescopy_v1`. If a service reports missing tables or no defects, check `MES_DB_BACKEND` before anything else — a service left on SQLite looks healthy and simply finds nothing.

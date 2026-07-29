@@ -1,6 +1,6 @@
 # CONTRACTS.md — CV → MES Agentic Defect Detection
 
-**Status: DRAFT (A) — needs B's approval.** Once approved, changing anything here requires telling the other person first.
+**Status: IMPLEMENTED.** Every section below is built and has been run end to end: five images produced 24 stored detections, 6 cleared the gate, one batch window closed, and the agent returned a root-cause report in 73 seconds. Changing anything here requires telling the other person first.
 
 All field and column names below are taken from the real code (`deployment/api.py`, `sqlite-synthetic-mes-data.py`), not invented — do not rename them.
 
@@ -9,10 +9,20 @@ All field and column names below are taken from the real code (`deployment/api.p
 | Port | Process | Repo | Endpoint(s) |
 |------|---------|------|-------------|
 | 8080 | Inference API (`deployment/api.py`) | steel-defect-detection-mlops | `POST /predict`, `GET /health` |
-| 8081 | Bridge (FastAPI, new) | industrial-data-store-simulation-chatbot | `POST /detection`, `GET /health` |
-| 8501 | Streamlit dashboard (existing app + new tab) | industrial-data-store-simulation-chatbot | — |
+| 8081 | Bridge (`bridge/bridge.py`) | industrial-data-store-simulation-chatbot | `POST /detection`, `GET /health` |
+| 8000 | Agent backend (`api.py`) | sample-MES-ClosedLoop-Strands-Agent | `POST /investigate`, `/analysis`, `/chat/`, `/cancel`; `GET /trace`, `/alerts`, `/health` |
+| 8502 | Trace dashboard (`trace_viewer.py`) | sample-MES-ClosedLoop-Strands-Agent | — (HTTP client of 8000; contract in `TRACE_API.md`) |
+| 3000 | Chat UI (Next.js) | frontend | — (posts to `/chat/`) |
 
-Database: `mes.db` at the **root of industrial-data-store-simulation-chatbot** (the existing `DatabaseManager` resolves it relative to the working directory — bridge, agent, and dashboard must all be started from that repo's root). Enable WAL mode on connect (`PRAGMA journal_mode=WAL`).
+`python Launch.py` at the repo root starts all five and refuses to start if any port is taken.
+
+> The dashboard was originally planned as a new tab on the existing Streamlit app at 8501. It became `trace_viewer.py` on 8502 instead, so that watching the agents work does not depend on the chatbot app being the thing you are running.
+
+Database: **PostgreSQL `mescopy_v1`** on localhost:5432, shared by every service. Connection settings come from `MES_PG_HOST` / `MES_PG_PORT` / `MES_PG_DBNAME` / `MES_PG_USER` / `MES_PG_PASSWORD`; the agent side selects it with `MES_DB_BACKEND=postgres`, which is the default.
+
+> **Changed from the original plan.** This began as SQLite (`mes.db`, WAL mode) and moved to PostgreSQL so the camera and the agent share one database. The move was forced: with the camera writing detections to one store and the agent reading another, the agent answered *"no such table: VisionDetections"* while everything reported healthy. Nothing else in this contract changed — the payload, the seam and the table shapes are as they were.
+>
+> PostgreSQL folds unquoted identifiers to lower case, so `DefectType` comes back as `defecttype`. The agent restores the intended spelling from the query text (`_column_case_map`), because its output rules cite exact column names. Anything else reading these tables must expect lower case.
 
 ## 2. Detection payload — simulator → bridge
 
@@ -37,36 +47,36 @@ The simulator POSTs one JSON object to `http://localhost:8081/detection` per ana
 
 ## 3. Database tables (bridge creates with `CREATE TABLE IF NOT EXISTS` at startup)
 
-`mes.db` is wiped by the data generator, so both tables must be (re)created idempotently every time the bridge starts.
+The MES data can be regenerated from scratch, so both tables must be (re)created idempotently every time the bridge starts.
 
 ```sql
 CREATE TABLE IF NOT EXISTS VisionDetections (
-    DetectionID   INTEGER PRIMARY KEY AUTOINCREMENT,
-    Timestamp     TEXT    NOT NULL,          -- UTC ISO-8601, from payload
-    MachineID     INTEGER NOT NULL,          -- FK Machines.MachineID
-    OrderID       INTEGER,                   -- FK WorkOrders.OrderID, NULL if no active order
-    DefectType    TEXT    NOT NULL,          -- "class" from payload
-    Confidence    REAL    NOT NULL,          -- 0.0–1.0
-    BBox          TEXT,                      -- JSON string of the bbox object
-    ImageName     TEXT,
-    InferenceTimeMs REAL
+    DetectionID     SERIAL PRIMARY KEY,
+    Timestamp       TIMESTAMPTZ NOT NULL,      -- UTC, from payload
+    MachineID       INTEGER NOT NULL,          -- FK Machines.MachineID
+    OrderID         INTEGER,                   -- FK WorkOrders.OrderID, NULL if no active order
+    DefectType      TEXT NOT NULL,             -- "class" from payload
+    Confidence      DOUBLE PRECISION NOT NULL, -- 0.0–1.0
+    BBox            TEXT,                      -- JSON string of the bbox object
+    ImageName       TEXT,
+    InferenceTimeMs DOUBLE PRECISION
 );
 -- One row per detection (an image with 3 boxes = 3 rows). Every detection is
 -- saved regardless of confidence; the 0.80 gate only controls batching.
 
 CREATE TABLE IF NOT EXISTS AgentAlerts (
-    AlertID        INTEGER PRIMARY KEY AUTOINCREMENT,
-    CreatedAt      TEXT    NOT NULL,         -- UTC ISO-8601
+    AlertID        SERIAL PRIMARY KEY,
+    CreatedAt      TIMESTAMPTZ NOT NULL,
     MachineID      INTEGER NOT NULL,
     OrderID        INTEGER,
-    DefectType     TEXT    NOT NULL,         -- dominant class in the batch
+    DefectType     TEXT NOT NULL,             -- dominant class in the batch
     DetectionCount INTEGER NOT NULL,
-    WindowStart    TEXT    NOT NULL,
-    WindowEnd      TEXT    NOT NULL,
-    Status         TEXT    NOT NULL DEFAULT 'pending',
-                   -- 'pending' | 'analyzing' | 'done' | 'failed'
-    Report         TEXT,                     -- agent's markdown report, NULL until done
-    CompletedAt    TEXT
+    WindowStart    TIMESTAMPTZ NOT NULL,
+    WindowEnd      TIMESTAMPTZ NOT NULL,
+    Status         TEXT NOT NULL DEFAULT 'pending',
+                   -- 'pending' | 'analyzing' | 'done' | 'failed' | 'cancelled'
+    Report         TEXT,                      -- agent's markdown report, NULL until done
+    CompletedAt    TIMESTAMPTZ
 );
 ```
 
