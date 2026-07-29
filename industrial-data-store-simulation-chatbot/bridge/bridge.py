@@ -17,7 +17,7 @@ import logging
 
 import psycopg2
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from bridge.batch_manager import BatchManager
 from bridge.db_config import (
@@ -50,7 +50,15 @@ class BBox(BaseModel):
 
 
 class DetectionItem(BaseModel):
-    class_: str
+    # The wire format is CONTRACTS.md §2's "class", straight from the
+    # inference API's /predict. "class" is a Python keyword, so the attribute
+    # has to be class_ - but without this alias Pydantic looked for a literal
+    # "class_" key, found none, and rejected every payload the camera sent
+    # with a 422. populate_by_name keeps class_= working for constructing one
+    # in tests.
+    model_config = ConfigDict(populate_by_name=True)
+
+    class_: str = Field(alias="class")
     class_id: int
     confidence: float
     bbox: BBox

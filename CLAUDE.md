@@ -79,15 +79,15 @@ Execution order, with status (✅ done · 🟡 partial · ⬜ open):
 1. ✅ **Train YOLO on Colab (B)** — `best.pt` (6.3 MB) is now at `runs/detect/steel_defect_colab_50_epochs/weights/best.pt`. No longer blocks anything.
 2. ✅ Verify API with one test image (B) — `POST /predict` returns `pitted_surface` at 0.92 confidence with a well-formed bbox, and the payload matches the fields `simulator.py` reads. Measured across one image per class: 5 of 6 classes detected, ~50 ms inference. **Crazing detected nothing** — it is the subtle-texture class and the weakest of the six; don't build a demo around it. Only 4 of 14 detections cleared the 0.80 pipeline gate, so use `patches`, `pitted_surface` or `scratches` images to trigger a burst reliably.
 3. 🟡 CONTRACTS.md — drafted by A, awaiting B's approval.
-4. ⬜ Create `VisionDetections` + `AgentAlerts` tables (B) — note `mes.db` doesn't exist in the chatbot repo yet; run `make setup-db` first.
-5. ⬜ Lookup helpers `get_frame_machines()` / `get_active_work_order()` (B).
+4. ✅ Create `VisionDetections` + `AgentAlerts` tables (B) — both live in Postgres `mescopy_v1`, created idempotently at bridge startup.
+5. ✅ Lookup helpers `get_frame_machines()` / `get_active_work_order()` (B) — `bridge/mes_lookups.py`; resolved OrderID 4901 in the live run.
 6. ✅ Read existing agent code (A) — findings are the architecture notes above.
-7. ⬜ Fake camera / replay script with burst mode (B).
-8. ⬜ Bridge: save all detections, gate ≥ 0.80, 30s batching (B).
-9. ⬜ Wire the seam with a stub `analyze_batch()` (both) — checkpoint: printed batch end-to-end, zero LLM cost.
-10. ⬜ Real `analyze_batch()` agent runner (A).
-11. ⬜ A's agent tool, e.g. `get_recent_detections(machine_id, hours)` (A).
-12. ⬜ Prompt iteration loop (A) — checkpoint: a burst produces a root-cause report in the DB.
+7. ✅ Fake camera / replay script with burst mode (B) — `bridge/simulator.py`; `--interval 0.5` over a folder of images is the burst.
+8. ✅ Bridge: save all detections, gate ≥ 0.80, 30s batching (B) — verified live: 24 detections saved, 6 cleared the gate, one batch.
+9. ✅ Wire the seam with a stub `analyze_batch()` (both) — `MES_ANALYZE_STUB=1` still runs the whole lifecycle for free.
+10. ✅ Real `analyze_batch()` agent runner (A) — posts to `/investigate`; alert goes `pending → analyzing → done`.
+11. ✅ A's agent tool `get_recent_detections(machine_id, hours)` (A) — registered on Monitor and Analyzer.
+12. 🟡 Prompt iteration loop (A) — **checkpoint met**: a burst produced a 4,733-char root-cause report naming the machine, work order, product, operator and shift correctly. Still worth iterating: the report ranked "vision system anomaly" HIGH certainty on the strength of a 1,200 ms inference time that was really just model warm-up on the first request.
 13. ⬜ Guardrails: one run at a time, hourly cap, failures → `failed` (A).
 14. ⬜ Live dashboard tab (A) — **open decision:** plan says Streamlit tab, but a Next.js frontend was started; pick deliberately.
 15. ⬜ Evaluation vs. the generator's injected incidents → `docs/evaluation.md` (A).
