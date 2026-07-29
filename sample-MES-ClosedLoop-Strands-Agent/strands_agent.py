@@ -12,6 +12,26 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import sys
+
+# Print agent output as UTF-8 whatever the console is.
+#
+# Strands' default PrintingCallbackHandler prints every streamed token to
+# stdout. When a host process is launched by Launch.py its stdout is a pipe,
+# so Python falls back to the locale encoding - cp1252 on Windows - and the
+# first emoji the model writes raises UnicodeEncodeError *inside the
+# streaming callback*, which aborts the whole agent call. The conversational
+# agent heads its answers with emoji, so this broke every chat turn. It lives
+# here rather than in api.py because app.py, trace_viewer.py and the bridge
+# all reach the agents without importing api. errors='replace' costs an
+# unprintable glyph a '?' in the console instead of costing the user their
+# answer.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):  # already wrapped, or not a TextIO
+        pass
+
 import boto3
 import pandas as pd
 from botocore.exceptions import ClientError

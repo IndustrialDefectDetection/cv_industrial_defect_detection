@@ -124,6 +124,9 @@ def main():
         sys.exit(1)
    pipeline_env = dict(os.environ)
    pipeline_env.setdefault("MES_DB_BACKEND", "postgres")
+   # Child stdout is a pipe here, so Python would otherwise pick the Windows
+   # locale encoding (cp1252) and die on the first emoji an agent streams.
+   pipeline_env.setdefault("PYTHONIOENCODING", "utf-8")
 
    backend_process =  subprocess.Popen(
         [
