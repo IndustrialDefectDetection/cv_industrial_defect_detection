@@ -12,13 +12,25 @@ ROOT_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = ROOT_DIR / "sample-MES-ClosedLoop-Strands-Agent"
 FRONTEND_DIR = ROOT_DIR / "frontend"
 CHATBOT_DIR = ROOT_DIR / "industrial-data-store-simulation-chatbot"
+MLOPS_DIR = ROOT_DIR / "steel-defect-detection-mlops"
+MODEL_WEIGHTS = MLOPS_DIR / "runs/detect/steel_defect_colab_50_epochs/weights/best.pt"
+
+
+def venv_python(project_dir: Path) -> Path:
+    """The interpreter inside a sub-project's own venv.
+
+    Each sub-project keeps its own: the agent venv has streamlit and psycopg2,
+    the mlops one has torch and ultralytics. Deliberately not shared - see
+    CLAUDE.md on the three toolchains.
+    """
+    if os.name == "nt":
+        return project_dir / ".venv" / "Scripts" / "python.exe"
+    return project_dir / ".venv" / "bin" / "python"
 
 
 def backend_venv_python() -> Path:
     # Same venv startup.py creates; streamlit lives there, not in the launcher's Python.
-    if os.name == "nt":
-        return BACKEND_DIR / ".venv" / "Scripts" / "python.exe"
-    return BACKEND_DIR / ".venv" / "bin" / "python"
+    return venv_python(BACKEND_DIR)
 
 
 def port_is_free(port: int) -> bool:
@@ -37,7 +49,8 @@ def check_ports() -> bool:
     """Refuse to start when a required port is taken, and say which."""
     busy = [(name, port) for name, port in
             (("backend API", 8000), ("Next.js chat", 3000),
-             ("trace dashboard", 8502), ("detection bridge", 8081))
+             ("trace dashboard", 8502), ("detection bridge", 8081),
+             ("inference API", 8080))
             if not port_is_free(port)]
     if not busy:
         return True
@@ -148,15 +161,44 @@ def main():
       start_new_session=True,
       shell = (os.name == "nt")
    )
+   # The camera itself: YOLOv8 inference on port 8080, which the simulator
+   # POSTs images to. Runs from the mlops venv - that is the only one with
+   # torch and ultralytics, and mixing them into the agent venv would break
+   # the toolchain separation CLAUDE.md asks for.
+   inference_process = None
+   mlops_python = venv_python(MLOPS_DIR)
+   if not mlops_python.exists():
+       print("Inference API not started: no venv in steel-defect-detection-mlops.")
+       print("  python -m venv .venv && .venv/Scripts/activate")
+       print("  pip install ultralytics fastapi uvicorn python-multipart prometheus-client")
+   elif not MODEL_WEIGHTS.exists():
+       # The API would start and then 503 every /predict, which looks like a
+       # broken bridge rather than a missing file.
+       print(f"Inference API not started: model weights missing at {MODEL_WEIGHTS}.")
+       print("  Train on Colab, or copy best.pt across from whoever has it.")
+   else:
+       inference_process = subprocess.Popen(
+          [
+             str(mlops_python),
+             "-m", "uvicorn",
+             "deployment.api:app",
+             "--port", "8080",
+          ],
+          cwd = MLOPS_DIR,
+          env = pipeline_env,
+          start_new_session=True
+       )
+       print("Inference API: http://localhost:8080  (docs at /docs)")
+
    # The camera-side bridge (CONTRACTS.md): receives detections, applies the
    # 0.80 gate, batches them, and hands each burst to the agent. Runs from the
    # backend venv because that is where psycopg2 and fastapi are installed.
    bridge_process = None
-   venv_python = backend_venv_python()
-   if venv_python.exists():
+   backend_python = backend_venv_python()
+   if backend_python.exists():
        bridge_process = subprocess.Popen(
           [
-             str(venv_python),
+             str(backend_python),
              "-m", "uvicorn",
              "bridge.bridge:app",
              "--port", "8081",
@@ -169,10 +211,10 @@ def main():
 
    # Under-the-hood trace viewer (TRACE_API.md) on port 8502.
    viewer_process = None
-   if venv_python.exists():
+   if backend_python.exists():
        viewer_process = subprocess.Popen(
           [
-             str(venv_python),
+             str(backend_python),
              "-m",
              "streamlit",
              "run",
@@ -206,6 +248,13 @@ def main():
        ui_processes["trace dashboard (port 8502)"] = viewer_process
    if bridge_process is not None:
        ui_processes["detection bridge (port 8081)"] = bridge_process
+   if inference_process is not None:
+       ui_processes["inference API (port 8080)"] = inference_process
+   if inference_process is not None and bridge_process is not None:
+       print("\nCamera demo - fire a burst from another terminal:")
+       print(f"  cd {CHATBOT_DIR.name}")
+       print(f"  {backend_python} -m bridge.simulator"
+             f" --image-dir ../{MLOPS_DIR.name}/data/demo_burst --interval 0.5")
    try:
        while True:
            if backend_process.poll() is not None:
@@ -217,7 +266,7 @@ def main():
                          "see messages above for why; everything else keeps running.")
                    del ui_processes[name]
            if not ui_processes:
-               print("Both UIs have exited - shutting down.")
+               print("Every non-backend service has exited - shutting down.")
                break
            time.sleep(1)
    except KeyboardInterrupt:
@@ -227,6 +276,7 @@ def main():
        stop(backend_process)
        stop(viewer_process)
        stop(bridge_process)
+       stop(inference_process)
 
 
 if(__name__ == "__main__"):
