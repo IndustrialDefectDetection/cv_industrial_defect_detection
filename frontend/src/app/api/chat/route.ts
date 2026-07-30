@@ -1,4 +1,14 @@
+import { auth } from "@/lib/auth";
+
 export async function POST(request: Request) {
+  const session = await auth.api.getSession({
+    headers: request.headers,
+  });
+
+  if (!session) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const body = await request.json();
   const backendUrl = process.env.BACKEND_URL;
 

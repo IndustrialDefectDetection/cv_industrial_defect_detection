@@ -200,7 +200,7 @@ function SignInCard() {
         <button
           type="button"
           onClick={signInWithGoogle}
-          className="w-full rounded-xl border border-slate-300/80 bg-white/60 px-5 py-3 font-normal text-slate-700 transition hover:border-slate-400 hover:bg-white/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:border-[#383a42] dark:bg-[#131418]/65 dark:text-zinc-300 dark:hover:border-[#4a4d56] dark:hover:bg-[#1d1e23]"
+          className="w-full rounded-xl border border-blue-500 bg-blue-600 px-5 py-3 font-normal text-white shadow-lg shadow-blue-600/20 transition hover:border-blue-400 hover:bg-blue-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:border-blue-500 dark:bg-blue-600 dark:text-white dark:hover:border-blue-400 dark:hover:bg-blue-500"
         >
           Continue with Google
         </button>
