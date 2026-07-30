@@ -52,7 +52,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from agent_tracer import AgentTracer
-from strands_agent import REPORTS_DIR, MESAgentManager
+from strands_agent import REPORTS_DIR, MESAgentManager, RunCancelled
 
 # One tracer for the process. It exists even when the manager fails to build,
 # so /trace always answers. MESAgentManager shares this instance.
@@ -242,7 +242,8 @@ def cancel_run():
     if _manager is None:
         raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
     running = _run_guard.locked()
-    _manager.cancel()
+    if running:
+        _manager.cancel()
     return {"cancelling": running,
             "detail": "Cancelling the run" if running else "No run was in progress"}
 
@@ -283,12 +284,14 @@ def send_message(message: ChatRequest):
         tracer.reset()
         tracer.run_start(f"Chat: {query[:80]}", params={"user_input": query[:200]})
         try:
-            # Trims the chat history and clears a stale cancel flag. The
-            # supervisor's own reset happens per delegation, inside the tool.
-            _manager.prepare_chat_turn()
-            chat_agent = _manager.get_conversational_agent()
-            response = chat_agent(query)
+            response = _manager.run_chat(query)
+            if response.stop_reason == "cancelled":
+                tracer.run_end("cancelled")
+                return {"status": "cancelled"}
             analysis_text = response.message["content"][0]["text"]
+        except RunCancelled:
+            tracer.run_end("cancelled")
+            return {"status": "cancelled"}
         except Exception as e:
             tracer.error(None, f"{type(e).__name__}: {e}")
             tracer.run_end("failed", error=str(e))

@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { authClient } from "@/lib/auth-client";
@@ -18,6 +18,11 @@ type Chat = {
   isPinned: boolean;
   updatedAt: string;
   messages: Message[];
+};
+
+type ChatResponse = {
+  analysis?: string;
+  status?: "cancelled";
 };
 
 function orderChats(chatList: Chat[]) {
@@ -46,6 +51,7 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [enteringChatId, setEnteringChatId] = useState<string | null>(null);
   const [isHistoryLoading, setIsHistoryLoading] = useState(false);
   const [deletingChatId, setDeletingChatId] = useState<string | null>(null);
   const [pinningChatId, setPinningChatId] = useState<string | null>(null);
@@ -53,9 +59,12 @@ export default function Home() {
   const [input, setInput] = useState("");
   const hasMessages = messages.length > 0;
   const [isWaiting, setIsWaiting] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
+  const [cancelledMessageIds, setCancelledMessageIds] = useState<string[]>([]);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>("system")
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const cancelRequestedRef = useRef(false);
   const { data: session, isPending: isSessionPending } = authClient.useSession();
   const shouldGateChat = !session;
 
@@ -123,6 +132,14 @@ export default function Home() {
     return () => controller.abort();
   }, [session]);
 
+  function markMessageCancelled(messageId: string) {
+    setCancelledMessageIds((currentIds) =>
+      currentIds.includes(messageId)
+        ? currentIds
+        : [...currentIds, messageId]
+    );
+  }
+
   async function handleSend() {
     if (
       !isHistoryLoading
@@ -139,9 +156,21 @@ export default function Home() {
       const pendingMessages = [...messages, newMessage];
       setMessages(pendingMessages);
       setInput("");
+      setHistoryError(null);
+      cancelRequestedRef.current = false;
       setIsWaiting(true);
       try {
         const response = await getResponse(newMessage.text);
+
+        if (cancelRequestedRef.current || response.status === "cancelled") {
+          markMessageCancelled(newMessage.id);
+          return;
+        }
+
+        if (typeof response.analysis !== "string") {
+          throw new Error("Assistant response did not include analysis");
+        }
+
         const chatResponse: Message = {
           id: crypto.randomUUID(),
           text: response.analysis,
@@ -150,8 +179,42 @@ export default function Home() {
         const completedMessages = [...pendingMessages, chatResponse];
         setMessages(completedMessages);
         await saveChat(completedMessages);
+      } catch {
+        if (cancelRequestedRef.current) {
+          markMessageCancelled(newMessage.id);
+        } else {
+          setHistoryError("The assistant could not respond.");
+        }
       } finally {
-        setIsWaiting(false)
+        cancelRequestedRef.current = false;
+        setIsCancelling(false);
+        setIsWaiting(false);
+      }
+    }
+  }
+
+  async function cancelPrompt() {
+    if (!isWaiting || isCancelling) {
+      return;
+    }
+
+    cancelRequestedRef.current = true;
+    setIsCancelling(true);
+    setHistoryError(null);
+
+    try {
+      const response = await fetch("/api/chat/cancel", {
+        method: "POST",
+      });
+
+      if (!response.ok) {
+        throw new Error("Unable to cancel prompt");
+      }
+    } catch {
+      if (cancelRequestedRef.current) {
+        cancelRequestedRef.current = false;
+        setIsCancelling(false);
+        setHistoryError("The current response could not be cancelled.");
       }
     }
   }
@@ -181,6 +244,9 @@ export default function Home() {
       }
 
       const data = await response.json() as { chat: Chat };
+      if (conversationId === null) {
+        setEnteringChatId(data.chat.id);
+      }
       setActiveChatId(data.chat.id);
       setChats((currentChats) => retainRecentChats([
         data.chat,
@@ -197,6 +263,8 @@ export default function Home() {
     }
 
     setActiveChatId(null);
+    setEnteringChatId(null);
+    setCancelledMessageIds([]);
     setMessages([]);
     setInput("");
     setHistoryError(null);
@@ -217,6 +285,7 @@ export default function Home() {
 
     if (selectedChat) {
       setActiveChatId(selectedChat.id);
+      setCancelledMessageIds([]);
       setMessages(selectedChat.messages);
       setInput("");
       setHistoryError(null);
@@ -298,6 +367,7 @@ export default function Home() {
 
       if (activeChatId === chatId) {
         setActiveChatId(null);
+        setCancelledMessageIds([]);
         setMessages([]);
         setInput("");
       }
@@ -326,7 +396,7 @@ export default function Home() {
     }
   }
 
-  async function getResponse(userInput: string) {
+  async function getResponse(userInput: string): Promise<ChatResponse> {
     const response = await fetch(
       "/api/chat",
       {
@@ -339,7 +409,12 @@ export default function Home() {
         })
       }
     )
-    const data = await response.json()
+    const data = await response.json() as ChatResponse;
+
+    if (!response.ok) {
+      throw new Error("Assistant request failed");
+    }
+
     return data
   }
 
@@ -358,13 +433,29 @@ export default function Home() {
           }`}
       />
 
+      <div
+        aria-hidden={hasMessages}
+        className={`absolute top-[calc(50%-6rem)] z-20 whitespace-nowrap text-4xl font-semibold tracking-tight text-slate-800 transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none dark:text-slate-100 ${session
+          ? "left-[calc(50%+var(--app-sidebar-half-width))]"
+          : "left-1/2"
+          } ${hasMessages
+            ? "pointer-events-none -translate-x-1/2 -translate-y-2 scale-[0.98] opacity-0"
+            : "-translate-x-1/2 translate-y-0 scale-100 opacity-100 delay-100"
+          }`}
+      >
+        <span>
+          Defect
+          <span className="ml-1.5 text-blue-600 [text-shadow:0_0_6px_rgba(59,130,246,0.28),0_0_12px_rgba(96,165,250,0.16)] dark:text-blue-400 dark:[text-shadow:none]">
+            Detection
+          </span>
+        </span>
+      </div>
+
       <header
-        className={`absolute z-20 flex items-center gap-2 whitespace-nowrap font-semibold tracking-tight text-slate-800 transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] dark:text-slate-100 ${hasMessages
-            ? "left-4 top-0 h-16 translate-x-0 text-xl"
-            : `${session
-              ? "left-[calc(50%+var(--app-sidebar-half-width))]"
-              : "left-1/2"
-            } top-[calc(50%-6rem)] -translate-x-1/2 text-4xl`
+        aria-hidden={!hasMessages}
+        className={`absolute left-4 top-0 z-20 flex h-16 items-center whitespace-nowrap text-xl font-semibold tracking-tight text-slate-800 transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none dark:text-slate-100 ${hasMessages
+          ? "translate-y-0 opacity-100 delay-150"
+          : "pointer-events-none -translate-y-2 opacity-0"
           }`}
       >
         <span>
@@ -466,6 +557,7 @@ export default function Home() {
           hasMessages={hasMessages}
           chats={chats}
           activeChatId={activeChatId}
+          enteringChatId={enteringChatId}
           isLoading={isHistoryLoading}
           deletingChatId={deletingChatId}
           pinningChatId={pinningChatId}
@@ -480,64 +572,107 @@ export default function Home() {
           onSetChatPinned={setChatPinned}
           onSelectChat={selectChat}
           onDeleteChat={deleteChat}
+          onChatEnterEnd={(chatId) => {
+            setEnteringChatId((currentChatId) =>
+              currentChatId === chatId ? null : currentChatId
+            );
+          }}
         />
       )}
       <section className="flex flex-1 relative flex-col justify-center items-center">
         {/*User and assistant messages*/}
         <div
-          className={`absolute left-1/2 flex max-h-[calc(100vh-12rem)] w-[min(92%,64rem)] -translate-x-1/2 flex-col overflow-y-auto py-1 pl-1 pr-4 [scrollbar-gutter:stable] transition-[top] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${hasMessages ? "top-20" : "top-1/2"
+          className={`absolute left-1/2 flex max-h-[calc(100vh-12rem)] w-[min(92%,64rem)] -translate-x-1/2 flex-col overflow-y-auto pl-1 pr-4 [scrollbar-gutter:stable] transition-[top] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${hasMessages
+            ? "message-scroll-fade top-20 pb-1 pt-8"
+            : "top-1/2 py-1"
             }`}
         >
           {messages.map((message, index) => (
-            message.role === "user" ? (
-              <div key={message.id} className="message-enter-user mb-4 rounded-lg bg-black/95 p-2 text-white shadow-lg flex ml-auto justify-end w-fit max-w-[70%] pr-3 pl-3 dark:bg-zinc-800 dark:text-zinc-100 dark:shadow-[0_8px_20px_rgba(0,0,0,0.28)]">
-                {message.text}
-              </div>
-            ) : (
-              <div key={message.id} className="message-enter-assistant mb-9 mr-auto min-w-0 w-full px-2 pb-2">
-                <div className="mb-3 flex items-center gap-2.5 text-sm font-normal text-slate-600 dark:text-zinc-400">
-                  <span
-                    className={`assistant-logo ${index === messages.length - 1 ? "assistant-logo-latest" : ""}`}
-                    aria-hidden="true"
-                  />
-                  <span>Defect Assistant</span>
+            <Fragment key={message.id}>
+              {message.role === "user" ? (
+                <div className="message-enter-user mb-4 ml-auto flex w-fit max-w-[70%] justify-end rounded-lg bg-black/95 p-2 pl-3 pr-3 text-white shadow-lg dark:bg-zinc-800 dark:text-zinc-100 dark:shadow-[0_8px_20px_rgba(0,0,0,0.28)]">
+                  {message.text}
                 </div>
-                <div className="assistant-response [overflow-wrap:anywhere] text-left text-base text-slate-800 dark:text-zinc-200">
-                  <Markdown
-                    remarkPlugins={[remarkGfm]}
-                    components={{
-                      table: ({ children }) => (
-                        <div className="assistant-table-wrap">
-                          <table>{children}</table>
-                        </div>
-                      ),
-                    }}
+              ) : (
+                <div className="message-enter-assistant mb-9 mr-auto min-w-0 w-full px-2 pb-2">
+                  <div className="mb-3 flex items-center gap-2.5 text-sm font-normal text-slate-600 dark:text-zinc-400">
+                    <span
+                      className={`assistant-logo ${index === messages.length - 1 ? "assistant-logo-latest" : ""}`}
+                      aria-hidden="true"
+                    />
+                    <span>Defect Assistant</span>
+                  </div>
+                  <div className="assistant-response [overflow-wrap:anywhere] text-left text-base text-slate-800 dark:text-zinc-200">
+                    <Markdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        table: ({ children }) => (
+                          <div className="assistant-table-wrap">
+                            <table>{children}</table>
+                          </div>
+                        ),
+                      }}
+                    >
+                      {message.text}
+                    </Markdown>
+                  </div>
+                </div>
+              )}
+
+              {message.role === "user"
+                && cancelledMessageIds.includes(message.id)
+                && (
+                  <div
+                    role="status"
+                    aria-label="Assistant analysis cancelled"
+                    className="mb-6 flex w-full items-center gap-2 px-2 text-xs font-medium text-slate-400 dark:text-zinc-500"
                   >
-                    {message.text}
-                  </Markdown>
-                </div>
-              </div>
-            )
+                    <span
+                      aria-hidden="true"
+                      className="h-px flex-1 bg-slate-300/65 dark:bg-zinc-700/70"
+                    />
+                    <span>Cancelled analysis</span>
+                    <span
+                      aria-hidden="true"
+                      className="h-px flex-1 bg-slate-300/65 dark:bg-zinc-700/70"
+                    />
+                  </div>
+                )}
+            </Fragment>
           ))}
           {isWaiting && (
             <div
               role="status"
-              aria-label="Waiting for assistant response"
+              aria-label={isCancelling
+                ? "Cancelling assistant response"
+                : "Waiting for assistant response"}
               className="mb-6 mr-auto px-2 py-1"
             >
-              <div aria-hidden="true" className="generating-loader">
+              <div
+                aria-hidden="true"
+                className={`generating-loader ${isCancelling
+                  ? "generating-loader--cancelling"
+                  : ""
+                  }`}
+              >
                 <div className="generating-loader__spinner" />
-                <div className="generating-loader__letters">
-                  {"Generating . . .".split("").map((character, index) => (
-                    <span
-                      key={`${character}-${index}`}
-                      className="generating-loader__letter"
-                      style={{ animationDelay: `${index * 0.12}s` }}
-                    >
-                      {character === " " ? "\u00A0" : character}
-                    </span>
-                  ))}
-                </div>
+                {isCancelling ? (
+                  <span className="generating-loader__cancel-label">
+                    Cancelling…
+                  </span>
+                ) : (
+                  <div className="generating-loader__letters">
+                    {"Generating . . .".split("").map((character, index) => (
+                      <span
+                        key={`${character}-${index}`}
+                        className="generating-loader__letter"
+                        style={{ animationDelay: `${index * 0.12}s` }}
+                      >
+                        {character === " " ? "\u00A0" : character}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -566,29 +701,54 @@ export default function Home() {
             />
             <button
               type="button"
-              aria-label="Send message"
+              aria-label={isCancelling
+                ? "Cancelling response"
+                : isWaiting
+                  ? "Stop generating"
+                  : "Send message"}
               disabled={
-                isHistoryLoading
-                || isWaiting
-                || deletingChatId !== null
-                || pinningChatId !== null
+                isWaiting
+                  ? isCancelling
+                  : isHistoryLoading
+                    || deletingChatId !== null
+                    || pinningChatId !== null
               }
-              className="rounded-full bg-black/95 p-2 text-white/90 transition-colors disabled:cursor-not-allowed disabled:bg-slate-400 disabled:text-white/70 dark:bg-zinc-100 dark:text-zinc-950 dark:disabled:bg-zinc-700 dark:disabled:text-zinc-400"
-              onClick={handleSend}
+              className={`rounded-full p-2 transition-colors disabled:cursor-not-allowed disabled:bg-slate-400 disabled:text-white/70 dark:disabled:bg-zinc-700 dark:disabled:text-zinc-400 ${isWaiting
+                ? "bg-slate-700 text-white hover:bg-red-600 dark:bg-zinc-200 dark:text-zinc-950 dark:hover:bg-red-500 dark:hover:text-white"
+                : "bg-black/95 text-white/90 dark:bg-zinc-100 dark:text-zinc-950"
+                }`}
+              onClick={isWaiting ? cancelPrompt : handleSend}
             >
-              <svg
-                aria-hidden="true"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className="h-5 w-5"
-              >
-                <path d="M12 19V5" />
-                <path d="m5 12 7-7 7 7" />
-              </svg>
+              {isWaiting ? (
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  className="h-5 w-5"
+                >
+                  <rect
+                    x="7"
+                    y="7"
+                    width="10"
+                    height="10"
+                    rx="1.5"
+                    fill="currentColor"
+                  />
+                </svg>
+              ) : (
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-5 w-5"
+                >
+                  <path d="M12 19V5" />
+                  <path d="m5 12 7-7 7 7" />
+                </svg>
+              )}
             </button>
           </div>
         </footer>

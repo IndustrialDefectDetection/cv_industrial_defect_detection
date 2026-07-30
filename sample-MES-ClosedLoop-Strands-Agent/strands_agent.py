@@ -330,6 +330,7 @@ class MESAgentManager:
         # manager outlives individual runs, so run_defect_analysis clears
         # it at the start of each run rather than relying on a fresh object.
         self._cancelled = threading.Event()
+        self._chat_running = threading.Event()
         
         # Get parameters from environment variables with fallbacks
         if db_path is None:
@@ -469,6 +470,18 @@ class MESAgentManager:
     def get_conversational_agent(self):
         """Return the conversational agent for external use"""
         return self.conversational_agent
+
+    def run_chat(self, query: str):
+        """Run one conversational turn with cooperative cancellation enabled."""
+        self.prepare_chat_turn()
+        self._chat_running.set()
+        try:
+            response = self.conversational_agent(query)
+            if response.stop_reason == "cancelled" or self._cancelled.is_set():
+                raise RunCancelled("Chat response cancelled by the user")
+            return response
+        finally:
+            self._chat_running.clear()
     
     def get_db_connection(self):
         """Open a connection to whichever backend is configured.
@@ -1921,13 +1934,14 @@ Always focus on clear and concise email body with actionable recommendations, ow
     def cancel(self):
         """Ask an in-flight run on this manager to stop as soon as it can.
 
-        Python cannot kill a thread, so this is cooperative: it sets a flag
-        that _check_cancelled raises on at the next checkpoint (each subagent
-        delegation and each database query), which unwinds the worker within
-        seconds instead of letting it burn the remaining agents' API budget.
+        The conversational agent stops during model streaming or before its
+        next tool. Structured analysis stops at its next delegation or query
+        checkpoint.
         Safe to call from another thread, and safe when nothing is running.
         """
         self._cancelled.set()
+        if self._chat_running.is_set():
+            self.conversational_agent.cancel()
         logger.info("Cancellation requested for the current run")
 
     def _check_cancelled(self):

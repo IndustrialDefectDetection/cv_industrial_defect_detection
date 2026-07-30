@@ -44,9 +44,44 @@ body {
   animation: app-sidebar-reveal 560ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
+@keyframes sidebar-chat-enter {
+  from {
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transform: translateY(-6px) scale(0.985);
+  }
+
+  to {
+    grid-template-rows: 1fr;
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.sidebar-chat-enter {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 1fr;
+  transform-origin: top;
+  animation: sidebar-chat-enter 360ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.sidebar-chat-enter-content {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .app-sidebar-reveal {
     animation: none;
+  }
+
+  .sidebar-chat-enter {
+    animation-duration: 1ms;
   }
 }
 
@@ -80,6 +115,23 @@ body {
 
 .message-enter-assistant {
   animation: message-enter-assistant 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.message-scroll-fade {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    rgb(0 0 0 / 38%) 0.75rem,
+    #000 2rem,
+    #000 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    rgb(0 0 0 / 38%) 0.75rem,
+    #000 2rem,
+    #000 100%
+  );
 }
 
 .assistant-logo {
@@ -739,6 +791,45 @@ body {
   animation-name: generating-loader-rotate;
 }
 
+.generating-loader--cancelling {
+  gap: 7px;
+  color: #64748b;
+}
+
+.generating-loader--cancelling .generating-loader__spinner {
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid rgb(100 116 139 / 28%);
+  border-top-color: currentColor;
+  background: transparent;
+  box-shadow: none;
+  animation: cancelling-loader-spin 1.2s linear infinite;
+}
+
+.generating-loader__cancel-label {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  opacity: 0.82;
+}
+
+.dark .generating-loader--cancelling {
+  color: #a1a1aa;
+}
+
+.dark .generating-loader--cancelling .generating-loader__spinner {
+  border-color: rgb(161 161 170 / 28%);
+  border-top-color: currentColor;
+  animation-name: cancelling-loader-spin;
+}
+
+@keyframes cancelling-loader-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @keyframes generating-loader-rotate-light {
   0% {
     transform: rotate(90deg);
@@ -808,5 +899,11 @@ body {
   50% {
     opacity: 0.9;
     transform: translateY(-1px) scale(1.04);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .generating-loader--cancelling .generating-loader__spinner {
+    animation: none;
   }
 }
