@@ -2,6 +2,7 @@
 
 Endpoints (full contract with examples: TRACE_API.md):
   POST /analysis       run the structured, traced defect-analysis workflow
+  POST /investigate    root-cause a camera-flagged defect burst (the bridge)
   POST /cancel         stop the in-flight run at its next checkpoint
   POST /chat/          run a traced supervisor-agent chat turn
   GET  /trace?since=N  live "under the hood" event stream (poll this)
@@ -163,6 +164,21 @@ def defect_types(days_back: int = 365):
     return {"defect_types": [r["DefectType"] for r in rows if r.get("DefectType")]}
 
 
+@app.get("/alerts")
+def alerts(limit: int = 20):
+    """Alerts raised by the CV pipeline, newest first (CONTRACTS.md §3).
+
+    Exists so the dashboard stays a pure HTTP client rather than opening its
+    own database connection. Cheap enough to poll: a plain SELECT, no model
+    call, and it does not touch the one-run-at-a-time guard - reading the
+    alert list must keep working while an investigation is in flight, which
+    is exactly when someone is watching it.
+    """
+    if _manager is None:
+        raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
+    return _manager.get_recent_alerts(limit)
+
+
 @app.get("/report/{filename}")
 def get_report(filename: str):
     """Serve a generated PDF so the dashboard stays a pure HTTP client."""
@@ -175,6 +191,44 @@ def get_report(filename: str):
     if not str(path).startswith(str(REPORTS_DIR.resolve())) or not path.is_file():
         raise HTTPException(status_code=404, detail=f"No such report: {safe_name}")
     return FileResponse(path, media_type="application/pdf", filename=safe_name)
+
+
+class BurstRequest(BaseModel):
+    """A camera-flagged defect burst, as the bridge's analyze_batch sends it."""
+
+    machine_id: int
+    defect_type: str
+    detection_count: int
+    window_start: str
+    window_end: str
+    order_id: int | None = None
+    detections: list[dict] = []
+
+
+@app.post("/investigate")
+def investigate(request: BurstRequest):
+    """Root-cause a defect burst detected by the CV pipeline (CONTRACTS.md §6).
+
+    Called by the bridge over HTTP so the agent stack stays in this project -
+    one toolchain, one set of credentials - and every investigation shows up
+    in the live trace dashboard like any other run.
+    """
+    if _manager is None:
+        raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
+    if not _run_guard.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A run is already in progress; wait for it to finish.")
+    try:
+        return _manager.investigate_detection_burst(
+            machine_id=request.machine_id,
+            defect_type=request.defect_type,
+            detection_count=request.detection_count,
+            window_start=request.window_start,
+            window_end=request.window_end,
+            order_id=request.order_id,
+            detections=request.detections,
+        )
+    finally:
+        _run_guard.release()
 
 
 @app.post("/cancel")
@@ -229,6 +283,9 @@ def send_message(message: ChatRequest):
         tracer.reset()
         tracer.run_start(f"Chat: {query[:80]}", params={"user_input": query[:200]})
         try:
+            # Trims the chat history and clears a stale cancel flag. The
+            # supervisor's own reset happens per delegation, inside the tool.
+            _manager.prepare_chat_turn()
             chat_agent = _manager.get_conversational_agent()
             response = chat_agent(query)
             analysis_text = response.message["content"][0]["text"]

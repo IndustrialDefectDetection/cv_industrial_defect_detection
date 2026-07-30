@@ -12,6 +12,7 @@ three endpoints documented in TRACE_API.md that any other frontend would use:
     GET  /health     is the backend usable, and if not, why
     GET  /trace      the live event stream from agent_tracer.AgentTracer
     GET  /defect-types  populates the event-type dropdown
+    GET  /alerts     camera-triggered investigations and their status
     POST /analysis   trigger the structured defect-analysis workflow
     POST /chat/      free-text supervisor run (used by the Next.js chat page;
                      runs from any client show up here regardless)
@@ -32,6 +33,7 @@ import streamlit as st
 DEFAULT_BASE = "http://127.0.0.1:8000"
 POLL_RUNNING = 0.8  # trace poll cadence while a run is active
 POLL_IDLE = 2.5  # keep polling when idle so runs from other clients appear
+POLL_ALERTS = 4.0  # alerts arrive on the pipeline's schedule, not the trace's
 HEALTH_RETRY_SECONDS = float(os.getenv("MES_VIEWER_HEALTH_RETRY", "2.0"))
 # Bounded: ~30s of auto-retry covers backend startup without spinning forever
 # on a backend that is genuinely down (after the cap, the manual button waits).
@@ -384,6 +386,68 @@ elif chat["status"] == "completed":
             st.caption(f"Report PDF unavailable: {type(e).__name__}: {e}")
     else:
         st.caption("No report PDF was produced for this run.")
+
+# -------------------------------------------------------------- alerts panel
+# What the camera side produced. Its own fragment on a slow cadence: alerts
+# arrive on the pipeline's schedule (a 30s batch window, then a ~40s
+# investigation), not the trace's, and nobody needs this refreshed every
+# 0.8s. Without it, a burst investigation is invisible unless you happen to
+# be watching the trace at the moment it runs — the alert lands in the
+# database and nothing on screen ever says so.
+STATUS_STYLE = {
+    "pending": ("⏳", "queued, waiting for the agent"),
+    "analyzing": ("🔎", "the agent is investigating now"),
+    "done": ("✅", "root-cause report ready"),
+    "failed": ("⚠️", "investigation did not finish"),
+    "cancelled": ("⏹", "stopped before it finished"),
+}
+
+
+@st.fragment(run_every=(POLL_ALERTS if live else None))
+def alerts_section() -> None:
+    data, err = fetch_json(f"{base_url}/alerts?limit=20", timeout=5)
+    if err:
+        st.caption(f"Alerts unavailable — {err}")
+        return
+
+    alerts = (data or {}).get("alerts") or []
+    note = (data or {}).get("note")
+    st.subheader(f"Camera alerts ({len(alerts)})")
+    if not alerts:
+        st.info(note or "No alerts yet. Run the simulator to fire a defect "
+                        "burst and one will appear here within about a minute.")
+        return
+
+    live_now = sum(1 for a in alerts if a["Status"] in ("pending", "analyzing"))
+    if live_now:
+        st.caption(f"{live_now} investigation(s) in flight")
+
+    for alert in alerts:
+        icon, meaning = STATUS_STYLE.get(alert["Status"], ("•", alert["Status"]))
+        duration = alert.get("DurationSeconds")
+        title = (f"{icon} #{alert['AlertID']} · {alert['DefectType']} on machine "
+                 f"{alert['MachineID']} · {alert['DetectionCount']} detections")
+        if duration is not None:
+            title += f" · {duration:.0f}s"
+        # Only the newest is open, and only while it is worth watching.
+        with st.expander(title, expanded=(alert is alerts[0] and alert["Status"] != "done")):
+            meta = st.columns(4)
+            meta[0].metric("Status", alert["Status"], help=meaning)
+            meta[1].metric("Work order", alert["OrderID"] or "—")
+            meta[2].metric("Detections", alert["DetectionCount"])
+            meta[3].metric("Took", f"{duration:.0f}s" if duration is not None else "—")
+            st.caption(f"Window {alert['WindowStart']} → {alert['WindowEnd']}")
+
+            report = alert.get("Report")
+            if alert["Status"] in ("pending", "analyzing"):
+                st.info("The agent is working on this now — watch it below.")
+            elif report:
+                st.markdown(report)
+            else:
+                st.caption("No report was recorded for this alert.")
+
+
+alerts_section()
 
 # --------------------------------------------------------------- trace panel
 # The whole trace view lives in a fragment so live polling reruns only this

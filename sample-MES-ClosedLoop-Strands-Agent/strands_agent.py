@@ -12,6 +12,26 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import sys
+
+# Print agent output as UTF-8 whatever the console is.
+#
+# Strands' default PrintingCallbackHandler prints every streamed token to
+# stdout. When a host process is launched by Launch.py its stdout is a pipe,
+# so Python falls back to the locale encoding - cp1252 on Windows - and the
+# first emoji the model writes raises UnicodeEncodeError *inside the
+# streaming callback*, which aborts the whole agent call. The conversational
+# agent heads its answers with emoji, so this broke every chat turn. It lives
+# here rather than in api.py because app.py, trace_viewer.py and the bridge
+# all reach the agents without importing api. errors='replace' costs an
+# unprintable glyph a '?' in the console instead of costing the user their
+# answer.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):  # already wrapped, or not a TextIO
+        pass
+
 import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
@@ -110,6 +130,62 @@ def _markdown_to_flowables(text, styles):
         flowables.append(Paragraph(_md_inline(line), styles['Normal']))
         flowables.append(Spacer(1, 6))
     return flowables
+
+
+def _to_postgres(sql: str) -> str:
+    """Translate this file's SQLite-dialect SQL to PostgreSQL.
+
+    Every query runs through one chokepoint (_execute_safe_query), so the
+    dialect gap is closed in one place rather than by hand-editing ~90 sites
+    across fifteen tool queries - where a mistranslated date cast returns the
+    wrong rows silently instead of raising. The differential test compares
+    both backends row for row.
+
+    Handled (the only SQLite-specific constructs this file uses):
+      date(X)                  -> CAST(X AS DATE)
+      strftime('%w', X)        -> day-of-week as text, as SQLite returns
+      strftime('%H', X)        -> zero-padded hour as text
+      julianday(X)             -> days as a float; differences stay correct
+                                  because the shared epoch offset cancels
+      datetime(X, '-72 hours') -> X - INTERVAL '72 hours'
+      ?                        -> %s
+    """
+    # julianday first: it wraps expressions the date() rule would also match.
+    sql = re.sub(r"julianday\(\s*([^()]+?)\s*\)",
+                 r"(EXTRACT(EPOCH FROM \1) / 86400.0)", sql, flags=re.I)
+    def _interval(m):
+        # SQLite's datetime(X, '-72 hours') means 72 hours BEFORE X. Getting
+        # this sign wrong does not raise - it silently searches the wrong
+        # direction in time and returns no rows.
+        target, sign, amount, unit = m.group(1), m.group(2), m.group(3), m.group(4)
+        op = "-" if sign == "-" else "+"
+        return f"({target} {op} INTERVAL '{amount} {unit}')"
+
+    sql = re.sub(r"datetime\(\s*([^,]+?)\s*,\s*'([+-]?)(\d+)\s+(\w+?)s?'\s*\)",
+                 _interval, sql, flags=re.I)
+    sql = re.sub(r"strftime\(\s*'%w'\s*,\s*([^()]+?)\s*\)",
+                 r"EXTRACT(DOW FROM \1)::int::text", sql, flags=re.I)
+    sql = re.sub(r"strftime\(\s*'%H'\s*,\s*([^()]+?)\s*\)",
+                 r"TO_CHAR(\1, 'HH24')", sql, flags=re.I)
+    sql = re.sub(r"\bdate\(\s*([^()]+?)\s*\)", r"CAST(\1 AS DATE)", sql, flags=re.I)
+    return sql.replace("?", "%s")
+
+
+def _column_case_map(sql: str) -> dict:
+    """{lowercase: OriginalCase} for every identifier written in the query.
+
+    Used to restore column names after PostgreSQL lower-cases them. The
+    query text is the source of truth for the intended spelling, so no
+    hand-maintained mapping can drift out of date.
+    """
+    mapping = {}
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", sql):
+        low = token.lower()
+        # Keep the first spelling that isn't already all-lowercase, so
+        # 'DefectType' wins over a later bare 'defecttype'.
+        if token != low and low not in mapping:
+            mapping[low] = token
+    return mapping
 
 
 def _render_report_value(value, styles, depth=0):
@@ -278,6 +354,17 @@ class MESAgentManager:
         # Database path
         self.db_path = db_path
 
+        # PostgreSQL is the default: the CV pipeline's bridge writes camera
+        # detections there, so an agent on SQLite cannot see them and would
+        # report "no detections" when it simply looked in the wrong database.
+        # MES_DB_BACKEND=sqlite still runs against the local mes.db.
+        self.db_backend = os.getenv("MES_DB_BACKEND", "postgres").strip().lower()
+        if self.db_backend not in ("sqlite", "postgres"):
+            raise ValueError(
+                f"MES_DB_BACKEND must be 'sqlite' or 'postgres', got {self.db_backend!r}")
+        if self.db_backend == "postgres":
+            self._verify_postgres_ready()
+
         # Newest timestamp in the database. Look-back windows count back from
         # this anchor instead of from today, so the frozen synthetic dataset
         # stays inside every window no matter when the demo runs (a "last 7
@@ -315,11 +402,39 @@ class MESAgentManager:
 
         self.region_name = region_name
         self.model_id = model_id
-        
+
+        # How many tries each agent gets before it is declared unavailable.
+        # Three rather than two because the usual cause is the output token
+        # limit, where an attempt *continues* the previous partial reply
+        # instead of redoing it - so a long Planner report can genuinely need
+        # a third. Every attempt is a full billed call, hence the cap of 5.
+        self._agent_max_attempts = max(1, min(
+            int(os.getenv("MES_AGENT_MAX_ATTEMPTS", "3")), 5))
+
+        # Chat is multi-turn, so the conversational agent keeps its history -
+        # but unbounded it re-sends every earlier report on every turn.
+        self._chat_history_limit = max(2, int(
+            os.getenv("MES_CHAT_HISTORY_MESSAGES", "12")))
+
+        # How many times one chat question may delegate to the supervisor.
+        # The chat agent decides for itself when to call ask_mes_supervisor,
+        # and nothing in the model stops it deciding twice - but a delegation
+        # is a full multi-agent workflow costing minutes and real credit, so
+        # the budget is enforced here rather than merely requested in a
+        # prompt. One is the right default for a chat box: a question earns an
+        # analysis, and anything further is a follow-up the user should choose
+        # to ask.
+        self._chat_supervisor_budget = max(1, min(
+            int(os.getenv("MES_CHAT_SUPERVISOR_CALLS", "1")), 3))
+        self._chat_supervisor_calls = 0
+
         # Define allowed table names for security
         self.allowed_tables = {
-            'OEEMetrics', 'Machines', 'WorkCenters', 'Downtimes', 'WorkOrders', 
-            'Products', 'Shifts', 'Employees', 'Defects', 'QualityControl'
+            'OEEMetrics', 'Machines', 'WorkCenters', 'Downtimes', 'WorkOrders',
+            'Products', 'Shifts', 'Employees', 'Defects', 'QualityControl',
+            # Written by the CV pipeline: the camera's detections, and the
+            # alerts raised from them (CONTRACTS.md §3).
+            'VisionDetections', 'AgentAlerts'
         }
         
         # Log configuration
@@ -332,6 +447,7 @@ class MESAgentManager:
         logger.info(f"  Base URL: {self.base_url}")
         logger.info(f"  Max Tokens: {os.getenv('MES_MAX_TOKENS', '16384')}")
         logger.info(f"  Temperature: {os.getenv('MES_TEMPERATURE', '0.2')}")
+        logger.info(f"  Agent attempts: {self._agent_max_attempts}")
         
         # Initialize tools and agents
         self._init_database_tools()
@@ -347,6 +463,7 @@ class MESAgentManager:
             self.model,
             self.supervisor_agent,
             self.tracer,
+            call_supervisor=self._call_supervisor_for_chat,
         )
 
     def get_conversational_agent(self):
@@ -354,22 +471,91 @@ class MESAgentManager:
         return self.conversational_agent
     
     def get_db_connection(self):
-        """Get a database connection"""
+        """Open a connection to whichever backend is configured.
+
+        SQLite stays the default so existing setups keep working; set
+        MES_DB_BACKEND=postgres to run against the migrated mescopy_v1 that
+        the CV pipeline's bridge also writes to.
+        """
+        if self.db_backend == "postgres":
+            import psycopg2
+            return psycopg2.connect(
+                host=os.getenv("MES_PG_HOST", "localhost"),
+                port=os.getenv("MES_PG_PORT", "5432"),
+                user=os.getenv("MES_PG_USER", "postgres"),
+                password=os.getenv("MES_PG_PASSWORD", "postgres"),
+                dbname=os.getenv("MES_PG_DBNAME", "mescopy_v1"),
+            )
         if not os.path.exists(self.db_path):
             logger.warning(f"Database file not found: {self.db_path}")
             raise FileNotFoundError(f"Database file not found: {self.db_path}")
         return sqlite3.connect(self.db_path)
-    
+
+    def _verify_postgres_ready(self):
+        """Fail at startup, with instructions, if Postgres is not usable.
+
+        Deliberately loud rather than falling back to SQLite: a silent
+        fallback would read a different database than the one the camera
+        writes to, and the agent would confidently report "no detections"
+        for defects that were recorded perfectly well.
+        """
+        dbname = os.getenv("MES_PG_DBNAME", "mescopy_v1")
+        setup = "python setupdatabase.py   (from sample-MES-ClosedLoop-Strands-Agent)"
+        try:
+            conn = self.get_db_connection()
+        except Exception as e:
+            raise RuntimeError(
+                f"MES_DB_BACKEND=postgres but the database '{dbname}' is not reachable: {e}\n"
+                f"  * Is the PostgreSQL server running?\n"
+                f"  * Has the database been created and populated? Run:\n"
+                f"      {setup}\n"
+                f"  * Credentials come from MES_PG_USER / MES_PG_PASSWORD "
+                f"(defaults: postgres/postgres).\n"
+                f"  * To use the local SQLite copy instead, set MES_DB_BACKEND=sqlite."
+            ) from e
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='public'")
+                tables = {r[0].lower() for r in cur.fetchall()}
+        finally:
+            conn.close()
+
+        missing_mes = {"machines", "workorders", "defects"} - tables
+        if missing_mes:
+            raise RuntimeError(
+                f"Database '{dbname}' is missing the MES tables {sorted(missing_mes)}.\n"
+                f"  The historical data has not been copied across yet. Run:\n"
+                f"      {setup}")
+        if "visiondetections" not in tables:
+            # Not fatal - the MES tools still work - but the camera tool will not.
+            logger.warning(
+                "VisionDetections is missing from '%s'; get_recent_detections "
+                "will be unavailable. Run %s", dbname, setup)
+        logger.info("  Backend: PostgreSQL '%s' (%d tables)", dbname, len(tables))
+
     def _load_data_anchor(self):
         """Newest timestamp across the main time-bearing tables."""
         try:
             conn = self.get_db_connection()
-            row = conn.execute(
-                "SELECT MAX(t) FROM ("
-                "SELECT MAX(Date) as t FROM QualityControl "
-                "UNION ALL SELECT MAX(StartTime) FROM Downtimes "
-                "UNION ALL SELECT MAX(ActualEndTime) FROM WorkOrders)"
-            ).fetchone()
+            sql = ("SELECT MAX(t) FROM ("
+                   "SELECT MAX(Date) as t FROM QualityControl "
+                   "UNION ALL SELECT MAX(StartTime) FROM Downtimes "
+                   "UNION ALL SELECT MAX(ActualEndTime) FROM WorkOrders)")
+            if self.db_backend == "postgres":
+                # Postgres requires a name for a derived table, and its
+                # UNION arms must share a type - the columns are all
+                # timestamps, so cast them explicitly.
+                sql = ("SELECT MAX(t) FROM ("
+                       "SELECT MAX(Date)::timestamp as t FROM QualityControl "
+                       "UNION ALL SELECT MAX(StartTime)::timestamp FROM Downtimes "
+                       "UNION ALL SELECT MAX(ActualEndTime)::timestamp FROM WorkOrders"
+                       ") AS newest")
+            cur = conn.cursor()
+            cur.execute(sql)
+            row = cur.fetchone()
+            cur.close()
             conn.close()
             if row and row[0]:
                 anchor = pd.to_datetime(row[0]).to_pydatetime()
@@ -405,11 +591,22 @@ class MESAgentManager:
         
         try:
             conn = self.get_db_connection()
+            # One place to close the dialect gap - see _to_postgres.
+            sql = _to_postgres(query) if self.db_backend == "postgres" else query
             if params:
-                df = pd.read_sql_query(query, conn, params=params)
+                df = pd.read_sql_query(sql, conn, params=params)
             else:
-                df = pd.read_sql_query(query, conn)
+                df = pd.read_sql_query(sql, conn)
             conn.close()
+
+            if self.db_backend == "postgres":
+                # PostgreSQL folds unquoted identifiers to lower case, while
+                # SQLite echoes back whatever the query wrote. Without this,
+                # the same tool hands the model 'defecttype' on one backend
+                # and 'DefectType' on the other - and the output rules tell
+                # it to cite specific column names like DefectRecords.
+                # The original query text carries the intended spelling.
+                df = df.rename(columns=_column_case_map(query))
             
             # Process datetime columns
             for col in df.columns:
@@ -738,8 +935,10 @@ class MESAgentManager:
                 Shifts s ON e.ShiftID = s.ShiftID
             WHERE 
                 date(dt.StartTime) >= ?
-            GROUP BY 
-                date(dt.StartTime), dt.Reason, m.Type, wc.Name, s.Name
+            GROUP BY
+                date(dt.StartTime), strftime('%w', dt.StartTime),
+                strftime('%H', dt.StartTime),
+                dt.Reason, m.Type, wc.Name, s.Name
             ORDER BY
                 EventCount DESC, AvgDuration DESC
             LIMIT 100
@@ -809,8 +1008,8 @@ class MESAgentManager:
             cutoff_date = self._cutoff_date(days_back)
             
             query = """
-            SELECT 
-                wo.ActualStartTime as WorkDate,
+            SELECT
+                MAX(wo.ActualStartTime) as WorkDate,
                 e.Name as OperatorName,
                 e.Role as OperatorRole,
                 s.Name as ShiftName,
@@ -832,9 +1031,10 @@ class MESAgentManager:
             WHERE 
                 date(wo.ActualStartTime) >= ?
             GROUP BY
-                date(wo.ActualStartTime), e.EmployeeID, s.ShiftID, wc.WorkCenterID
+                date(wo.ActualStartTime), e.EmployeeID, s.ShiftID, wc.WorkCenterID,
+                e.Name, e.Role, s.Name, wc.Name, m.Type
             ORDER BY
-                wo.ActualStartTime DESC
+                WorkDate DESC
             LIMIT 100
             """
             
@@ -921,7 +1121,9 @@ class MESAgentManager:
             WHERE d.DefectType = ? AND date(qc.Date) >= ?
             GROUP BY s.ShiftID
             UNION ALL
-            SELECT 'ByDate', date(qc.Date), COUNT(*), SUM(d.Quantity)
+            -- cast to text so this arm matches the TEXT of the other UNION
+            -- arms; PostgreSQL will not union a DATE with a name column
+            SELECT 'ByDate', CAST(date(qc.Date) AS TEXT), COUNT(*), SUM(d.Quantity)
             FROM Defects d
             JOIN QualityControl qc ON d.CheckID = qc.CheckID
             WHERE d.DefectType = ? AND date(qc.Date) >= ?
@@ -945,8 +1147,71 @@ class MESAgentManager:
             params = (defect_type, cutoff_date) * 5
             return self._execute_safe_query(query, params)
 
+        @tool
+        def get_recent_detections(machine_id: int, hours: int = 2):
+            """Camera detections recorded by the live vision system for ONE
+            machine in the last N hours. This is the CAMERA's own evidence -
+            what the model actually saw on the line - and is separate from
+            the Defects table, which holds human quality-control records.
+
+            Returns one row per detection: timestamp, defect class, the
+            model's confidence (0-1), the image filename, the work order
+            running at the time, and how long inference took. Newest first,
+            capped at 200 rows.
+
+            Use this when investigating a defect burst flagged by the camera,
+            to see exactly which detections triggered it and how confident
+            the model was. Only detections at or above the 0.80 confidence
+            gate are batched into an alert, but this returns every saved
+            detection, including lower-confidence ones."""
+            hours = int(hours)
+            if hours < 0 or hours > 8760:
+                raise ValueError("hours must be between 0 and 8760")
+
+            if self.db_backend != "postgres":
+                # A raw "no such table" error invites the model to conclude
+                # that no defects were detected - a false finding rather
+                # than a gap. Say what is actually true.
+                return {
+                    "success": False,
+                    "error": (
+                        "Camera detections are unavailable: this agent is running "
+                        "against SQLite, and VisionDetections is written by the "
+                        "vision pipeline into PostgreSQL. This is a tool limitation, "
+                        "NOT evidence that no detections occurred - classify it as "
+                        "'not exposed by available tools'."
+                    ),
+                }
+
+            # The cutoff is computed here rather than in SQL on purpose:
+            # "N hours ago" is spelled differently in SQLite and PostgreSQL,
+            # and passing a plain timestamp as a parameter sidesteps the
+            # difference entirely.
+            cutoff = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+
+            query = """
+            SELECT
+                Timestamp,
+                DefectType,
+                Confidence,
+                ImageName,
+                OrderID,
+                InferenceTimeMs
+            FROM
+                VisionDetections
+            WHERE
+                MachineID = ?
+                AND Timestamp >= ?
+            ORDER BY
+                Timestamp DESC
+            LIMIT 200
+            """
+            return self._execute_safe_query(query, (int(machine_id), cutoff))
+
         # Shared with the Analyzer so both agents cite the same counts.
         self._summarize_defect_distribution_tool = summarize_defect_distribution
+        # The Analyzer needs the camera evidence too, not just the Monitor.
+        self._get_recent_detections_tool = get_recent_detections
 
         self.monitor_tools = [
             fetch_oee_metrics,
@@ -955,7 +1220,8 @@ class MESAgentManager:
             fetch_work_orders_context,
             fetch_operator_logs,
             fetch_defect_records,
-            summarize_defect_distribution
+            summarize_defect_distribution,
+            get_recent_detections
         ]
 
     def _init_analyzer_tools(self):
@@ -999,8 +1265,8 @@ class MESAgentManager:
                 Shifts s ON e.ShiftID = s.ShiftID
             WHERE 
                 date(dt.StartTime) >= ?
-            GROUP BY 
-                dt.Reason, s.Name, e.Name, p.Name, m.Type
+            GROUP BY
+                dt.Reason, s.Name, e.Name, p.Name, m.Type, wc.Name
             ORDER BY
                 TotalDuration DESC
             LIMIT 100
@@ -1125,8 +1391,8 @@ class MESAgentManager:
                 AND date(dt.StartTime) = date(wo.ActualStartTime)
             WHERE 
                 date(wo.ActualStartTime) >= ?
-            GROUP BY 
-                m.MachineID, e.EmployeeID, s.ShiftID
+            GROUP BY
+                m.MachineID, e.EmployeeID, s.ShiftID, wc.Name
             ORDER BY
                 AvgOEE ASC, TotalDowntime DESC
             LIMIT 100
@@ -1187,7 +1453,8 @@ class MESAgentManager:
                 date(qc.Date) >= ?
                 {defect_filter}
             GROUP BY
-                d.DefectType, d.RootCause, p.ProductID, m.MachineID, e.EmployeeID, s.ShiftID
+                d.DefectType, d.RootCause, p.ProductID, m.MachineID, e.EmployeeID, s.ShiftID,
+                d.Severity, d.Location, d.ActionTaken, wc.Name
             ORDER BY
                 DefectCount DESC, d.Severity DESC
             LIMIT 100
@@ -1252,7 +1519,8 @@ class MESAgentManager:
             identify_performance_patterns,
             analyze_quality_defects,
             correlate_defects_with_maintenance,
-            self._summarize_defect_distribution_tool
+            self._summarize_defect_distribution_tool,
+            self._get_recent_detections_tool
         ]
 
     def _init_planner_tools(self):
@@ -1704,19 +1972,23 @@ Always focus on clear and concise email body with actionable recommendations, ow
                 logger.warning(f"Could not reset {name} conversation: {e}")
 
     def _call_agent_with_retry(self, agent_name: str, agent_obj, prompt: str):
-        """Run one subagent turn; on failure (timeout/connection), retry once.
+        """Run one subagent turn, retrying on failure.
 
         Necessary companion to the bounded API timeout: a timeout raises
         where it previously hung, and a bare exception reaches the
-        supervisor as a tool error, which it then improvises around. This
-        retries once and otherwise hands back an explicit "unavailable"
+        supervisor as a tool error, which it then improvises around. Once
+        the attempts are spent this hands back an explicit "unavailable"
         string the supervisor is instructed to report as a gap.
+
+        MES_AGENT_MAX_ATTEMPTS (default 3) sets the budget.
         """
         # Cancellation checkpoint: abandoning a run between phases skips the
         # remaining agents entirely rather than paying for all five.
         self._check_cancelled()
+        max_attempts = self._agent_max_attempts
         last_error = None
-        for attempt in (1, 2):
+        for attempt in range(1, max_attempts + 1):
+            final = attempt == max_attempts
             try:
                 return agent_obj(prompt)
             except RunCancelled:
@@ -1725,25 +1997,110 @@ Always focus on clear and concise email body with actionable recommendations, ow
                 # Not a failure: the model filled max_tokens mid-reply and the
                 # partial message is already in history, so calling again
                 # continues it (the SDK's documented recovery). Say so plainly
-                # rather than showing the trace a scary error.
+                # rather than showing the trace a scary error. This is also why
+                # extra attempts help here where they would not help a genuine
+                # error - each one resumes rather than restarts.
                 last_error = e
                 logger.warning(
-                    f"{agent_name} agent hit the output token limit; continuing"
-                    if attempt == 1 else
-                    f"{agent_name} agent hit the output token limit twice - giving up")
+                    f"{agent_name} agent hit the output token limit "
+                    f"(attempt {attempt}/{max_attempts})"
+                    + (" - giving up" if final else " - continuing the reply"))
                 self.tracer.error(
                     agent_name.capitalize(),
-                    "output token limit reached - continuing the truncated reply "
-                    "(raise MES_MAX_TOKENS if this recurs)")
+                    f"output token limit reached on attempt {attempt}/{max_attempts}"
+                    + ("" if final else " - continuing the truncated reply")
+                    + " (raise MES_MAX_TOKENS, or MES_AGENT_MAX_ATTEMPTS to keep"
+                      " continuing, if this recurs)")
             except Exception as e:
                 last_error = e
                 logger.warning(
-                    f"{agent_name} agent attempt {attempt} failed: {e}"
-                    + (" - retrying once" if attempt == 1 else " - giving up"))
-                self.tracer.error(agent_name.capitalize(),
-                                  f"attempt {attempt} failed: {type(e).__name__}: {e}")
-        return (f"[{agent_name} agent unavailable after 2 attempts: {last_error}. "
-                f"Proceed with available information and state this gap explicitly.]")
+                    f"{agent_name} agent attempt {attempt}/{max_attempts} failed: {e}"
+                    + (" - giving up" if final else " - retrying"))
+                self.tracer.error(
+                    agent_name.capitalize(),
+                    f"attempt {attempt}/{max_attempts} failed: {type(e).__name__}: {e}")
+        return (f"[{agent_name} agent unavailable after {max_attempts} attempts: "
+                f"{last_error}. Proceed with available information and state this "
+                f"gap explicitly.]")
+
+    def _call_supervisor_for_chat(self, request: str) -> str:
+        """Delegate a chat question to the supervisor and return its text.
+
+        Two things the bare call in chat_agent.py did not do. It resets the
+        workflow agents first: the supervisor and its five subagents are a
+        work engine, not a conversation, so without this the third question
+        of a session re-reads the first two answers' entire transcripts,
+        tool results included. And it goes through _call_agent_with_retry,
+        so a token-limit or timeout inside the supervisor comes back as the
+        documented "unavailable" sentence rather than as a raw tool error
+        the chat agent has to improvise around.
+
+        The conversational agent's own history is deliberately untouched -
+        that is what makes follow-up questions work.
+
+        Refuses past MES_CHAT_SUPERVISOR_CALLS delegations for one question,
+        so a model that decides to "check one more thing" cannot quietly turn
+        a single chat message into several multi-minute billed workflows.
+        """
+        if self._chat_supervisor_calls >= self._chat_supervisor_budget:
+            logger.warning(
+                "chat turn tried delegation %d; budget is %d - refusing",
+                self._chat_supervisor_calls + 1, self._chat_supervisor_budget)
+            self.tracer.error(
+                "Chat",
+                f"supervisor delegation budget of {self._chat_supervisor_budget} "
+                f"reached for this question - answering from what was gathered "
+                f"(raise MES_CHAT_SUPERVISOR_CALLS to allow more)")
+            return (f"[The MES supervisor has already run "
+                    f"{self._chat_supervisor_calls} time(s) for this question, "
+                    f"which is the limit. Do not call this tool again. Answer the "
+                    f"user now using the findings you already have; if something "
+                    f"is still missing, say plainly what it is and invite them to "
+                    f"ask for it as a follow-up.]")
+
+        self._chat_supervisor_calls += 1
+        logger.info("chat delegating to supervisor (%d/%d)",
+                    self._chat_supervisor_calls, self._chat_supervisor_budget)
+        self._reset_conversations()
+        result = self._call_agent_with_retry("supervisor", self.supervisor_agent, request)
+        if isinstance(result, str):
+            return result          # the "unavailable" sentence
+        try:
+            return result.message["content"][0]["text"]
+        except (AttributeError, KeyError, IndexError, TypeError):
+            # A reply whose first block is not text (e.g. an unresolved tool
+            # use) would otherwise raise inside the tool and reach the chat
+            # agent as a stack trace.
+            return ("[supervisor returned no readable text. Report this as a gap "
+                    "rather than answering from memory.]")
+
+    def prepare_chat_turn(self):
+        """Get the conversational agent ready for one more turn.
+
+        Trims its history so a long session does not re-send every earlier
+        report, refreshes the per-question delegation budget, and clears any
+        cancel flag left over from a previous run.
+        """
+        self._cancelled.clear()
+        self._chat_supervisor_calls = 0
+        messages = getattr(self.conversational_agent, "messages", None)
+        if not messages or len(messages) <= self._chat_history_limit:
+            return
+        # Cut from the front, then walk forward to the first message that can
+        # legally begin a conversation: a user message that is not a
+        # toolResult. Sending a toolResult whose toolUse has been trimmed away
+        # is a 400 from the API, so if no safe cut point exists, cut nothing.
+        start = len(messages) - self._chat_history_limit
+        while start < len(messages):
+            message = messages[start]
+            content = message.get("content") or []
+            is_tool_result = any(isinstance(block, dict) and "toolResult" in block
+                                 for block in content)
+            if message.get("role") == "user" and not is_tool_result:
+                break
+            start += 1
+        if start < len(messages):
+            del messages[:start]
 
     def _init_supervisor_agent(self):
         """Initialize the Supervisor Agent that orchestrates the workflow"""
@@ -1873,6 +2230,94 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
         )
 
         attach_tracer(self.supervisor_agent, "Supervisor", self.tracer)
+
+    def investigate_detection_burst(self, machine_id: int, defect_type: str,
+                                    detection_count: int, window_start: str,
+                                    window_end: str, order_id=None,
+                                    detections: list = None) -> dict:
+        """Investigate a burst of camera detections flagged by the CV pipeline.
+
+        This is the agent half of CONTRACTS.md §6, reached over HTTP from the
+        bridge's analyze_batch. Deliberately narrower than run_defect_analysis:
+        an alert wants a root cause fast, so the supervisor is told to run the
+        Monitor and Analyzer phases only. Planning, verification and
+        notification are what the full workflow is for.
+
+        Returns {'status', 'report', 'duration_s'} and never raises - a failed
+        investigation must still let the bridge mark its alert 'failed'.
+        """
+        start = datetime.now()
+        self._cancelled.clear()
+        self._reset_conversations()
+        self.tracer.reset()
+        self.tracer.run_start(
+            f"Defect burst: {defect_type} on machine {machine_id}",
+            params={"machine_id": machine_id, "defect_type": defect_type,
+                    "detections": detection_count,
+                    "window": f"{window_start} → {window_end}"},
+        )
+
+        sample = ""
+        for d in (detections or [])[:10]:
+            sample += (f"\n              - {d.get('timestamp')} {d.get('class')} "
+                       f"confidence {d.get('confidence')} ({d.get('image_name')})")
+
+        prompt = f"""
+            A live camera on the production line has flagged a burst of defects.
+            Investigate why it happened and report the most likely root cause.
+
+            What the camera saw:
+            - Machine ID: {machine_id}
+            - Work order: {order_id if order_id is not None else 'none active'}
+            - Dominant defect class: {defect_type}
+            - Detections above the 0.80 confidence gate: {detection_count}
+            - Time window: {window_start} to {window_end}
+            {'Sample detections:' + sample if sample else ''}
+
+            How to investigate:
+            1. Call the Monitor Agent. Tell it to use get_recent_detections for
+               machine {machine_id} to see the camera's own evidence, and to
+               pull the surrounding MES context - the work order running at the
+               time, recent downtime and maintenance on that machine, and the
+               quality-control records for '{defect_type}'.
+            2. Call the Analyzer Agent to determine the most likely root cause,
+               using correlate_defects_with_maintenance for the maintenance
+               link and summarize_defect_distribution for any counts.
+            3. Do NOT call the Planner, Verifier or Executor agents. This is a
+               fast root-cause alert, not the full improvement workflow.
+
+            Then write the report yourself, under 600 words, with exactly these
+            sections:
+            1. What the camera saw (the burst, in plain terms)
+            2. Machine and work-order context
+            3. Most likely root cause (ranked, each with a WHY mechanism and
+               HIGH/MEDIUM/LOW certainty)
+            4. What a human should check first
+            5. Gaps / missing data
+
+            The camera detections are evidence that something occurred; they do
+            not by themselves explain why. Ground every claim in a tool result.
+            """
+
+        try:
+            response = self.supervisor_agent(prompt)
+            self._check_cancelled()
+            report = response.message['content'][0]['text']
+            duration = (datetime.now() - start).total_seconds()
+            self.tracer.run_end("completed")
+            logger.info("Burst investigation finished in %.0fs (%s chars)",
+                        duration, len(report))
+            return {"status": "completed", "report": report, "duration_s": duration}
+        except RunCancelled:
+            self.tracer.run_end("cancelled")
+            return {"status": "cancelled", "report": "", "duration_s":
+                    (datetime.now() - start).total_seconds()}
+        except Exception as e:
+            logger.exception("Burst investigation failed")
+            self.tracer.error(None, f"{type(e).__name__}: {e}")
+            self.tracer.run_end("failed", error=str(e))
+            return {"status": "failed", "report": f"Investigation failed: {e}",
+                    "duration_s": (datetime.now() - start).total_seconds()}
 
     def run_defect_analysis(self, defect_type: str, days_back: int = 7, include_oee: bool = True,
                            include_downtime: bool = True, include_changeover: bool = True, 
@@ -2138,6 +2583,59 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
         """
         
         return self._execute_safe_query(sql_query, (cutoff_date,))
+
+    def get_recent_alerts(self, limit: int = 20):
+        """Alerts the CV pipeline raised, newest first (CONTRACTS.md §3).
+
+        A plain read rather than an agent tool: this feeds the dashboard, and
+        nothing about it should cost a model call. AgentAlerts only exists
+        once the bridge has run, so a missing table means "no camera has run
+        yet" and is reported as an empty list, not an error.
+        """
+        limit = max(1, min(int(limit), 200))
+        if self.db_backend != "postgres":
+            return {"alerts": [],
+                    "note": "AgentAlerts lives in PostgreSQL; set MES_DB_BACKEND=postgres."}
+
+        sql = """
+        SELECT AlertID, CreatedAt, MachineID, OrderID, DefectType,
+               DetectionCount, WindowStart, WindowEnd, Status, Report, CompletedAt
+        FROM AgentAlerts
+        ORDER BY AlertID DESC
+        LIMIT %s
+        """
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (limit,))
+                columns = [c[0] for c in cur.description]
+                rows = cur.fetchall()
+        except Exception as e:
+            # psycopg2 poisons the transaction on error, so the caller cannot
+            # reuse this connection either way.
+            logger.info("AgentAlerts unavailable: %s", e)
+            return {"alerts": [], "note": "No alerts yet - the bridge has not run."}
+        finally:
+            conn.close()
+
+        # PostgreSQL folds unquoted identifiers to lower case; the query text
+        # is the source of truth for the intended spelling.
+        case = _column_case_map(sql)
+        alerts = []
+        for row in rows:
+            record = {case.get(col, col): value for col, value in zip(columns, row)}
+            for field in ("CreatedAt", "WindowStart", "WindowEnd", "CompletedAt"):
+                if record.get(field) is not None:
+                    record[field] = str(record[field])
+            # Seconds from raising the alert to finishing it - the number the
+            # README wants to quote, and it is only derivable here.
+            record["DurationSeconds"] = None
+            alerts.append(record)
+        for record, row in zip(alerts, rows):
+            created, completed = row[1], row[10]
+            if created is not None and completed is not None:
+                record["DurationSeconds"] = round((completed - created).total_seconds(), 1)
+        return {"alerts": alerts}
 
     def get_defect_window_stats(self, defect_type, days_back):
         """Pre-run check: how many records of this defect the selected

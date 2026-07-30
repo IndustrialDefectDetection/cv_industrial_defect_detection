@@ -4,15 +4,20 @@ import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION — defaults to Supabase
 # ==========================================
-SQLITE_FILE = "mescopy_v1.db"  # Replace with your actual SQLite file path
+# Override any of these via MES_PG_* environment variables.
+# The Supabase pooler (port 6543) is the default so that
+#   python3 setupdatabase.py
+# works without any flags.  To target a local Postgres instead:
+#   MES_PG_HOST=localhost MES_PG_PORT=5432 MES_PG_USER=... python3 setupdatabase.py
+SQLITE_FILE = os.getenv("MES_SQLITE_FILE", "mescopy_v1.db")
 
-PG_HOST = "localhost"
-PG_PORT = "5432"
-PG_USER = ""   # replace with username
-PG_PASSWORD = ""     # replace with password
-PG_DBNAME = "mescopy_v1"          # target database name
+PG_HOST     = os.getenv("MES_PG_HOST",     "aws-0-ca-central-1.pooler.supabase.com")
+PG_PORT     = os.getenv("MES_PG_PORT",     "6543")
+PG_USER     = os.getenv("MES_PG_USER",     "postgres.isdhddsgfuzvymrxfiox")
+PG_PASSWORD = os.getenv("MES_PG_PASSWORD", "cv_industrial_defect_detection")
+PG_DBNAME   = os.getenv("MES_PG_DBNAME",   "postgres")
 
 def ensure_postgres_db_exists():
     """Connects to the default 'postgres' database and creates the target DB if missing."""
@@ -72,9 +77,108 @@ def run_pgloader():
         print(e.stderr)
         return False
     except FileNotFoundError:
-        print("Error: 'pgloader' utility is not installed or not in your system PATH.")
-        print("Quick fix: Run 'brew install pgloader' on your Mac.")
+        print("'pgloader' is not installed or not on PATH — skipping the MES data copy.")
+        print("  macOS:   brew install pgloader")
+        print("  Linux:   apt install pgloader")
+        print("  Windows: no official build; use WSL, Docker "
+              "(ghcr.io/dimitri/pgloader), or copy the tables another way.")
         return False
+
+# SQLite is loosely typed; these are the six declared types mes.db actually
+# uses. Anything unexpected falls back to TEXT rather than failing the copy.
+_SQLITE_TO_PG = {
+    "INTEGER": "INTEGER",
+    "TEXT": "TEXT",
+    "VARCHAR": "TEXT",
+    "FLOAT": "DOUBLE PRECISION",
+    "BOOLEAN": "BOOLEAN",
+    "DATETIME": "TIMESTAMP",
+}
+
+
+def copy_tables_with_python():
+    """Copy every mes.db table into PostgreSQL without pgloader.
+
+    pgloader has no official Windows build, which left this project unable to
+    populate the database at all. The dataset is small (14 tables, ~44k rows),
+    so a direct copy is simpler than a toolchain dependency that fights the
+    platform.
+
+    Identifiers are created UNQUOTED on purpose: PostgreSQL folds those to
+    lower case, which is what the bridge's unquoted queries
+    (`SELECT MachineID ... FROM Machines`) resolve to, and what
+    RealDictCursor hands back (bridge.py already reads `order["orderid"]`).
+    Quoting them as "Machines" would make every existing query fail.
+    """
+    import sqlite3
+
+    from psycopg2.extras import execute_values
+
+    if not os.path.exists(SQLITE_FILE):
+        print(f"Cannot copy: SQLite file '{SQLITE_FILE}' not found.")
+        return False
+
+    print(f"\nCopying tables from {SQLITE_FILE} into '{PG_DBNAME}' (no pgloader needed)...")
+    lite = sqlite3.connect(SQLITE_FILE)
+    lite.row_factory = sqlite3.Row
+    pg = psycopg2.connect(host=PG_HOST, port=PG_PORT, user=PG_USER,
+                          password=PG_PASSWORD, dbname=PG_DBNAME)
+
+    copied, mismatched = 0, []
+    try:
+        tables = [r[0] for r in lite.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+
+        for table in tables:
+            cols = list(lite.execute(f'PRAGMA table_info("{table}")'))
+            names = [c["name"] for c in cols]
+            bool_idx = {i for i, c in enumerate(cols)
+                        if (c["type"] or "").upper() == "BOOLEAN"}
+
+            defs = []
+            for c in cols:
+                pg_type = _SQLITE_TO_PG.get((c["type"] or "").upper(), "TEXT")
+                defs.append(f'{c["name"]} {pg_type}'
+                            + (" PRIMARY KEY" if c["pk"] else ""))
+
+            rows = [tuple(r) for r in lite.execute(f'SELECT * FROM "{table}"')]
+            # SQLite keeps booleans as 0/1; PostgreSQL's BOOLEAN rejects ints.
+            if bool_idx:
+                rows = [tuple(bool(v) if i in bool_idx and v is not None else v
+                              for i, v in enumerate(row)) for row in rows]
+
+            with pg.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+                cur.execute(f"CREATE TABLE {table} ({', '.join(defs)})")
+                if rows:
+                    execute_values(
+                        cur,
+                        f"INSERT INTO {table} ({', '.join(names)}) VALUES %s",
+                        rows, page_size=1000)
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                landed = cur.fetchone()[0]
+
+            if landed != len(rows):
+                mismatched.append((table, len(rows), landed))
+            print(f"  {table:<22} {landed:>7} rows")
+            copied += 1
+
+        pg.commit()
+    except Exception as exc:
+        pg.rollback()
+        print(f"Copy failed: {exc}")
+        return False
+    finally:
+        lite.close()
+        pg.close()
+
+    if mismatched:
+        print("Row-count mismatches:", mismatched)
+        return False
+    print(f"Copied {copied} tables with every row accounted for.")
+    return True
+
 
 def create_contract_tables():
     """Creates the VisionDetections and AgentAlerts tables (CONTRACTS.md §3) in PostgreSQL."""
@@ -176,12 +280,39 @@ def add_ml_columns():
             conn.close()
 
 if __name__ == "__main__":
-    # Step 1: Check/PostgreSQL database exists
-    if ensure_postgres_db_exists():
-        # Step 2: Stream all SQLite tables and historical data across
-        if run_pgloader():
-            # Step 3: Create CONTRACTS.md §3 tables (VisionDetections, AgentAlerts)
-            if create_contract_tables():
-                # Step 4: Mutate the defects table layout for the live camera values
-                add_ml_columns()
-                print("\nAll steps complete! Your live-tracking database is ready to roll.")
+    # Step 1 is the only hard prerequisite: without the database, nothing else
+    # can run.
+    if not ensure_postgres_db_exists():
+        raise SystemExit(1)
+
+    # Step 2 copies the historical MES tables across. Prefer pgloader when it
+    # is installed; fall back to the built-in Python copy, which needs no
+    # external tooling and works on Windows.
+    migrated = run_pgloader()
+    if not migrated:
+        print("Falling back to the built-in copy...")
+        migrated = copy_tables_with_python()
+
+    # Step 3 must NOT depend on step 2. The two contract tables are created
+    # directly here and are what the bridge and the analyze_batch seam
+    # actually write to - gating them behind pgloader meant that on any
+    # machine without it the pipeline had no tables at all and could not run.
+    tables_ok = create_contract_tables()
+
+    # Step 4 only makes sense once the MES tables exist (it alters 'defects',
+    # which pgloader brings over).
+    if migrated:
+        add_ml_columns()
+
+    print()
+    if migrated and tables_ok:
+        print("All steps complete! Your live-tracking database is ready to roll.")
+    elif tables_ok:
+        print("Partial setup: VisionDetections and AgentAlerts exist, so the "
+              "bridge and analyze_batch can run now.")
+        print("The historical MES tables were NOT copied, so work-order and "
+              "machine lookups will return nothing (OrderID stays NULL) until "
+              "pgloader runs.")
+    else:
+        print("Setup failed: the contract tables could not be created.")
+        raise SystemExit(1)

@@ -1,0 +1,15 @@
+# Secrets. .env holds a real ANTHROPIC_API_KEY and a database password -
+# copy .env.example instead. Ignored everywhere, not just at the root,
+# because each sub-project boots from its own .env.
+.env
+**/.env
+!**/.env.example
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtualenvs. venv writes a self-ignoring .gitignore of its own, but that is
+# a side effect to rely on rather than a rule.
+.venv/
+
