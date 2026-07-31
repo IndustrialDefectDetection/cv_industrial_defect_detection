@@ -20,9 +20,28 @@ export async function POST(request: Request) {
     body: JSON.stringify(body),
   });
 
-  const data = await response.json();
+  if (!response.ok) {
+    const data = await response.json();
 
-  return Response.json(data, {
+    return Response.json(data, {
+      status: response.status,
+    });
+  }
+
+  if (!response.body) {
+    return Response.json(
+      { error: "Backend response did not include a stream" },
+      { status: 502 }
+    );
+  }
+
+  return new Response(response.body, {
     status: response.status,
+    headers: {
+      "Content-Type": response.headers.get("Content-Type")
+        ?? "application/x-ndjson",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+    },
   });
 }

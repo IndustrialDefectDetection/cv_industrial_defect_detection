@@ -814,6 +814,16 @@ body {
   opacity: 0.82;
 }
 
+.generating-loader__progress-label {
+  min-width: 12rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  line-height: 1.2;
+  opacity: 0;
+  animation: generating-progress-enter 260ms ease-out forwards;
+}
+
 .dark .generating-loader--cancelling {
   color: #a1a1aa;
 }
@@ -827,6 +837,18 @@ body {
 @keyframes cancelling-loader-spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes generating-progress-enter {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+
+  to {
+    opacity: 0.82;
+    transform: translateY(0);
   }
 }
 
@@ -903,7 +925,12 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .generating-loader--cancelling .generating-loader__spinner {
+  .generating-loader--cancelling .generating-loader__spinner,
+  .generating-loader__progress-label {
     animation: none;
+  }
+
+  .generating-loader__progress-label {
+    opacity: 0.82;
   }
 }

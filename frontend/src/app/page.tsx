@@ -25,6 +25,57 @@ type ChatResponse = {
   status?: "cancelled";
 };
 
+type ChatStreamEvent =
+  | { type: "started" | "heartbeat" }
+  | { type: "result"; data: ChatResponse }
+  | { type: "error"; error: string };
+
+type TraceProgressEvent = {
+  seq: number;
+  agent: string | null;
+  kind: string;
+  tool: string | null;
+};
+
+type TraceProgressResponse = {
+  seq: number;
+  run: {
+    id: string | null;
+    status: string;
+  };
+  current: {
+    agent: string | null;
+    tool: string | null;
+  };
+  events: TraceProgressEvent[];
+};
+
+const agentProgressLabels: Record<string, string> = {
+  Chat: "Understanding your request…",
+  Supervisor: "Coordinating the analysis…",
+  Monitor: "Reviewing production signals…",
+  Analyzer: "Analyzing defect data…",
+  Planner: "Building an action plan…",
+  Verifier: "Verifying the findings…",
+  Executor: "Preparing the final response…",
+};
+
+function getTraceProgressLabel(agent: string | null, tool: string | null) {
+  if (tool?.includes("generate_pdf")) {
+    return "Generating the report…";
+  }
+  if (tool?.includes("create_action_plan")) {
+    return "Building an action plan…";
+  }
+  if (tool?.includes("validate")) {
+    return "Verifying the findings…";
+  }
+
+  return agent
+    ? agentProgressLabels[agent] ?? "Working through the analysis…"
+    : "Working through the analysis…";
+}
+
 function orderChats(chatList: Chat[]) {
   return [...chatList].sort((firstChat, secondChat) => {
     if (firstChat.isPinned !== secondChat.isPinned) {
@@ -60,6 +111,7 @@ export default function Home() {
   const hasMessages = messages.length > 0;
   const [isWaiting, setIsWaiting] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [traceProgress, setTraceProgress] = useState("Starting the analysis…");
   const [cancelledMessageIds, setCancelledMessageIds] = useState<string[]>([]);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>("system")
@@ -92,7 +144,89 @@ export default function Home() {
       behavior: "smooth",
       block: "end",
     });
-  }, [messages, isWaiting]);
+  }, [messages, isWaiting, traceProgress]);
+
+  useEffect(() => {
+    if (!session || !isWaiting || isCancelling) {
+      return;
+    }
+
+    const controller = new AbortController();
+    let cursor = 0;
+    let runId: string | null = null;
+    let activeAgent: string | null = null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    async function pollTrace() {
+      try {
+        const response = await fetch(`/api/chat/trace?since=${cursor}`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          return;
+        }
+
+        const trace = await response.json() as TraceProgressResponse;
+
+        if (trace.seq < cursor) {
+          cursor = 0;
+          runId = null;
+          activeAgent = null;
+          setTraceProgress("Starting the analysis…");
+          return;
+        }
+
+        cursor = trace.seq;
+        if (trace.run.status !== "running") {
+          return;
+        }
+
+        if (trace.run.id !== runId) {
+          runId = trace.run.id;
+          activeAgent = null;
+        }
+
+        for (const event of trace.events) {
+          if (
+            (event.kind === "agent_start" || event.kind === "tool_start")
+            && event.agent
+          ) {
+            activeAgent = event.agent;
+          } else if (
+            event.kind === "agent_end"
+            && event.agent === activeAgent
+          ) {
+            activeAgent = null;
+          }
+        }
+
+        const currentAgent = trace.current.agent ?? activeAgent;
+        setTraceProgress(getTraceProgressLabel(
+          currentAgent,
+          trace.current.tool,
+        ));
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          return;
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          timer = setTimeout(pollTrace, 900);
+        }
+      }
+    }
+
+    pollTrace();
+
+    return () => {
+      controller.abort();
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [isCancelling, isWaiting, session]);
 
   useEffect(() => {
     if (!session) {
@@ -158,6 +292,7 @@ export default function Home() {
       setInput("");
       setHistoryError(null);
       cancelRequestedRef.current = false;
+      setTraceProgress("Starting the analysis…");
       setIsWaiting(true);
       try {
         const response = await getResponse(newMessage.text);
@@ -409,13 +544,48 @@ export default function Home() {
         })
       }
     )
-    const data = await response.json() as ChatResponse;
 
     if (!response.ok) {
       throw new Error("Assistant request failed");
     }
 
-    return data
+    if (!response.body) {
+      throw new Error("Assistant response stream was unavailable");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf("\n");
+
+        if (!line) {
+          continue;
+        }
+
+        const event = JSON.parse(line) as ChatStreamEvent;
+        if (event.type === "result") {
+          return event.data;
+        }
+        if (event.type === "error") {
+          throw new Error(event.error);
+        }
+      }
+
+      if (done) {
+        break;
+      }
+    }
+
+    throw new Error("Assistant response ended before completion");
   }
 
   return (
@@ -453,7 +623,7 @@ export default function Home() {
 
       <header
         aria-hidden={!hasMessages}
-        className={`absolute left-4 top-0 z-20 flex h-16 items-center whitespace-nowrap text-xl font-semibold tracking-tight text-slate-800 transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none dark:text-slate-100 ${hasMessages
+        className={`absolute left-8 top-0 z-20 flex h-16 items-center whitespace-nowrap text-xl font-semibold tracking-tight text-slate-800 transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none dark:text-slate-100 ${hasMessages
           ? "translate-y-0 opacity-100 delay-150"
           : "pointer-events-none -translate-y-2 opacity-0"
           }`}
@@ -645,7 +815,7 @@ export default function Home() {
               role="status"
               aria-label={isCancelling
                 ? "Cancelling assistant response"
-                : "Waiting for assistant response"}
+                : traceProgress}
               className="mb-6 mr-auto px-2 py-1"
             >
               <div
@@ -661,17 +831,12 @@ export default function Home() {
                     Cancelling…
                   </span>
                 ) : (
-                  <div className="generating-loader__letters">
-                    {"Generating . . .".split("").map((character, index) => (
-                      <span
-                        key={`${character}-${index}`}
-                        className="generating-loader__letter"
-                        style={{ animationDelay: `${index * 0.12}s` }}
-                      >
-                        {character === " " ? "\u00A0" : character}
-                      </span>
-                    ))}
-                  </div>
+                  <span
+                    key={traceProgress}
+                    className="generating-loader__progress-label"
+                  >
+                    {traceProgress}
+                  </span>
                 )}
               </div>
             </div>

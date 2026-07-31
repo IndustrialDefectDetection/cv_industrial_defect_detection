@@ -152,12 +152,29 @@ from today, so a "last 7 days" run always overlaps the data.
 
 ## `POST /chat/`
 
-Unchanged request/response: `{"user_input": "..."}` → `{"analysis": "..."}`.
-The call blocks for the whole run (minutes); poll `/trace` in parallel for
-live progress. Errors are FastAPI-standard `{"detail": "..."}`:
+Request: `{"user_input": "..."}`. A successful call returns an NDJSON stream
+(`application/x-ndjson`) so long reports do not look like an idle HTTP
+connection:
+
+```jsonl
+{"type":"started"}
+{"type":"heartbeat"}
+{"type":"result","data":{"analysis":"..."}}
+```
+
+Heartbeats arrive every 10 seconds until the terminal `result` or `error`
+event. Cancellation ends with
+`{"type":"result","data":{"status":"cancelled"}}`. The run guard is released
+before the terminal event is emitted, so completion also means the API is
+ready for the next prompt. Poll `/trace` in parallel for detailed live
+progress. Errors detected before streaming starts remain FastAPI-standard
+`{"detail": "..."}`:
 
 | status | meaning |
 |---|---|
 | 409 | a run is already in progress (one traced run at a time) |
-| 500 | the run failed; the trace also ends with `error` + `run_end{status:"failed"}` |
 | 503 | agent manager not ready — see `GET /health` for why |
+
+Once streaming starts, a run failure is delivered as
+`{"type":"error","error":"ExceptionType: message"}` and the trace ends with
+`error` + `run_end{status:"failed"}`.

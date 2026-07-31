@@ -14,8 +14,10 @@ instead of uvicorn dying with a stack trace before the port even opens.
 """
 
 import asyncio
+import json
 import logging
 import os
+import queue
 import sys
 import threading
 import warnings
@@ -48,7 +50,7 @@ if sys.platform == "win32":
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from agent_tracer import AgentTracer
@@ -65,6 +67,7 @@ _manager_error: str | None = None
 # supervisor Agent keeps conversation state, so concurrent runs would corrupt
 # both. A second /chat/ while one is in flight gets a 409.
 _run_guard = threading.Lock()
+_CHAT_HEARTBEAT_SECONDS = 10
 
 
 class _QuietPollingFilter(logging.Filter):
@@ -279,24 +282,88 @@ def send_message(message: ChatRequest):
         raise HTTPException(status_code=503, detail=f"Agent manager not ready: {_manager_error}")
     if not _run_guard.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="A run is already in progress; wait for it to finish.")
+
+    terminal_events: queue.Queue[dict] = queue.Queue(maxsize=1)
+    worker = threading.Thread(
+        target=_run_chat_worker,
+        args=(_manager, message.user_input, terminal_events),
+        name="mes-chat-run",
+        daemon=True,
+    )
     try:
-        query = message.user_input
+        worker.start()
+    except Exception:
+        _run_guard.release()
+        raise
+
+    return StreamingResponse(
+        _iter_chat_events(_manager, worker, terminal_events),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _run_chat_worker(manager, query: str, terminal_events: queue.Queue[dict]):
+    """Run the blocking agent stack while the response stream stays alive."""
+    terminal_event: dict
+    try:
         tracer.reset()
         tracer.run_start(f"Chat: {query[:80]}", params={"user_input": query[:200]})
-        try:
-            response = _manager.run_chat(query)
-            if response.stop_reason == "cancelled":
-                tracer.run_end("cancelled")
-                return {"status": "cancelled"}
-            analysis_text = response.message["content"][0]["text"]
-        except RunCancelled:
+        response = manager.run_chat(query)
+        if response.stop_reason == "cancelled":
             tracer.run_end("cancelled")
-            return {"status": "cancelled"}
-        except Exception as e:
-            tracer.error(None, f"{type(e).__name__}: {e}")
-            tracer.run_end("failed", error=str(e))
-            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-        tracer.run_end("completed")
-        return {"analysis": analysis_text}
+            terminal_event = {
+                "type": "result",
+                "data": {"status": "cancelled"},
+            }
+        else:
+            analysis_text = response.message["content"][0]["text"]
+            tracer.run_end("completed")
+            terminal_event = {
+                "type": "result",
+                "data": {"analysis": analysis_text},
+            }
+    except RunCancelled:
+        tracer.run_end("cancelled")
+        terminal_event = {
+            "type": "result",
+            "data": {"status": "cancelled"},
+        }
+    except Exception as e:
+        tracer.error(None, f"{type(e).__name__}: {e}")
+        tracer.run_end("failed", error=str(e))
+        terminal_event = {
+            "type": "error",
+            "error": f"{type(e).__name__}: {e}",
+        }
     finally:
+        # The client must not receive a terminal event while the API would
+        # still reject its next request as busy.
         _run_guard.release()
+    terminal_events.put(terminal_event)
+
+
+def _iter_chat_events(manager, worker: threading.Thread,
+                      terminal_events: queue.Queue[dict]):
+    """Emit an immediate acknowledgement, heartbeats, then one final event."""
+    terminal_delivered = False
+    try:
+        yield json.dumps({"type": "started"}) + "\n"
+        while True:
+            try:
+                event = terminal_events.get(timeout=_CHAT_HEARTBEAT_SECONDS)
+            except queue.Empty:
+                yield json.dumps({"type": "heartbeat"}) + "\n"
+                continue
+
+            terminal_delivered = True
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+            return
+    finally:
+        # A browser/navigation disconnect must not leave an invisible run
+        # holding the global guard. Cancellation remains cooperative.
+        if not terminal_delivered and worker.is_alive():
+            manager.cancel()
