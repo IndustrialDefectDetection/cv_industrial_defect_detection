@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { X509Certificate } from "node:crypto";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   googleSignupPolicy,
@@ -6,6 +8,7 @@ import {
   readAuthRuntimeConfig,
   readDatabaseRuntimeConfig,
   readMesBackendRuntimeConfig,
+  withDatabaseCaFallback,
 } from "../src/lib/security-config.ts";
 
 const certificate = [
@@ -20,6 +23,51 @@ const validAuthEnvironment = {
   GOOGLE_CLIENT_ID: "google-client-id",
   GOOGLE_CLIENT_SECRET: "google-client-secret",
 };
+
+test("bundled Supabase certificate is the database CA fallback", () => {
+  const certificatePath = new URL(
+    "../certs/supabase-root-2021.crt",
+    import.meta.url,
+  );
+  const bundledCertificate = readFileSync(certificatePath, "utf8");
+  const parsedCertificate = new X509Certificate(bundledCertificate);
+
+  assert.equal(parsedCertificate.ca, true);
+  assert.match(parsedCertificate.subject, /CN=Supabase Root 2021 CA/);
+  assert.equal(
+    parsedCertificate.fingerprint256,
+    "80:70:25:AD:50:D4:ED:21:9D:2C:9C:7D:29:9C:00:4F:"
+      + "82:4E:B0:0C:F7:F6:5A:FE:F6:07:D0:7B:72:E6:CA:FA",
+  );
+  assert.ok(Date.parse(parsedCertificate.validTo) > Date.now());
+  assert.doesNotMatch(bundledCertificate, /PRIVATE KEY/);
+
+  const fallbackEnvironment = withDatabaseCaFallback(
+    {
+      DATABASE_URL: "postgresql://user:password@db.example.com:5432/app",
+    },
+    bundledCertificate,
+  );
+  assert.equal(fallbackEnvironment.DATABASE_CA_CERT, bundledCertificate);
+
+  const overrideEnvironment = {
+    DATABASE_CA_CERT: certificate,
+    DATABASE_URL: "postgresql://user:password@db.example.com:5432/app",
+  };
+  assert.strictEqual(
+    withDatabaseCaFallback(overrideEnvironment, bundledCertificate),
+    overrideEnvironment,
+  );
+
+  const blankEnvironment = withDatabaseCaFallback(
+    {
+      DATABASE_CA_CERT: "   ",
+      DATABASE_URL: "postgresql://user:password@db.example.com:5432/app",
+    },
+    bundledCertificate,
+  );
+  assert.equal(blankEnvironment.DATABASE_CA_CERT, bundledCertificate);
+});
 
 test("local PostgreSQL can run without TLS", () => {
   const config = readDatabaseRuntimeConfig({

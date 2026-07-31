@@ -140,6 +140,20 @@ function normalizeCertificate(value: string): string {
   return value.replace(/\\n/g, "\n").trim();
 }
 
+export function withDatabaseCaFallback(
+  environment: Environment,
+  fallbackCertificate: string,
+): Environment {
+  if (environment.DATABASE_CA_CERT?.trim()) {
+    return environment;
+  }
+
+  return {
+    ...environment,
+    DATABASE_CA_CERT: fallbackCertificate,
+  };
+}
+
 export function readDatabaseRuntimeConfig(
   environment: Environment,
 ): DatabaseRuntimeConfig {

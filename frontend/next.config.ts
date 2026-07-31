@@ -27,6 +27,9 @@ const contentSecurityPolicy = [
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
+  outputFileTracingIncludes: {
+    "/*": ["./certs/supabase-root-2021.crt"],
+  },
   async headers() {
     const securityHeaders = [
       {
