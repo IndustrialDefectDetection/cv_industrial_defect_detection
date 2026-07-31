@@ -11,8 +11,7 @@ concurrency:
   group: security-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Start every job with a read-only token. The SARIF job opts into only the
-# additional permission it needs below.
+# Start every job with a read-only token.
 permissions:
   contents: read
 
@@ -146,9 +145,6 @@ jobs:
     name: Repository vulnerability, configuration, and secret scan
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions:
-      contents: read
-      security-events: write
 
     steps:
       - name: Checkout code
@@ -159,22 +155,14 @@ jobs:
       - name: Run Trivy scanner
         # This must stay SHA-pinned. Mutable Trivy Action tags were
         # compromised in March 2026 (GHSA-69fq-xp46-6x23).
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        # This private repository does not have GitHub Code Security enabled,
+        # so keep findings visible in the job log instead of uploading SARIF.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
-          format: sarif
-          output: trivy-results.sarif
+          format: table
           version: v0.70.0
           scanners: vuln,misconfig,secret
           severity: HIGH,CRITICAL
           exit-code: "1"
-
-      - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@f52b05f4acaaa234e44466e66d29050e135ea9ef # v4.36.0
-        if: >-
-          always() &&
-          (github.event_name != 'pull_request' ||
-          github.event.pull_request.head.repo.full_name == github.repository)
-        with:
-          sarif_file: trivy-results.sarif
