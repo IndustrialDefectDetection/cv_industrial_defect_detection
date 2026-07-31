@@ -4,33 +4,42 @@ The FastAPI backend (`api.py`, `http://127.0.0.1:8000`, started with
 `python startup.py --api`) exposes everything the agent system does — per-agent
 streamed text, every tool call with arguments/results/durations, the literal
 SQL each tool ran, and run status — over three endpoints. `trace_viewer.py`
-(Streamlit, `streamlit run trace_viewer.py --server.port 8502`) is a working
+(Streamlit, `streamlit run trace_viewer.py --server.port 8502 --server.address
+127.0.0.1`) is a working
 reference client for this exact contract; a Next.js consumer can be built
-against the same endpoints without any backend changes (CORS already allows
-`http://localhost:3000` for GET and POST).
+against the same endpoints through authenticated server-side proxy routes.
+
+## Authentication and isolation
+
+Every endpoint below except `GET /health` requires the server-only header
+`X-MES-Internal-Token`. The configured token must be at least 32 characters;
+missing configuration returns `503`, and an invalid or missing caller token
+returns `401`. Never expose this token to browser JavaScript.
+
+Next.js validates the Better Auth session before proxying a request and adds
+`X-MES-User-ID` from that validated session to `/chat/`, `/trace`, and
+`/cancel`. The backend uses that value to prevent one signed-in user from
+observing or cancelling another user's run. The browser cannot choose the
+header value. Trusted loopback clients such as `trace_viewer.py` omit the user
+header and act as operator clients.
 
 ## Endpoints
 
 ### `GET /health`
 
-Always answers 200, even when the agent side is broken — this is the first
-debugging stop. Never contains the API key itself.
+Answers `200` when ready and `503` when unavailable. It deliberately exposes
+no paths, model names, credentials, or exception text.
 
 ```json
 {
   "status": "ok",
-  "model_id": "claude-sonnet-4-6",
-  "db_path": "C:\\...\\sample-MES-ClosedLoop-Strands-Agent\\mes.db",
-  "db_exists": true,
-  "anthropic_api_key_set": true,
-  "agent_manager_ready": true,
-  "agent_manager_error": null
+  "agent_manager_ready": true
 }
 ```
 
-If the manager failed to build (missing key, bad config), `agent_manager_ready`
-is `false` and `agent_manager_error` holds the exception text; `/chat/` will
-return 503 until it's fixed and the server restarted.
+If manager construction fails, the response is
+`{"status":"unavailable","agent_manager_ready":false}` with status `503`.
+Diagnostic details remain in server logs.
 
 ### `GET /trace?since=N`
 
@@ -48,6 +57,9 @@ Poll this (~800 ms works well) to render the live trace. Returns events with
   "current": { "agent": "Analyzer", "tool": "get_defect_data" }
 }
 ```
+
+A signed-in user's server-side proxy receives `403` when the retained trace
+belongs to another user or to an operator-triggered run.
 
 - `run.status`: `idle` | `running` | `completed` | `failed`. When ended, `run`
   also has `ended_at`, `duration_ms`, and (on failure) the `run_end` event
@@ -152,7 +164,8 @@ from today, so a "last 7 days" run always overlaps the data.
 
 ## `POST /chat/`
 
-Request: `{"user_input": "..."}`. A successful call returns an NDJSON stream
+Request: `{"user_input": "..."}` (nonblank, at most 4,000 characters). A
+successful call returns an NDJSON stream
 (`application/x-ndjson`) so long reports do not look like an idle HTTP
 connection:
 
@@ -172,9 +185,13 @@ progress. Errors detected before streaming starts remain FastAPI-standard
 
 | status | meaning |
 |---|---|
+| 400 | invalid input or missing server-derived user identity |
+| 401 | invalid internal service credentials |
+| 403 | the active/retained run belongs to another signed-in user |
 | 409 | a run is already in progress (one traced run at a time) |
-| 503 | agent manager not ready — see `GET /health` for why |
+| 429 | rolling hourly run budget exhausted; respect `Retry-After` |
+| 503 | agent manager or internal authentication is not configured |
 
 Once streaming starts, a run failure is delivered as
-`{"type":"error","error":"ExceptionType: message"}` and the trace ends with
-`error` + `run_end{status:"failed"}`.
+`{"type":"error","error":"The analysis failed"}` and the trace ends with a
+generic failed run marker. Detailed exceptions remain in server logs.

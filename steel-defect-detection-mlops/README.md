@@ -242,7 +242,8 @@ Opens at http://localhost:8501
 ### Option 2: API Server
 
 ```bash
-uvicorn deployment.api:app --port 8080
+export MES_INTERNAL_API_TOKEN="$(openssl rand -hex 32)"
+uvicorn deployment.api:app --host 127.0.0.1 --port 8080
 ```
 
 API documentation available at http://localhost:8080/docs
@@ -250,7 +251,10 @@ API documentation available at http://localhost:8080/docs
 ### Option 3: Full Stack with Docker
 
 ```bash
-docker-compose -f deployment/docker-compose.full.yml up
+export MES_INTERNAL_API_TOKEN="$(openssl rand -hex 32)"
+export GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 32)"
+export GRAFANA_SECRET_KEY="$(openssl rand -hex 32)"
+docker compose -f deployment/docker-compose.full.yml up
 ```
 
 This spins up:
@@ -266,11 +270,14 @@ This spins up:
 Simple Python example:
 
 ```python
+import os
+
 import requests
 
 with open("steel_image.jpg", "rb") as f:
     response = requests.post(
         "http://localhost:8080/predict",
+        headers={"X-MES-Internal-Token": os.environ["MES_INTERNAL_API_TOKEN"]},
         files={"file": f},
         params={"confidence": 0.25}
     )
@@ -284,9 +291,9 @@ for detection in result['detections']:
 Or using curl:
 
 ```bash
-curl -X POST "http://localhost:8080/predict" \
-  -F "file=@steel_image.jpg" \
-  -F "confidence=0.25"
+curl -X POST "http://localhost:8080/predict?confidence=0.25" \
+  -H "X-MES-Internal-Token: ${MES_INTERNAL_API_TOKEN}" \
+  -F "file=@steel_image.jpg"
 ```
 
 ## Dataset
@@ -379,7 +386,13 @@ The system includes Prometheus metrics for production monitoring:
 - `inference_duration_seconds` - Inference time distribution
 - `detections_total` - Number of detections by class
 
-Access metrics at http://localhost:8080/metrics
+Prometheus scrapes metrics with the internal service token. For direct local
+inspection:
+
+```bash
+curl -H "X-MES-Internal-Token: ${MES_INTERNAL_API_TOKEN}" \
+  http://localhost:8080/metrics
+```
 
 For visualization, Grafana dashboards are included in `monitoring/` directory.
 
@@ -619,13 +632,17 @@ tqdm>=4.64.0
 
 ```bash
 # Build Docker image
-docker build -t steel-defect-detector .
+docker build -f deployment/Dockerfile -t steel-defect-detector .
 
-# Run container
-docker run -p 8080:8080 steel-defect-detector
+# Run container on loopback with the required internal token
+docker run --read-only --cap-drop=ALL \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
+  -e MES_INTERNAL_API_TOKEN \
+  -p 127.0.0.1:8080:8080 \
+  steel-defect-detector
 
 # Or use Docker Compose
-docker-compose up -d
+docker compose -f deployment/docker-compose.yml up -d
 ````
 
 ## 📊 Model Performance

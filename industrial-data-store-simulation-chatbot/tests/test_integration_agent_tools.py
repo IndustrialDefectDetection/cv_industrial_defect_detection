@@ -139,7 +139,7 @@ class TestAgentToolFunctionality:
         
         return temp_db.name
     
-    @patch('app_factory.shared.database.DatabaseManager')
+    @patch('app_factory.production_meeting_agents.tools.database_tools.DatabaseManager')
     def test_database_tools_integration(self, mock_db_manager):
         """Test that database tools work correctly with agent tools."""
         # Create test database
@@ -151,11 +151,13 @@ class TestAgentToolFunctionality:
             mock_db_manager.return_value = mock_instance
             
             # Test run_sqlite_query tool
-            mock_instance.execute_query.return_value = {
+            mock_instance.execute_read_only_query.return_value = {
                 'success': True,
                 'rows': [{'OrderID': 1, 'Status': 'completed', 'ActualProduction': 95}],
-                'columns': ['OrderID', 'Status', 'ActualProduction'],
-                'row_count': 1
+                'column_names': ['OrderID', 'Status', 'ActualProduction'],
+                'row_count': 1,
+                'truncated': False,
+                'max_rows': 1000
             }
             
             result = run_sqlite_query("SELECT * FROM WorkOrders WHERE Status = 'completed'")
@@ -327,7 +329,7 @@ class TestErrorHandlingAndRecovery:
         with patch('app_factory.production_meeting_agents.tools.database_tools.DatabaseManager') as mock_db:
             mock_instance = MagicMock()
             mock_db.return_value = mock_instance
-            mock_instance.execute_query.side_effect = sqlite3.Error("Database connection failed")
+            mock_instance.execute_read_only_query.side_effect = sqlite3.Error("Database connection failed")
 
             result = run_sqlite_query("SELECT * FROM WorkOrders")
 

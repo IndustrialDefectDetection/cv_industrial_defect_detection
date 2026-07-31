@@ -23,6 +23,11 @@ from ..error_handling import IntelligentErrorAnalyzer, ErrorContext, TimeoutHand
 from datetime import datetime
 
 from app_factory.shared.database import DatabaseManager
+from app_factory.shared.display_security import safe_log_text
+from app_factory.shared.sql_security import (
+    ReadOnlyQueryError,
+    validate_read_only_query,
+)
 
 # Shared database manager instance
 _db_manager: Optional[DatabaseManager] = None
@@ -56,9 +61,11 @@ def run_sqlite_query(query: str) -> Dict[str, Any]:
         if not validation_result['valid']:
             return _create_validation_error_response(query, validation_result)
 
-        # Execute query using DatabaseManager
+        safe_query = validation_result['query']
+
+        # Execute model-generated SQL through the hardened read-only path.
         db = _get_db_manager()
-        result = db.execute_query(query)
+        result = db.execute_read_only_query(safe_query)
 
         if result["success"]:
             # Convert to agent-friendly format
@@ -82,7 +89,9 @@ def run_sqlite_query(query: str) -> Dict[str, Any]:
                 'query_metadata': {
                     'has_results': row_count > 0,
                     'result_size': 'large' if row_count > 1000 else 'medium' if row_count > 100 else 'small',
-                    'columns_count': len(columns)
+                    'columns_count': len(columns),
+                    'truncated': result.get('truncated', False),
+                    'max_rows': result.get('max_rows', 1000)
                 }
             }
         else:
@@ -239,7 +248,11 @@ def _handle_db_error(error_message: str, query: str, start_time: datetime) -> Di
     # Try to provide recovery options
     recovery_options = _generate_sqlite_recovery_options(error_message, query)
 
-    logger.warning(f"Database error in query: {query[:100]}... Error: {error_message}")
+    logger.warning(
+        "Database error in query %s: %s",
+        safe_log_text(query, max_chars=100),
+        safe_log_text(error_message),
+    )
 
     return {
         'success': False,
@@ -269,37 +282,24 @@ def _validate_query(query: str) -> Dict[str, Any]:
         Dictionary with validation results
     """
     validation_result = {'valid': True, 'warnings': [], 'suggestions': []}
-    
-    query_lower = query.lower().strip()
-    
-    # Check for empty query
-    if not query_lower:
+
+    try:
+        safe_query = validate_read_only_query(query)
+    except ReadOnlyQueryError as exc:
         validation_result['valid'] = False
-        validation_result['error'] = 'Query cannot be empty'
+        validation_result['error'] = str(exc)
+        validation_result['suggestions'] = [
+            'Use one SELECT statement or a read-only CTE to retrieve data'
+        ]
         return validation_result
-    
-    # Check for dangerous operations (basic safety)
-    dangerous_keywords = ['drop', 'delete', 'truncate', 'alter', 'create', 'insert', 'update']
-    if any(keyword in query_lower for keyword in dangerous_keywords):
-        validation_result['valid'] = False
-        validation_result['error'] = 'Modifying operations are not allowed. Use SELECT queries only.'
-        validation_result['suggestions'] = ['Use SELECT statements to query data without modifying it']
-        return validation_result
-    
-    # Check for SELECT statement
-    if not query_lower.startswith('select'):
-        validation_result['warnings'].append('Query should start with SELECT for data retrieval')
+
+    validation_result['query'] = safe_query
+    query_lower = safe_query.lower()
     
     # Check for potential performance issues
     if 'select *' in query_lower and 'limit' not in query_lower:
         validation_result['warnings'].append('Consider using LIMIT clause with SELECT * for better performance')
         validation_result['suggestions'].append('Add "LIMIT 100" to limit results for testing')
-    
-    # Check for common syntax issues
-    if query_lower.count('(') != query_lower.count(')'):
-        validation_result['valid'] = False
-        validation_result['error'] = 'Unmatched parentheses in query'
-        return validation_result
     
     return validation_result
 
@@ -351,7 +351,11 @@ def _handle_general_error(error: Exception, query: str, start_time: datetime) ->
     analyzer = IntelligentErrorAnalyzer()
     analysis = analyzer.analyze_error(error_context)
     
-    logger.error(f"General error in query: {query[:100]}... Error: {error_message}")
+    logger.error(
+        "General error in query %s: %s",
+        safe_log_text(query, max_chars=100),
+        safe_log_text(error_message),
+    )
     
     return {
         'success': False,

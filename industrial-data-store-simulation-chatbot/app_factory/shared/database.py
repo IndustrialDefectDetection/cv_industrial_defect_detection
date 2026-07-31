@@ -7,6 +7,8 @@ Currently supports SQLite; designed for future PostgreSQL support.
 
 import logging
 import pandas as pd
+import sqlite3
+import sys
 from datetime import datetime, timedelta
 import time
 import os
@@ -19,11 +21,35 @@ from app_factory.shared.db_utils import (
     days_ago, days_ahead, today, now_timestamp,
     date_range_start, date_range_end, date_diff_days
 )
+from app_factory.shared.display_security import safe_log_text
+from app_factory.shared.sql_security import (
+    ReadOnlyQueryError,
+    open_read_only_connection,
+    validate_read_only_query,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+MAX_READ_ONLY_RESULT_BYTES = 16 * 1024 * 1024
+
+
+def _estimated_row_bytes(row: tuple[object, ...]) -> int:
+    """Conservatively estimate retained Python memory for one SQLite row."""
+
+    total = sys.getsizeof(row)
+    for value in row:
+        total += sys.getsizeof(value)
+        if isinstance(value, str):
+            # Avoid allocating a second encoded copy merely to measure it.
+            total += len(value) * 4
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            # memoryview does not include the referenced buffer in getsizeof;
+            # double-counting bytes/bytearray is an intentional safety margin.
+            total += len(value)
+    return total
 
 class DatabaseManager:
     """Database manager for accessing the MES database with common queries.
@@ -67,9 +93,9 @@ class DatabaseManager:
         Returns:
             Dictionary with success status, rows, column_names, row_count, and timing.
         """
-        logger.info(f"Executing SQL query: {sql_query}")
+        logger.info("Executing SQL query: %s", safe_log_text(sql_query))
         if params:
-            logger.info(f"With parameters: {params}")
+            logger.info("Executing query with %s bound parameter(s)", len(params))
         start_time = time.time()
 
         try:
@@ -111,7 +137,7 @@ class DatabaseManager:
 
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"Error executing SQL query: {error_msg}")
+            logger.error("Error executing SQL query: %s", safe_log_text(error_msg))
 
             # Provide more helpful error messages for common issues
             if "no such table" in error_msg.lower():
@@ -128,6 +154,167 @@ class DatabaseManager:
                 "error": error_msg,
                 "execution_time_ms": round((time.time() - start_time) * 1000, 2)
             }
+
+    def execute_read_only_query(
+        self,
+        sql_query: str,
+        *,
+        max_rows: int = 1000,
+        timeout_seconds: float = 5.0,
+    ) -> dict:
+        """Execute a bounded agent-supplied query on a read-only connection.
+
+        Unlike :meth:`execute_query`, this method is safe for model-generated
+        SQL. It applies the shared SELECT/CTE validator, opens SQLite in
+        ``mode=ro`` with ``query_only`` and an authorizer, limits returned rows,
+        and interrupts queries that exceed the wall-clock deadline.
+        """
+        start_time = time.perf_counter()
+
+        try:
+            validated_query = validate_read_only_query(sql_query)
+            row_limit = min(max(int(max_rows), 1), 1000)
+            query_timeout = min(max(float(timeout_seconds), 0.001), 30.0)
+        except (ReadOnlyQueryError, TypeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": f"Read-only query rejected: {exc}",
+                "execution_time_ms": round(
+                    (time.perf_counter() - start_time) * 1000, 2
+                ),
+            }
+
+        connection = None
+        deadline = time.monotonic() + query_timeout
+        timed_out = False
+
+        def interrupt_after_deadline() -> int:
+            nonlocal timed_out
+            if time.monotonic() >= deadline:
+                timed_out = True
+                return 1
+            return 0
+
+        try:
+            connection = open_read_only_connection(
+                self.db_path, lock_timeout_seconds=query_timeout
+            )
+            connection.set_progress_handler(interrupt_after_deadline, 1000)
+            cursor = connection.execute(validated_query)
+            column_names = [
+                description[0] for description in (cursor.description or ())
+            ]
+            bounded_rows = []
+            retained_bytes = 0
+            truncated = False
+
+            while len(bounded_rows) < row_limit:
+                row = cursor.fetchone()
+                if row is None:
+                    break
+
+                row_bytes = _estimated_row_bytes(row)
+                if retained_bytes + row_bytes > MAX_READ_ONLY_RESULT_BYTES:
+                    truncated = True
+                    break
+
+                bounded_rows.append(row)
+                retained_bytes += row_bytes
+
+            if not truncated and len(bounded_rows) == row_limit:
+                truncated = cursor.fetchone() is not None
+
+            df = pd.DataFrame(bounded_rows, columns=column_names)
+
+            # Preserve the existing agent-friendly display formatting.
+            for column in df.columns:
+                if df[column].dtype == "object":
+                    try:
+                        if (
+                            df[column].str.contains("-").any()
+                            and df[column].str.contains(":").any()
+                        ):
+                            df[column] = pd.to_datetime(df[column])
+                            df[column] = df[column].dt.strftime("%Y-%m-%d %H:%M")
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+
+            for column in df.select_dtypes(include=["float"]).columns:
+                df[column] = df[column].round(2)
+
+            result = {
+                "success": True,
+                "rows": df.to_dict(orient="records"),
+                "column_names": column_names,
+                "row_count": len(df),
+                "truncated": truncated,
+                "max_rows": row_limit,
+                "max_result_bytes": MAX_READ_ONLY_RESULT_BYTES,
+                "execution_time_ms": round(
+                    (time.perf_counter() - start_time) * 1000, 2
+                ),
+            }
+            logger.info(
+                "Read-only query returned %s row(s) in %sms%s",
+                len(df),
+                result["execution_time_ms"],
+                " (truncated)" if truncated else "",
+            )
+            return result
+
+        except sqlite3.OperationalError as exc:
+            error_message = str(exc)
+            if timed_out or "interrupted" in error_message.lower():
+                error_message = (
+                    f"Read-only query exceeded the {query_timeout:g}-second timeout."
+                )
+            elif "no such table" in error_message.lower():
+                table_name = error_message.split(":", 1)[-1].strip()
+                error_message = (
+                    f"Table '{table_name}' doesn't exist. "
+                    "Please check the schema and table names."
+                )
+            elif "no such column" in error_message.lower():
+                column_name = error_message.split(":", 1)[-1].strip()
+                error_message = (
+                    f"Column '{column_name}' doesn't exist. "
+                    "Please check the schema and column names."
+                )
+            elif "syntax error" in error_message.lower():
+                error_message = (
+                    f"SQL syntax error: {error_message}. "
+                    "Please check your query syntax."
+                )
+
+            logger.warning(
+                "Read-only query failed: %s",
+                safe_log_text(error_message),
+            )
+            return {
+                "success": False,
+                "error": error_message,
+                "execution_time_ms": round(
+                    (time.perf_counter() - start_time) * 1000, 2
+                ),
+            }
+
+        except (OSError, sqlite3.DatabaseError) as exc:
+            logger.warning(
+                "Read-only query failed: %s",
+                safe_log_text(exc),
+            )
+            return {
+                "success": False,
+                "error": "The database could not complete the read-only query.",
+                "execution_time_ms": round(
+                    (time.perf_counter() - start_time) * 1000, 2
+                ),
+            }
+
+        finally:
+            if connection is not None:
+                connection.set_progress_handler(None, 0)
+                connection.close()
     
     def get_schema(self) -> dict:
         """Get the database schema with caching for performance.
@@ -156,6 +343,14 @@ class DatabaseManager:
 
             schema = {}
             for table_name in table_names:
+                # Inspector output is database metadata, not a SQL value.
+                # Quote it as an identifier before interpolating it so a
+                # deliberately named table cannot alter either query.
+                quoted_table_name = (
+                    self.engine.dialect.identifier_preparer.quote_identifier(
+                        table_name
+                    )
+                )
                 # Get column information using SQLAlchemy inspect
                 columns = inspector.get_columns(table_name)
                 column_info = []
@@ -181,13 +376,16 @@ class DatabaseManager:
                         })
 
                 # Get table row count using parameterized query
-                # Note: table_name comes from inspector, not user input
                 with self.engine.connect() as conn:
-                    count_result = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
+                    count_result = conn.execute(
+                        text(f"SELECT COUNT(*) FROM {quoted_table_name}")
+                    )
                     row_count = count_result.scalar()
 
                     # Get sample data (limited to 3 rows for performance)
-                    sample_result = conn.execute(text(f"SELECT * FROM {table_name} LIMIT 3"))
+                    sample_result = conn.execute(
+                        text(f"SELECT * FROM {quoted_table_name} LIMIT 3")
+                    )
                     sample_rows = sample_result.fetchall()
                     sample_columns = sample_result.keys()
 
@@ -226,7 +424,7 @@ class DatabaseManager:
             return schema
 
         except Exception as e:
-            logger.error(f"Error retrieving schema: {e}")
+            logger.error("Error retrieving schema: %s", safe_log_text(e))
             return {
                 "error": f"Failed to retrieve schema: {str(e)}",
                 "timestamp": datetime.now().isoformat()
@@ -272,7 +470,10 @@ class DatabaseManager:
         if result["success"]:
             return pd.DataFrame(result["rows"])
         else:
-            logger.error(f"Error getting daily production summary: {result['error']}")
+            logger.error(
+                "Error getting daily production summary: %s",
+                safe_log_text(result["error"]),
+            )
             return pd.DataFrame()
     
     def get_machine_status_summary(self) -> pd.DataFrame:
@@ -302,7 +503,10 @@ class DatabaseManager:
         if result["success"]:
             return pd.DataFrame(result["rows"])
         else:
-            logger.error(f"Error getting machine status summary: {result['error']}")
+            logger.error(
+                "Error getting machine status summary: %s",
+                safe_log_text(result["error"]),
+            )
             return pd.DataFrame()
     
     def get_quality_summary(self, days_back: int = 1, range_days: int = 30) -> pd.DataFrame:
@@ -350,7 +554,10 @@ class DatabaseManager:
         if result["success"]:
             return pd.DataFrame(result["rows"])
         else:
-            logger.error(f"Error getting quality summary: {result['error']}")
+            logger.error(
+                "Error getting quality summary: %s",
+                safe_log_text(result["error"]),
+            )
             return pd.DataFrame()
     
     def get_inventory_alerts(self) -> pd.DataFrame:
@@ -382,7 +589,10 @@ class DatabaseManager:
         if result["success"]:
             return pd.DataFrame(result["rows"])
         else:
-            logger.error(f"Error getting inventory alerts: {result['error']}")
+            logger.error(
+                "Error getting inventory alerts: %s",
+                safe_log_text(result["error"]),
+            )
             return pd.DataFrame()
     
     def get_upcoming_maintenance(self, days_forward: int = 7) -> pd.DataFrame:
@@ -426,7 +636,10 @@ class DatabaseManager:
                 )
             return df
         else:
-            logger.error(f"Error getting upcoming maintenance: {result['error']}")
+            logger.error(
+                "Error getting upcoming maintenance: %s",
+                safe_log_text(result["error"]),
+            )
             return pd.DataFrame()
     
     def get_work_order_status(self) -> pd.DataFrame:
@@ -460,7 +673,10 @@ class DatabaseManager:
             # that works without julianday
             return df[["Status", "OrderCount", "TotalQuantity"]] if not df.empty else df
         else:
-            logger.error(f"Error getting work order status: {result['error']}")
+            logger.error(
+                "Error getting work order status: %s",
+                safe_log_text(result["error"]),
+            )
             return pd.DataFrame()
 
     def get_work_order_status_with_duration(self) -> pd.DataFrame:
@@ -485,7 +701,10 @@ class DatabaseManager:
 
         status_result = self.execute_query(status_query)
         if not status_result["success"]:
-            logger.error(f"Error getting work order status: {status_result['error']}")
+            logger.error(
+                "Error getting work order status: %s",
+                safe_log_text(status_result["error"]),
+            )
             return pd.DataFrame()
 
         # Get duration data separately and calculate in Python

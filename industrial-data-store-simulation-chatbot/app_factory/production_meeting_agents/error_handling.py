@@ -29,6 +29,7 @@ from enum import Enum
 from dataclasses import dataclass
 
 from app_factory.shared.db_utils import days_ago
+from app_factory.shared.display_security import safe_log_text
 
 
 class MeetingErrorSeverity(Enum):
@@ -216,7 +217,10 @@ class ProductionMeetingErrorAnalyzer:
             )
             
         except Exception as e:
-            self.logger.error(f"Error during meeting error analysis: {e}")
+            self.logger.error(
+                "Error during meeting error analysis: %s",
+                safe_log_text(e),
+            )
             return self._create_meeting_fallback_analysis(error_context)
     
     def _classify_meeting_error(self, error_context: ProductionErrorContext) -> MeetingErrorCategory:
@@ -857,7 +861,10 @@ class MeetingTimeoutHandler:
             return False, None, partial_results
             
         except Exception as e:
-            self.logger.error(f"Meeting operation failed: {e}")
+            self.logger.error(
+                "Meeting operation failed: %s",
+                safe_log_text(e),
+            )
             return False, str(e), None
     
     def _determine_meeting_timeout(self, meeting_context: Dict[str, Any], timeout_override: Optional[int]) -> int:
@@ -911,7 +918,10 @@ class MeetingTimeoutHandler:
             ]
             
         except Exception as e:
-            self.logger.debug(f"Could not collect meeting partial results: {e}")
+            self.logger.debug(
+                "Could not collect meeting partial results: %s",
+                safe_log_text(e),
+            )
         
         return partial_results
     

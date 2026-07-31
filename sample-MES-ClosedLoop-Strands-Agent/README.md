@@ -128,9 +128,19 @@ Users can configure analysis scope with the following options:
    Configure AWS environment variables by creating a `.env` file:
 
    ```text
-   AWS_REGION="YourRegion" #example us-east-1
-   AWS_PROFILE="myprofile" #from ~/.aws/config
+   AWS_REGION="us-east-1"
+   AWS_ACCESS_KEY_ID="your-static-access-key-id"
+   AWS_SECRET_ACCESS_KEY="your-static-secret-access-key"
+   # Optional for temporary static credentials:
+   AWS_SESSION_TOKEN="your-session-token"
    ```
+
+   These AWS values are only needed when live SES email delivery is enabled.
+   Copy `.env.example` as a starting point and keep `.env` out of Git. For
+   transport security, AWS profiles, assume-role, web identity, SSO,
+   `credential_process`, ECS task credentials, and EC2 instance metadata are
+   intentionally unsupported. Without the static variables above, AWS calls
+   fail without consulting those outbound credential providers.
 
 3. **Install Required Packages**
 
@@ -170,7 +180,7 @@ You can run the applications independently or together:
 
 ```bash
 # Start the combined application
-python3 -m streamlit run app.py
+python3 -m streamlit run app.py --server.address 127.0.0.1
 ```
 
 

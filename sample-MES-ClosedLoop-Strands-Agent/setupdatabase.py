@@ -1,36 +1,119 @@
 import os
-import subprocess
+import re
+from pathlib import Path
+
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+from display_security import safe_log_text
 
 # ==========================================
-# CONFIGURATION — defaults to Supabase
+# DATABASE CONFIGURATION
 # ==========================================
-# Override any of these via MES_PG_* environment variables.
-# The Supabase pooler (port 6543) is the default so that
-#   python3 setupdatabase.py
-# works without any flags.  To target a local Postgres instead:
-#   MES_PG_HOST=localhost MES_PG_PORT=5432 MES_PG_USER=... python3 setupdatabase.py
+# Defaults are deliberately local-only. A remote database must be configured
+# explicitly and must use certificate- and hostname-verified TLS.
 SQLITE_FILE = os.getenv("MES_SQLITE_FILE", "mescopy_v1.db")
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
-PG_HOST     = os.getenv("MES_PG_HOST",     "aws-0-ca-central-1.pooler.supabase.com")
-PG_PORT     = os.getenv("MES_PG_PORT",     "6543")
-PG_USER     = os.getenv("MES_PG_USER",     "postgres.isdhddsgfuzvymrxfiox")
-PG_PASSWORD = os.getenv("MES_PG_PASSWORD", "cv_industrial_defect_detection")
-PG_DBNAME   = os.getenv("MES_PG_DBNAME",   "postgres")
+
+def _validated_host(host):
+    """Accept exactly one hostname/IP or one normalized Unix socket path."""
+
+    candidate = host.strip()
+    if (
+        not candidate
+        or "," in candidate
+        or any(character.isspace() or ord(character) < 32 for character in candidate)
+    ):
+        raise RuntimeError("MES_PG_HOST must contain exactly one database host")
+    if candidate.startswith("/") and os.path.normpath(candidate) != candidate:
+        raise RuntimeError(
+            "MES_PG_HOST Unix socket paths must be normalized absolute paths"
+        )
+    return candidate
+
+
+def _is_local_host(host):
+    normalized = host.strip().lower()
+    return normalized in _LOCAL_HOSTS or normalized.startswith("/")
+
+
+def _bounded_int(name, default, minimum, maximum):
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise RuntimeError(
+            f"{name} must be between {minimum} and {maximum}"
+        )
+    return value
+
+
+PG_HOST = _validated_host(os.getenv("MES_PG_HOST", "127.0.0.1"))
+PG_PORT = _bounded_int("MES_PG_PORT", 5432, 1, 65535)
+PG_DBNAME = os.getenv("MES_PG_DBNAME", "mescopy_v1").strip()
+_LOCAL_DATABASE = _is_local_host(PG_HOST)
+PG_USER = os.getenv("MES_PG_USER", "postgres" if _LOCAL_DATABASE else "").strip()
+PG_PASSWORD = os.getenv("MES_PG_PASSWORD") or None
+
+if not PG_DBNAME:
+    raise RuntimeError("MES_PG_DBNAME must not be empty")
+if not _LOCAL_DATABASE and (not PG_USER or not PG_PASSWORD):
+    raise RuntimeError(
+        "Remote PostgreSQL requires MES_PG_USER and MES_PG_PASSWORD"
+    )
+
+PG_SSLMODE = os.getenv(
+    "MES_PG_SSLMODE",
+    "disable" if _LOCAL_DATABASE else "verify-full",
+).strip().lower()
+if not _LOCAL_DATABASE and PG_SSLMODE != "verify-full":
+    raise RuntimeError(
+        "Remote PostgreSQL requires MES_PG_SSLMODE=verify-full"
+    )
+
+PG_SSLROOTCERT = os.getenv("MES_PG_SSLROOTCERT", "").strip()
+if PG_SSLROOTCERT and not Path(PG_SSLROOTCERT).is_file():
+    raise RuntimeError(
+        "MES_PG_SSLROOTCERT must point to a readable CA certificate file"
+    )
+if not _LOCAL_DATABASE and not PG_SSLROOTCERT:
+    raise RuntimeError(
+        "Remote PostgreSQL requires MES_PG_SSLROOTCERT"
+    )
+PG_CONNECT_TIMEOUT = _bounded_int("MES_PG_CONNECT_TIMEOUT", 10, 1, 60)
+
+
+def _connection_kwargs(dbname=None):
+    """Build one consistent, TLS-aware psycopg2 connection configuration."""
+    kwargs = {
+        "host": PG_HOST,
+        "port": PG_PORT,
+        "user": PG_USER,
+        "dbname": dbname or PG_DBNAME,
+        "sslmode": PG_SSLMODE,
+        "connect_timeout": PG_CONNECT_TIMEOUT,
+    }
+    if PG_PASSWORD is not None:
+        kwargs["password"] = PG_PASSWORD
+    if PG_SSLROOTCERT:
+        kwargs["sslrootcert"] = PG_SSLROOTCERT
+    return kwargs
+
+
+def _connect(dbname=None):
+    return psycopg2.connect(**_connection_kwargs(dbname))
 
 def ensure_postgres_db_exists():
     """Connects to the default 'postgres' database and creates the target DB if missing."""
     print(f"Checking if PostgreSQL database '{PG_DBNAME}' exists...")
+    conn = None
+    cursor = None
     try:
         # Connect to the default 'postgres' maintenance database first
-        conn = psycopg2.connect(
-            host=PG_HOST,
-            port=PG_PORT,
-            user=PG_USER,
-            password=PG_PASSWORD,
-            dbname="postgres"
-        )
+        conn = _connect("postgres")
 
         # need AUTOCOMMIT mode here to run CREATE DATABASE statements
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
@@ -42,47 +125,41 @@ def ensure_postgres_db_exists():
         
         if not exists:
             print(f"Database '{PG_DBNAME}' not found. Creating it now...")
-            cursor.execute(f'CREATE DATABASE "{PG_DBNAME}";')
+            cursor.execute(
+                sql.SQL("CREATE DATABASE {}").format(sql.Identifier(PG_DBNAME))
+            )
             print(f"Successfully created database '{PG_DBNAME}'!")
         else:
             print(f"Database '{PG_DBNAME}' already exists. Skipping creation step.")
             
-        cursor.close()
-        conn.close()
         return True
         
     except Exception as e:
-        print(f"Error while checking/creating the database: {e}")
+        print(
+            "Error while checking/creating the database: "
+            f"{safe_log_text(e)}"
+        )
         return False
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 def run_pgloader():
-    """Uses pgloader to migrate the SQLite schema and data into PostgreSQL."""
-    print(f"\nStarting SQLite to PostgreSQL migration via pgloader...")
-    
-    if not os.path.exists(SQLITE_FILE):
-        print(f"Error: SQLite file '{SQLITE_FILE}' not found at path: {SQLITE_FILE}")
-        return False
+    """Use the built-in copy instead of putting credentials in process argv.
 
-    # Construct the target PostgreSQL URI string
-    pg_uri = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DBNAME}"
-    command = ["pgloader", SQLITE_FILE, pg_uri]
-    
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        print("Data migration completed by pgloader!")
-        print(result.stdout)
-        return True
-    except subprocess.CalledProcessError as e:
-        print("Migration failed during pgloader execution:")
-        print(e.stderr)
-        return False
-    except FileNotFoundError:
-        print("'pgloader' is not installed or not on PATH — skipping the MES data copy.")
-        print("  macOS:   brew install pgloader")
-        print("  Linux:   apt install pgloader")
-        print("  Windows: no official build; use WSL, Docker "
-              "(ghcr.io/dimitri/pgloader), or copy the tables another way.")
-        return False
+    pgloader requires its destination URI on the command line in this workflow.
+    Embedding the password there exposes it to process listings and can echo it
+    back in errors. Returning False selects copy_tables_with_python(), which
+    uses the same protected psycopg2 connection settings without an external
+    process.
+    """
+    print(
+        "\nSkipping pgloader so database credentials never enter process "
+        "arguments; using the built-in copy."
+    )
+    return False
 
 # SQLite is loosely typed; these are the six declared types mes.db actually
 # uses. Anything unexpected falls back to TEXT rather than failing the copy.
@@ -94,6 +171,14 @@ _SQLITE_TO_PG = {
     "BOOLEAN": "BOOLEAN",
     "DATETIME": "TIMESTAMP",
 }
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validated_identifier(value):
+    """Reject metadata-controlled SQL identifiers outside the MES convention."""
+    if not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value):
+        raise ValueError(f"Unsafe database identifier: {value!r}")
+    return value
 
 
 def copy_tables_with_python():
@@ -119,20 +204,21 @@ def copy_tables_with_python():
         return False
 
     print(f"\nCopying tables from {SQLITE_FILE} into '{PG_DBNAME}' (no pgloader needed)...")
-    lite = sqlite3.connect(SQLITE_FILE)
-    lite.row_factory = sqlite3.Row
-    pg = psycopg2.connect(host=PG_HOST, port=PG_PORT, user=PG_USER,
-                          password=PG_PASSWORD, dbname=PG_DBNAME)
-
+    lite = None
+    pg = None
     copied, mismatched = 0, []
     try:
+        lite = sqlite3.connect(SQLITE_FILE)
+        lite.row_factory = sqlite3.Row
+        pg = _connect()
         tables = [r[0] for r in lite.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
 
         for table in tables:
-            cols = list(lite.execute(f'PRAGMA table_info("{table}")'))
-            names = [c["name"] for c in cols]
+            table = _validated_identifier(table)
+            cols = list(lite.execute(f"PRAGMA table_info({table})"))
+            names = [_validated_identifier(c["name"]) for c in cols]
             bool_idx = {i for i, c in enumerate(cols)
                         if (c["type"] or "").upper() == "BOOLEAN"}
 
@@ -166,12 +252,15 @@ def copy_tables_with_python():
 
         pg.commit()
     except Exception as exc:
-        pg.rollback()
-        print(f"Copy failed: {exc}")
+        if pg is not None:
+            pg.rollback()
+        print(f"Copy failed: {safe_log_text(exc)}")
         return False
     finally:
-        lite.close()
-        pg.close()
+        if lite is not None:
+            lite.close()
+        if pg is not None:
+            pg.close()
 
     if mismatched:
         print("Row-count mismatches:", mismatched)
@@ -184,14 +273,10 @@ def create_contract_tables():
     """Creates the VisionDetections and AgentAlerts tables (CONTRACTS.md §3) in PostgreSQL."""
     print("\nCreating CONTRACTS.md §3 tables (VisionDetections, AgentAlerts) in PostgreSQL...")
 
+    conn = None
+    cursor = None
     try:
-        conn = psycopg2.connect(
-            host=PG_HOST,
-            port=PG_PORT,
-            user=PG_USER,
-            password=PG_PASSWORD,
-            dbname=PG_DBNAME
-        )
+        conn = _connect()
         cursor = conn.cursor()
 
         queries = [
@@ -233,13 +318,14 @@ def create_contract_tables():
         return True
 
     except Exception as e:
-        print(f"Error creating contract tables: {e}")
-        if 'conn' in locals():
+        print(f"Error creating contract tables: {safe_log_text(e)}")
+        if conn is not None:
             conn.rollback()
         return False
     finally:
-        if 'conn' in locals():
+        if cursor is not None:
             cursor.close()
+        if conn is not None:
             conn.close()
 
 
@@ -247,15 +333,11 @@ def add_ml_columns():
     """Connects to the target Postgres DB and safely alters the 'defects' table structure."""
     print("\nAdding live-tracking ML columns to the 'defects' table...")
     
+    conn = None
+    cursor = None
     try:
         # Establish connection to the newly populated target DB
-        conn = psycopg2.connect(
-            host=PG_HOST,
-            port=PG_PORT,
-            user=PG_USER,
-            password=PG_PASSWORD,
-            dbname=PG_DBNAME
-        )
+        conn = _connect()
         cursor = conn.cursor()
         
         # SQL commands to append our confidence score and future-proofing image pointer
@@ -271,12 +353,13 @@ def add_ml_columns():
         print("Columns 'confidence' and 'image_url' successfully attached!")
         
     except Exception as e:
-        print(f"Database alteration failed: {e}")
-        if 'conn' in locals():
+        print(f"Database alteration failed: {safe_log_text(e)}")
+        if conn is not None:
             conn.rollback()
     finally:
-        if 'conn' in locals():
+        if cursor is not None:
             cursor.close()
+        if conn is not None:
             conn.close()
 
 if __name__ == "__main__":
@@ -285,9 +368,9 @@ if __name__ == "__main__":
     if not ensure_postgres_db_exists():
         raise SystemExit(1)
 
-    # Step 2 copies the historical MES tables across. Prefer pgloader when it
-    # is installed; fall back to the built-in Python copy, which needs no
-    # external tooling and works on Windows.
+    # Step 2 copies the historical MES tables across. pgloader is disabled in
+    # this workflow because its destination URI would expose the password in
+    # process arguments, so the protected built-in copy is always selected.
     migrated = run_pgloader()
     if not migrated:
         print("Falling back to the built-in copy...")
@@ -312,7 +395,7 @@ if __name__ == "__main__":
               "bridge and analyze_batch can run now.")
         print("The historical MES tables were NOT copied, so work-order and "
               "machine lookups will return nothing (OrderID stays NULL) until "
-              "pgloader runs.")
+              "the database copy succeeds.")
     else:
         print("Setup failed: the contract tables could not be created.")
         raise SystemExit(1)

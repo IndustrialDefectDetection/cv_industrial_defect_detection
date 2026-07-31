@@ -1,4 +1,9 @@
 import { auth } from "@/lib/auth";
+import {
+  fetchMesBackend,
+  isBackendContentType,
+  sanitizedBackendErrorResponse,
+} from "@/lib/mes-backend";
 
 type TraceEvent = {
   seq?: unknown;
@@ -15,6 +20,7 @@ const visibleEventKinds = new Set([
   "tool_start",
   "tool_end",
 ]);
+const BACKEND_READ_TIMEOUT_MILLISECONDS = 10_000;
 
 export async function GET(request: Request) {
   const session = await auth.api.getSession({
@@ -25,27 +31,64 @@ export async function GET(request: Request) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const backendUrl = process.env.BACKEND_URL;
-  if (!backendUrl) {
-    return Response.json(
-      { error: "Backend URL is not configured" },
-      { status: 500 }
-    );
-  }
-
   const requestUrl = new URL(request.url);
   const requestedSince = Number(requestUrl.searchParams.get("since") ?? "0");
   const since = Number.isSafeInteger(requestedSince) && requestedSince >= 0
     ? requestedSince
     : 0;
 
-  const response = await fetch(`${backendUrl}/trace?since=${since}`, {
-    cache: "no-store",
-  });
-  const data = await response.json();
+  let response: Response;
+
+  try {
+    response = await fetchMesBackend(`/trace?since=${since}`, session.user.id, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(BACKEND_READ_TIMEOUT_MILLISECONDS),
+    });
+  } catch {
+    return Response.json(
+      { error: "Assistant backend is unavailable" },
+      {
+        status: 502,
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      },
+    );
+  }
 
   if (!response.ok) {
-    return Response.json(data, { status: response.status });
+    return sanitizedBackendErrorResponse(response);
+  }
+
+  if (!isBackendContentType(response, "application/json")) {
+    await response.body?.cancel().catch(() => undefined);
+    return Response.json(
+      { error: "Backend response used an unexpected content type" },
+      {
+        status: 502,
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      },
+    );
+  }
+
+  let data: Record<string, unknown>;
+  try {
+    const parsedData = await response.json();
+    data = typeof parsedData === "object" && parsedData !== null
+      ? parsedData as Record<string, unknown>
+      : {};
+  } catch {
+    return Response.json(
+      { error: "Backend response was not valid JSON" },
+      {
+        status: 502,
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      },
+    );
   }
 
   const events = Array.isArray(data.events)
@@ -62,22 +105,36 @@ export async function GET(request: Request) {
       }))
     : [];
 
-  return Response.json({
-    seq: typeof data.seq === "number" ? data.seq : 0,
-    run: {
-      id: typeof data.run?.run_id === "string" ? data.run.run_id : null,
-      status: typeof data.run?.status === "string"
-        ? data.run.status
-        : "idle",
+  const run = typeof data.run === "object" && data.run !== null
+    ? data.run as Record<string, unknown>
+    : {};
+  const current = typeof data.current === "object" && data.current !== null
+    ? data.current as Record<string, unknown>
+    : {};
+
+  return Response.json(
+    {
+      seq: typeof data.seq === "number" ? data.seq : 0,
+      run: {
+        id: typeof run.run_id === "string" ? run.run_id : null,
+        status: typeof run.status === "string"
+          ? run.status
+          : "idle",
+      },
+      current: {
+        agent: typeof current.agent === "string"
+          ? current.agent
+          : null,
+        tool: typeof current.tool === "string"
+          ? current.tool
+          : null,
+      },
+      events,
     },
-    current: {
-      agent: typeof data.current?.agent === "string"
-        ? data.current.agent
-        : null,
-      tool: typeof data.current?.tool === "string"
-        ? data.current.tool
-        : null,
+    {
+      headers: {
+        "Cache-Control": "no-store",
+      },
     },
-    events,
-  });
+  );
 }

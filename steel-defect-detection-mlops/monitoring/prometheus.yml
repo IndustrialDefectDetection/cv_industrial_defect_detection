@@ -13,10 +13,6 @@ alerting:
     - static_configs:
         - targets: []
 
-# Rule files
-rule_files:
-  - "alerts.yml"
-
 # Scrape configurations
 scrape_configs:
   # Prometheus self-monitoring
@@ -27,6 +23,10 @@ scrape_configs:
   # FastAPI application metrics
   - job_name: "steel-defect-api"
     metrics_path: "/metrics"
+    http_headers:
+      X-MES-Internal-Token:
+        files:
+          - /run/secrets/mes_internal_api_token
     static_configs:
       - targets: ["defect-api:8080"]
     relabel_configs:

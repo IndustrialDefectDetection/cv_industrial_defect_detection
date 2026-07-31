@@ -5,7 +5,6 @@ This module runs comprehensive AI analysis daily and caches results for fast ret
 """
 
 import asyncio
-import json
 import logging
 import os
 import subprocess
@@ -18,33 +17,54 @@ from typing import Dict, Any, Optional
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from app_factory.shared.database import DatabaseManager
+from app_factory.shared.display_security import safe_log_text
+from app_factory.shared.output_security import (
+    PrivateFileHandler,
+    atomic_write_private_json,
+    ensure_private_directory,
+    open_private_json,
+)
 from app_factory.production_meeting_agents.agent_manager import ProductionMeetingAgentManager
 from app_factory.production_meeting_agents.config import default_config
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('daily_analysis.log'),
-        logging.StreamHandler()
-    ]
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LOGS_DIR = ensure_private_directory(PROJECT_ROOT / "logs")
+DAILY_ANALYSIS_LOG = LOGS_DIR / "daily_analysis.log"
+root_logger = logging.getLogger()
+private_log_path = str(DAILY_ANALYSIS_LOG)
+had_logging_handlers = bool(root_logger.handlers)
+if not any(
+    getattr(handler, "baseFilename", None) == private_log_path
+    for handler in root_logger.handlers
+):
+    private_handler = PrivateFileHandler(DAILY_ANALYSIS_LOG)
+    private_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+    )
+    root_logger.addHandler(private_handler)
+if not had_logging_handlers:
+    root_logger.addHandler(logging.StreamHandler())
+root_logger.setLevel(min(root_logger.level, logging.INFO))
 logger = logging.getLogger(__name__)
 
 class DailyAnalysisScheduler:
     """Handles daily analysis generation and caching"""
-    
+
     def __init__(self, cache_dir: str = "reports/daily_analysis", generate_data: bool = True):
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if self.cache_dir.parent.name == "reports":
+            ensure_private_directory(self.cache_dir.parent)
+        self.cache_dir = ensure_private_directory(self.cache_dir)
         self.generate_data = generate_data
         
         self.db_manager = DatabaseManager()
         self.agent_manager = ProductionMeetingAgentManager(default_config)
         
         # Get project root for data generation
-        self.project_root = Path(__file__).parent.parent.parent
+        self.project_root = PROJECT_ROOT
         
     async def initialize(self):
         """Initialize the agent manager"""
@@ -52,7 +72,10 @@ class DailyAnalysisScheduler:
             await self.agent_manager.initialize()
             logger.info("Agent manager initialized successfully")
         except Exception as e:
-            logger.error(f"Failed to initialize agent manager: {e}")
+            logger.error(
+                "Failed to initialize agent manager: %s",
+                safe_log_text(e),
+            )
             raise
     
     def generate_fresh_data(self) -> bool:
@@ -90,19 +113,28 @@ class DailyAnalysisScheduler:
             if result.returncode == 0:
                 logger.info("Data generation completed successfully")
                 if result.stdout:
-                    logger.debug(f"Data generation output: {result.stdout}")
+                    logger.debug(
+                        "Data generation output: %s",
+                        safe_log_text(result.stdout),
+                    )
                 return True
             else:
                 logger.error(f"Data generation failed with return code {result.returncode}")
                 if result.stderr:
-                    logger.error(f"Data generation error: {result.stderr}")
+                    logger.error(
+                        "Data generation error: %s",
+                        safe_log_text(result.stderr),
+                    )
                 return False
                 
         except subprocess.TimeoutExpired:
             logger.error("Data generation timed out after 5 minutes")
             return False
         except Exception as e:
-            logger.error(f"Error during data generation: {e}")
+            logger.error(
+                "Error during data generation: %s",
+                safe_log_text(e),
+            )
             return False
     
     def get_cache_filename(self, date: datetime = None) -> Path:
@@ -184,14 +216,22 @@ class DailyAnalysisScheduler:
                         "generated_at": datetime.now().isoformat()
                     }
                 else:
-                    logger.warning(f"Failed {analysis_config['name']}: {response.get('error', 'Unknown')}")
+                    logger.warning(
+                        "Failed %s: %s",
+                        safe_log_text(analysis_config["name"]),
+                        safe_log_text(response.get("error", "Unknown")),
+                    )
                     return analysis_config['name'], {
                         "error": response.get('error', 'Analysis failed'),
                         "generated_at": datetime.now().isoformat()
                     }
 
             except Exception as e:
-                logger.error(f"Error in {analysis_config['name']}: {e}")
+                logger.error(
+                    "Error in %s: %s",
+                    safe_log_text(analysis_config["name"]),
+                    safe_log_text(e),
+                )
                 return analysis_config['name'], {
                     "error": str(e),
                     "generated_at": datetime.now().isoformat()
@@ -204,7 +244,10 @@ class DailyAnalysisScheduler:
         # Collect results
         for result in results:
             if isinstance(result, Exception):
-                logger.error(f"Parallel task failed: {result}")
+                logger.error(
+                    "Parallel task failed: %s",
+                    safe_log_text(result),
+                )
             else:
                 name, data = result
                 analysis_results["analyses"][name] = data
@@ -220,18 +263,20 @@ class DailyAnalysisScheduler:
     def save_analysis_cache(self, analysis_results: Dict[str, Any], date: datetime = None):
         """Save analysis results to cache file"""
         cache_file = self.get_cache_filename(date)
-        
+
         try:
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(analysis_results, f, indent=2, ensure_ascii=False)
-            
+            cache_file = atomic_write_private_json(cache_file, analysis_results)
+
             logger.info(f"Analysis results cached to {cache_file}")
             
             # Clean up old cache files (keep last 30 days)
             self.cleanup_old_cache_files()
             
         except Exception as e:
-            logger.error(f"Failed to save analysis cache: {e}")
+            logger.error(
+                "Failed to save analysis cache: %s",
+                safe_log_text(e),
+            )
             raise
     
     def cleanup_old_cache_files(self, days_to_keep: int = 30):
@@ -249,7 +294,11 @@ class DailyAnalysisScheduler:
                     logger.info(f"Removed old cache file: {cache_file}")
                     
             except Exception as e:
-                logger.warning(f"Error processing cache file {cache_file}: {e}")
+                logger.warning(
+                    "Error processing cache file %s: %s",
+                    safe_log_text(cache_file),
+                    safe_log_text(e),
+                )
     
     async def run_daily_analysis(self):
         """Main method to run daily analysis"""
@@ -271,14 +320,26 @@ class DailyAnalysisScheduler:
             today_cache = self.get_cache_filename()
             if today_cache.exists():
                 logger.info(f"Daily analysis already exists for today: {today_cache}")
-                
-                # Check if it's recent (within last 6 hours)
-                file_time = datetime.fromtimestamp(today_cache.stat().st_mtime)
-                if datetime.now() - file_time < timedelta(hours=6):
-                    logger.info("Recent analysis found, skipping generation")
-                    return
+
+                try:
+                    # Stat the same no-follow descriptor that validates and
+                    # repairs the cache file's private mode.
+                    with open_private_json(today_cache) as cache_stream:
+                        file_time = datetime.fromtimestamp(
+                            os.fstat(cache_stream.fileno()).st_mtime
+                        )
+                except Exception:
+                    logger.warning(
+                        "Existing daily cache is unsafe or unreadable; "
+                        "regenerating it"
+                    )
                 else:
-                    logger.info("Analysis is older than 6 hours, regenerating")
+                    if datetime.now() - file_time < timedelta(hours=6):
+                        logger.info("Recent analysis found, skipping generation")
+                        return
+                    logger.info(
+                        "Analysis is older than 6 hours, regenerating"
+                    )
             
             # Step 4: Generate new analysis
             logger.info("Step 3: Generating comprehensive analysis...")
@@ -291,7 +352,10 @@ class DailyAnalysisScheduler:
             logger.info("Daily analysis workflow completed successfully")
             
         except Exception as e:
-            logger.error(f"Daily analysis workflow failed: {e}")
+            logger.error(
+                "Daily analysis workflow failed: %s",
+                safe_log_text(e),
+            )
             raise
 
 

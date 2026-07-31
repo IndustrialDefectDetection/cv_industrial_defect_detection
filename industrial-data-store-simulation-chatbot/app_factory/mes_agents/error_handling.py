@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
+from app_factory.shared.display_security import safe_log_text
 
 
 class ErrorSeverity(Enum):
@@ -144,7 +145,10 @@ class IntelligentErrorAnalyzer:
             )
             
         except Exception as e:
-            self.logger.error(f"Error during error analysis: {e}")
+            self.logger.error(
+                "Error during error analysis: %s",
+                safe_log_text(e),
+            )
             return self._create_fallback_analysis(error_context)
     
     def _classify_error(self, error_context: ErrorContext) -> ErrorCategory:
@@ -620,7 +624,7 @@ class TimeoutHandler:
             return False, None, partial_results
             
         except Exception as e:
-            self.logger.error(f"Operation failed: {e}")
+            self.logger.error("Operation failed: %s", safe_log_text(e))
             return False, str(e), None
     
     async def _collect_partial_results(self, operation_func, args, kwargs) -> Dict[str, Any]:
@@ -656,7 +660,10 @@ class TimeoutHandler:
                     partial_results['suggested_simplified_query'] = simplified_query
             
         except Exception as e:
-            self.logger.debug(f"Could not collect partial results: {e}")
+            self.logger.debug(
+                "Could not collect partial results: %s",
+                safe_log_text(e),
+            )
         
         return partial_results
     

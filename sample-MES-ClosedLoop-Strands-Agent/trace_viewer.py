@@ -1,7 +1,7 @@
 """Under-the-hood trace viewer for the MES agent backend — the project's
 observability dashboard for watching what the agents are doing, live.
 
-    streamlit run trace_viewer.py --server.port 8502
+    streamlit run trace_viewer.py --server.port 8502 --server.address 127.0.0.1
 
 (Also launched automatically by the repo-root Launch.py alongside the API and
 the Next.js frontend.)
@@ -23,14 +23,50 @@ trace API contract.
 """
 
 import json
+import logging
 import os
 import threading
 import time
+from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 import streamlit as st
+from display_security import safe_log_text, safe_model_markdown
+from env_security import load_protected_env, remove_cross_service_secrets
 
-DEFAULT_BASE = "http://127.0.0.1:8000"
+load_protected_env(
+    Path(__file__).resolve().parent / ".env",
+    allowed_names=frozenset({
+        "MES_AGENT_URL",
+        "MES_INTERNAL_API_TOKEN",
+        "MES_VIEWER_HEALTH_MAX_RETRIES",
+        "MES_VIEWER_HEALTH_RETRY",
+    }),
+)
+remove_cross_service_secrets()
+
+logger = logging.getLogger(__name__)
+
+
+def loopback_backend_url() -> str:
+    """Accept a trusted environment override, never a browser-supplied URL."""
+    value = os.getenv("MES_AGENT_URL", "http://127.0.0.1:8000").rstrip("/")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise RuntimeError("MES_AGENT_URL must be a plain loopback HTTP origin")
+    return value
+
+
+DEFAULT_BASE = loopback_backend_url()
 POLL_RUNNING = 0.8  # trace poll cadence while a run is active
 POLL_IDLE = 2.5  # keep polling when idle so runs from other clients appear
 POLL_ALERTS = 4.0  # alerts arrive on the pipeline's schedule, not the trace's
@@ -38,6 +74,7 @@ HEALTH_RETRY_SECONDS = float(os.getenv("MES_VIEWER_HEALTH_RETRY", "2.0"))
 # Bounded: ~30s of auto-retry covers backend startup without spinning forever
 # on a backend that is genuinely down (after the cap, the manual button waits).
 MAX_HEALTH_RETRIES = int(os.getenv("MES_VIEWER_HEALTH_MAX_RETRIES", "15"))
+INTERNAL_API_TOKEN = os.getenv("MES_INTERNAL_API_TOKEN", "")
 
 # Streamlit markdown accent color per agent, so the timeline is scannable.
 AGENT_COLORS = {
@@ -58,10 +95,29 @@ st.set_page_config(
 
 
 # --------------------------------------------------------------------- helpers
+def api_headers() -> dict[str, str]:
+    """Server-only authentication header for the loopback FastAPI service."""
+    if len(INTERNAL_API_TOKEN) < 32:
+        return {}
+    return {"X-MES-Internal-Token": INTERNAL_API_TOKEN}
+
+
+def api_request(method: str, url: str, **kwargs):
+    """Call loopback directly without proxy inheritance or redirect forwarding."""
+    with requests.Session() as session:
+        session.trust_env = False
+        return session.request(
+            method,
+            url,
+            allow_redirects=False,
+            **kwargs,
+        )
+
+
 def fetch_json(url: str, timeout: float = 3.0):
     """GET a JSON endpoint. Returns (data, None) or (None, error_message)."""
     try:
-        resp = requests.get(url, timeout=timeout)
+        resp = api_request("GET", url, headers=api_headers(), timeout=timeout)
         resp.raise_for_status()
         return resp.json(), None
     except requests.exceptions.ConnectionError:
@@ -81,9 +137,11 @@ def post_analysis(base_url: str, params: dict, holder: dict) -> None:
     main script reruns on its poll interval and reads `holder` instead.
     """
     try:
-        resp = requests.post(
+        resp = api_request(
+            "POST",
             f"{base_url}/analysis",
             json=params,
+            headers=api_headers(),
             timeout=1800,  # full five-agent runs take minutes
         )
         if resp.ok:
@@ -140,7 +198,8 @@ def group_events(events: list[dict]) -> tuple[list[dict], dict]:
 
 
 def as_blockquote(text: str) -> str:
-    return "> " + text.replace("\n", "\n> ")
+    safe_text = safe_model_markdown(text)
+    return "> " + safe_text.replace("\n", "\n> ")
 
 
 # ------------------------------------------------------------------- renderers
@@ -179,7 +238,11 @@ def render_query(event: dict) -> None:
         if meta:
             st.caption(" · ".join(meta))
     else:
-        st.error(f"Query failed: {event.get('error')}")
+        st.error(
+            safe_model_markdown(
+                f"Query failed: {event.get('error')}", max_chars=2_000
+            )
+        )
 
 
 def render_event(event: dict, ends_by_id: dict) -> None:
@@ -195,9 +258,10 @@ def render_event(event: dict, ends_by_id: dict) -> None:
             st.caption("💭 reasoning")
         st.markdown(as_blockquote(event["text"]))
     elif kind == "error":
-        st.error(event["message"])
+        st.error(safe_model_markdown(event["message"], max_chars=2_000))
     elif kind == "run_start":
-        st.markdown(f"▶️ **{event['label']}**  \nrun `{event.get('run_id', '?')}`")
+        label = safe_model_markdown(event.get("label", ""), max_chars=500)
+        st.markdown(f"▶️ **{label}**  \nrun `{event.get('run_id', '?')}`")
         if event.get("params"):
             st.json(event["params"], expanded=False)
     elif kind == "run_end":
@@ -207,31 +271,28 @@ def render_event(event: dict, ends_by_id: dict) -> None:
             line += f" in {event['duration_ms'] / 1000:.1f}s"
         st.markdown(line)
         if event.get("error"):
-            st.error(event["error"])
+            st.error(safe_model_markdown(event["error"], max_chars=2_000))
     # agent_start / agent_end are folded into the group header, nothing to draw.
 
 
 # -------------------------------------------------------------------- sidebar
 st.sidebar.title("🔍 Under the Hood")
-base_url = st.sidebar.text_input("Backend URL", DEFAULT_BASE).rstrip("/")
+base_url = DEFAULT_BASE
+st.sidebar.caption(f"Backend: `{base_url}`")
 live = st.sidebar.toggle("Live updates", value=True)
 
 health, health_err = fetch_json(f"{base_url}/health")
 st.sidebar.subheader("Backend health")
-if health_err:
+if len(INTERNAL_API_TOKEN) < 32:
+    st.sidebar.error("MES_INTERNAL_API_TOKEN is missing or too short")
+elif health_err:
     st.sidebar.error(health_err)
 else:
     st.sidebar.markdown(":green[●] connected")
-    st.sidebar.caption(f"model: `{health['model_id']}`")
-    st.sidebar.caption(f"db: `{health['db_path']}`")
-    if not health["db_exists"]:
-        st.sidebar.error("mes.db not found at that path")
-    if not health["anthropic_api_key_set"]:
-        st.sidebar.error("ANTHROPIC_API_KEY is not set (check .env)")
-    if health["agent_manager_ready"]:
+    if health.get("agent_manager_ready"):
         st.sidebar.markdown(":green[●] agent manager ready")
     else:
-        st.sidebar.error(f"Agent manager failed to start: {health['agent_manager_error']}")
+        st.sidebar.warning("Agent manager is still starting or unavailable")
 
 st.sidebar.divider()
 st.sidebar.caption(
@@ -322,11 +383,20 @@ with st.form("trigger", clear_on_submit=False):
 if chat_running:
     if st.button("⏹ Stop this run", type="secondary"):
         try:
-            r = requests.post(f"{base_url}/cancel", timeout=10)
+            r = api_request(
+                "POST",
+                f"{base_url}/cancel",
+                headers=api_headers(),
+                timeout=10,
+            )
             st.warning(r.json().get("detail", "Cancelling")
                        + " — it stops at the next agent or query, within seconds.")
-        except Exception as e:
-            st.error(f"Could not cancel: {type(e).__name__}: {e}")
+        except Exception as exc:
+            logger.error(
+                "Trace viewer could not request cancellation: %s",
+                safe_log_text(exc),
+            )
+            st.error("The run could not be cancelled. Check the server logs.")
 
 if not defect_options:
     st.warning(
@@ -356,18 +426,29 @@ if submitted and not chat_running:
 for turn in qa_history[:-1]:
     icon = "💬" if turn["status"] == "completed" else "❌"
     with st.expander(f"{icon} {turn['question']}", expanded=False):
-        st.markdown(turn["answer"] or "*empty response*")
+        st.markdown(
+            safe_model_markdown(turn["answer"] or "*empty response*"),
+            unsafe_allow_html=False,
+        )
 
 if chat["status"] == "cancelled":
     st.info("Run cancelled. The trace below shows how far it got.")
 elif chat["status"] == "failed":
-    st.error(f"Chat request failed — {chat.get('detail')}")
+    st.error(
+        safe_model_markdown(
+            f"Chat request failed — {chat.get('detail')}",
+            max_chars=2_000,
+        )
+    )
 elif chat["status"] == "completed":
     label = "💬 Final report from the supervisor"
     if chat.get("duration_s"):
         label += f" · {chat['duration_s']:.0f}s"
     with st.expander(label, expanded=False):
-        st.markdown(chat.get("analysis") or "*empty response*")
+        st.markdown(
+            safe_model_markdown(chat.get("analysis") or "*empty response*"),
+            unsafe_allow_html=False,
+        )
 
     # The same report as a PDF. Fetched over HTTP rather than read off disk,
     # so the viewer stays a pure API client and still works if the backend
@@ -375,7 +456,12 @@ elif chat["status"] == "completed":
     pdf_name = chat.get("report_pdf")
     if pdf_name:
         try:
-            pdf = requests.get(f"{base_url}/report/{pdf_name}", timeout=30)
+            pdf = api_request(
+                "GET",
+                f"{base_url}/report/{pdf_name}",
+                headers=api_headers(),
+                timeout=30,
+            )
             if pdf.ok:
                 st.download_button(f"📄 Download {pdf_name}", data=pdf.content,
                                    file_name=pdf_name, mime="application/pdf",
@@ -430,19 +516,29 @@ def alerts_section() -> None:
         if duration is not None:
             title += f" · {duration:.0f}s"
         # Only the newest is open, and only while it is worth watching.
-        with st.expander(title, expanded=(alert is alerts[0] and alert["Status"] != "done")):
+        with st.expander(
+            safe_model_markdown(title, max_chars=500),
+            expanded=(alert is alerts[0] and alert["Status"] != "done"),
+        ):
             meta = st.columns(4)
             meta[0].metric("Status", alert["Status"], help=meaning)
             meta[1].metric("Work order", alert["OrderID"] or "—")
             meta[2].metric("Detections", alert["DetectionCount"])
             meta[3].metric("Took", f"{duration:.0f}s" if duration is not None else "—")
-            st.caption(f"Window {alert['WindowStart']} → {alert['WindowEnd']}")
+            st.caption(
+                safe_model_markdown(
+                    f"Window {alert['WindowStart']} → {alert['WindowEnd']}",
+                    max_chars=500,
+                )
+            )
 
             report = alert.get("Report")
             if alert["Status"] in ("pending", "analyzing"):
                 st.info("The agent is working on this now — watch it below.")
             elif report:
-                st.markdown(report)
+                st.markdown(
+                    safe_model_markdown(report), unsafe_allow_html=False
+                )
             else:
                 st.caption("No report was recorded for this alert.")
 
@@ -513,7 +609,8 @@ def trace_section() -> None:
         st.markdown(f"### {badge}")
     with cols[1]:
         if run.get("label"):
-            st.markdown(f"**{run['label']}**")
+            label = safe_model_markdown(run["label"], max_chars=500)
+            st.markdown(f"**{label}**")
             st.caption(f"run `{run.get('run_id', '?')}` · started {run.get('started_at', '?')}")
         if run_status == "running" and current.get("agent"):
             now_line = current["agent"]

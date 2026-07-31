@@ -2,6 +2,8 @@
 Quality dashboard functionality focused on daily production meetings
 """
 
+import logging
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,8 +12,11 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 from app_factory.shared.database import DatabaseManager
+from app_factory.shared.display_security import safe_log_text, safe_model_markdown
 from app_factory.shared.db_utils import days_ago, today
 from ..ai_insights import generate_ai_insight
+
+logger = logging.getLogger(__name__)
 
 # Initialize database manager
 db_manager = DatabaseManager()
@@ -777,9 +782,16 @@ def quality_dashboard():
                         include_historical=True
                     )
                     
-                    st.markdown(insight, unsafe_allow_html=True)
-                except Exception as e:
-                    st.error(f"Error generating AI insights: {str(e)}")
+                    # Model output must never opt into raw HTML rendering.
+                    st.markdown(
+                        safe_model_markdown(insight), unsafe_allow_html=False
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Daily quality insight generation failed: %s",
+                        safe_log_text(exc),
+                    )
+                    st.error("AI insights could not be generated. Check the logs.")
                     st.info("Try manually reviewing the quality data visualizations above.")
     else:
         st.info("No quality data available for yesterday")

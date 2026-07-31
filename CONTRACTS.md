@@ -14,9 +14,27 @@ All field and column names below are taken from the real code (`deployment/api.p
 
 Database: `mes.db` at the **root of industrial-data-store-simulation-chatbot** (the existing `DatabaseManager` resolves it relative to the working directory — bridge, agent, and dashboard must all be started from that repo's root). Enable WAL mode on connect (`PRAGMA journal_mode=WAL`).
 
+### Internal-service security
+
+- `Launch.py` binds locally served UIs to `127.0.0.1` and supplies one
+  high-entropy `MES_INTERNAL_API_TOKEN` to the inference API, bridge, agent API,
+  server-side Next.js routes, and trace viewer.
+- Every operational inference, bridge, and agent endpoint requires
+  `X-MES-Internal-Token`. Public health endpoints expose readiness only.
+- The token is never sent to browser JavaScript. Next.js first validates the
+  Better Auth session and then adds the token while proxying server-side.
+- Next.js also adds `X-MES-User-ID` from the validated session to chat, trace,
+  and cancel calls. It must never accept this ID from the browser. The agent API
+  uses it to prevent one signed-in user from tracing or cancelling another
+  user's run.
+- Tokens must contain at least 32 characters. Missing or short tokens fail
+  closed; do not add an insecure fallback.
+
 ## 2. Detection payload — simulator → bridge
 
 The simulator POSTs one JSON object to `http://localhost:8081/detection` per analyzed image. `detections` is passed through **unchanged** from the API's `/predict` response; the simulator adds the envelope fields.
+Both the simulator's `/predict` and `/detection` requests carry the internal
+service header described in §1.
 
 ```json
 {
@@ -34,6 +52,15 @@ The simulator POSTs one JSON object to `http://localhost:8081/detection` per ana
   ]
 }
 ```
+
+Validation limits: `/predict` accepts only decoded JPEG/PNG images, at most
+10 MiB and 16 megapixels; `/batch-predict` accepts at most 16 files and
+32 MiB total. The bridge accepts at most a 1 MiB JSON body and 100 detections
+per payload. Timestamps must be timezone-aware, `image_name` must be a plain
+filename, bounding boxes must be finite and ordered, and every `class_id` must
+match its six-class `class` value.
+The API and standalone Streamlit UI verify `best.pt` against the reviewed
+`MODEL_SHA256` before deserializing the executable PyTorch artifact.
 
 ## 3. Database tables (bridge creates with `CREATE TABLE IF NOT EXISTS` at startup)
 
@@ -94,6 +121,9 @@ The camera story: it watches the **Frame Welding** line (`Machines.Type = 'Frame
 - Save **every** incoming detection to `VisionDetections` immediately.
 - **Confidence gate:** only detections with `confidence >= 0.80` count toward batching.
 - **Batching:** first gated detection for a machine opens a 30-second window; when it closes, all gated detections collected in it form **one batch** and one call to `analyze_batch`. Constants: `CONF_GATE = 0.80`, `BATCH_WINDOW_SECONDS = 30`.
+- **Resource bounds:** at most 32 machine windows and 500 gated detections per
+  window are retained in memory. Extra gated detections remain persisted but
+  do not start additional timers or agent work.
 
 ## 6. The seam — `analyze_batch` (A implements, B calls)
 
@@ -126,6 +156,11 @@ def analyze_batch(batch: dict) -> int:
     ]
 }
 ```
+
+The agent API accepts only one cost-bearing run at a time and, by default, at
+most 10 starts per rolling hour (`MES_MAX_RUNS_PER_HOUR`, bounded to 1–100).
+Limit exhaustion returns `429` with `Retry-After`; concurrent starts return
+`409`; failures are recorded as `failed`.
 
 ## 7. Change protocol
 

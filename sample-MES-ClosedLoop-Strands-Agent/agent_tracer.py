@@ -36,10 +36,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from strands.handlers.callback_handler import (
-    CompositeCallbackHandler,
-    PrintingCallbackHandler,
-)
 from strands.hooks import (
     AfterInvocationEvent,
     AfterToolCallEvent,
@@ -48,6 +44,7 @@ from strands.hooks import (
     HookProvider,
     HookRegistry,
 )
+from display_security import safe_terminal_text
 
 # Event kinds emitted onto the stream. Kept as bare strings (not an Enum) so the
 # serialised form is trivially JSON/SSE friendly.
@@ -67,6 +64,8 @@ ERROR = "error"
 _MAX_TEXT = 6000
 _MAX_PREVIEW = 4000
 _MAX_EVENTS = 5000
+_MAX_COLLECTION_ITEMS = 50
+_MAX_JSON_DEPTH = 6
 
 
 # The (agent, tool_name, tool_use_id) executing on *this* logical thread of
@@ -88,6 +87,7 @@ def _now_iso() -> str:
 
 def _truncate(value: Any, limit: int) -> str:
     text = value if isinstance(value, str) else repr(value)
+    text = safe_terminal_text(text, max_chars=limit + 1)
     if len(text) > limit:
         return text[:limit] + f"\n… (truncated, {len(text)} chars total)"
     return text
@@ -108,11 +108,14 @@ def _extract_tool_result(result: Any) -> dict:
     # An exception was raised by the tool.
     if isinstance(result, BaseException):
         out["status"] = "error"
-        out["preview"] = _truncate(f"{type(result).__name__}: {result}", _MAX_PREVIEW)
+        out["preview"] = f"{type(result).__name__}: tool execution failed"
         return out
 
     if isinstance(result, dict):
         out["status"] = result.get("status")
+        if str(out["status"]).lower() == "error":
+            out["preview"] = "Tool execution failed"
+            return out
         blocks = result.get("content") or []
         parts: list[str] = []
         for block in blocks:
@@ -228,7 +231,13 @@ class AgentTracer:
             self._run.update(
                 {"status": status, "ended_at": _now_iso(), "duration_ms": duration_ms}
             )
-        self._emit(None, RUN_END, status=status, duration_ms=duration_ms, error=error)
+        self._emit(
+            None,
+            RUN_END,
+            status=status,
+            duration_ms=duration_ms,
+            error=_truncate(error, _MAX_PREVIEW) if error is not None else None,
+        )
 
     # ----------------------------------------------------------- text streaming
     def buffer_text(self, agent: str, delta: str) -> None:
@@ -326,7 +335,11 @@ class AgentTracer:
                 result.get("execution_time_ms") if isinstance(result, dict) else None
             ),
             ok=bool(result.get("success", True)) if isinstance(result, dict) else True,
-            error=result.get("error") if isinstance(result, dict) else None,
+            error=(
+                _truncate(result.get("error"), _MAX_PREVIEW)
+                if isinstance(result, dict) and result.get("error") is not None
+                else None
+            ),
         )
 
     def error(self, agent: Optional[str], message: str) -> None:
@@ -343,14 +356,35 @@ def _dedent_sql(sql: str) -> str:
     return "\n".join(ln[indent:] if len(ln) >= indent else ln for ln in lines).strip()
 
 
-def _jsonable(value: Any) -> Any:
-    """Best-effort conversion of tool inputs/params to something displayable."""
-    if isinstance(value, (str, int, float, bool)) or value is None:
+def _jsonable(value: Any, _depth: int = 0) -> Any:
+    """Best-effort, bounded conversion of tool inputs to displayable data."""
+    if _depth >= _MAX_JSON_DEPTH:
+        return "<nested value truncated>"
+    if isinstance(value, str):
+        return _truncate(value, _MAX_PREVIEW)
+    if isinstance(value, (int, float, bool)) or value is None:
         return value
     if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
+        converted = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _MAX_COLLECTION_ITEMS:
+                break
+            converted[_truncate(str(key), 200)] = _jsonable(item, _depth + 1)
+        if len(value) > _MAX_COLLECTION_ITEMS:
+            converted["<truncated>"] = (
+                f"{len(value) - _MAX_COLLECTION_ITEMS} more entries"
+            )
+        return converted
     if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
+        converted = [
+            _jsonable(item, _depth + 1)
+            for item in value[:_MAX_COLLECTION_ITEMS]
+        ]
+        if len(value) > _MAX_COLLECTION_ITEMS:
+            converted.append(
+                f"<{len(value) - _MAX_COLLECTION_ITEMS} more entries>"
+            )
+        return converted
     return _truncate(value, _MAX_PREVIEW)
 
 
@@ -410,13 +444,11 @@ class _TracingHooks(HookProvider):
 
 
 def attach_tracer(agent: Any, label: str, tracer: AgentTracer) -> None:
-    """Wire a tracer into a Strands ``Agent`` without changing its behaviour.
+    """Wire a tracer into a Strands ``Agent`` without raw terminal output.
 
-    Preserves the default stdout ``PrintingCallbackHandler`` (so existing console
-    logging is untouched) by composing it with our tracing callback, and adds the
-    lifecycle/tool hooks.
+    Strands' default callback streams model-controlled text directly to stdout.
+    The trace callback retains the live dashboard feed while keeping that
+    untrusted text out of operator terminals.
     """
-    agent.callback_handler = CompositeCallbackHandler(
-        PrintingCallbackHandler(), _TracingCallback(tracer, label)
-    )
+    agent.callback_handler = _TracingCallback(tracer, label)
     agent.hooks.add_hook(_TracingHooks(tracer, label))

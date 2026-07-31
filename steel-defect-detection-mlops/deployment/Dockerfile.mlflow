@@ -1,0 +1,30 @@
+FROM python:3.10.20-slim-bookworm@sha256:9643927a6fc74bd81b0f1bbb5cce3cb4a491f46b4c5dbee770f28e575f180015
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/home/app \
+    XDG_CACHE_HOME=/tmp/.cache \
+    XDG_CONFIG_HOME=/tmp/.config
+
+RUN python -m pip install --no-compile "mlflow==3.14.0"
+
+RUN groupadd --gid 10001 app \
+    && useradd \
+        --uid 10001 \
+        --gid app \
+        --create-home \
+        --shell /usr/sbin/nologin \
+        app \
+    && install -d -o app -g app /mlruns /models
+
+USER 10001:10001
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/', timeout=5).read()"]
+
+ENTRYPOINT ["mlflow", "server"]
+CMD ["--backend-store-uri", "file:///mlruns", "--default-artifact-root", "file:///models", "--host", "0.0.0.0", "--port", "5000", "--workers", "1", "--allowed-hosts", "localhost,127.0.0.1,mlflow", "--cors-allowed-origins", "http://localhost:5000,http://127.0.0.1:5000", "--x-frame-options", "DENY"]

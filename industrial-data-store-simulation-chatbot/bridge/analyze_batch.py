@@ -32,17 +32,13 @@ import os
 import threading
 from collections import Counter
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import psycopg2
 import requests
 
-from bridge.db_config import (
-    PG_DBNAME,
-    PG_HOST,
-    PG_PASSWORD,
-    PG_PORT,
-    PG_USER,
-)
+from bridge.db_config import connection_kwargs
+from app_factory.shared.display_security import safe_log_text
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +46,32 @@ logger = logging.getLogger(__name__)
 # the alert still completes its full lifecycle with a placeholder report.
 STUB_MODE = os.getenv("MES_ANALYZE_STUB", "0").strip().lower() in ("1", "true", "yes")
 
-# Where the agent lives. A setting, not a hardcoded address, so the backend
-# can move to another machine without a code change.
-AGENT_URL = os.getenv("MES_AGENT_URL", "http://127.0.0.1:8000").rstrip("/")
+def _loopback_agent_url() -> str:
+    value = os.getenv("MES_AGENT_URL", "http://127.0.0.1:8000").rstrip("/")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise RuntimeError("MES_AGENT_URL must be a plain loopback HTTP origin")
+    return value
+
+
+AGENT_URL = _loopback_agent_url()
 
 # The agent reasons for one to three minutes. An ordinary few-second HTTP
 # timeout would abandon investigations that were about to succeed.
-AGENT_TIMEOUT_SECONDS = int(os.getenv("MES_AGENT_TIMEOUT", "900"))
+try:
+    AGENT_TIMEOUT_SECONDS = max(
+        30, min(int(os.getenv("MES_AGENT_TIMEOUT", "900")), 1800)
+    )
+except ValueError:
+    AGENT_TIMEOUT_SECONDS = 900
 
 _STUB_REPORT = (
     "**[stub - no agent run]**\n\n"
@@ -68,17 +83,24 @@ _STUB_REPORT = (
 
 def _get_conn():
     """Fresh connection, same settings the rest of the bridge uses."""
-    return psycopg2.connect(
-        host=PG_HOST,
-        port=PG_PORT,
-        user=PG_USER,
-        password=PG_PASSWORD,
-        dbname=PG_DBNAME,
-    )
+    return psycopg2.connect(**connection_kwargs())
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _post_agent(payload: dict, headers: dict):
+    """Call loopback directly; never proxy or redirect the internal token."""
+    with requests.Session() as session:
+        session.trust_env = False
+        return session.post(
+            f"{AGENT_URL}/investigate",
+            json=payload,
+            headers=headers,
+            timeout=AGENT_TIMEOUT_SECONDS,
+            allow_redirects=False,
+        )
 
 
 def ensure_tables() -> None:
@@ -160,7 +182,12 @@ def _set_status(alert_id: int, status: str, report: str | None = None) -> None:
             conn.close()
     except Exception as exc:
         # Nothing useful left to do - the run is already over.
-        logger.error("Could not set alert %s to %s: %s", alert_id, status, exc)
+        logger.error(
+            "Could not set alert %s to %s: %s",
+            alert_id,
+            safe_log_text(status),
+            safe_log_text(exc),
+        )
 
 
 def _run_agent(alert_id: int, batch: dict) -> None:
@@ -187,6 +214,16 @@ def _run_agent(alert_id: int, batch: dict) -> None:
             return
 
         detections = batch.get("detections") or []
+        wire_detections = [
+            {
+                "detection_id": item["detection_id"],
+                "timestamp": item["timestamp"],
+                "class": item["class"],
+                "confidence": item["confidence"],
+                "image_name": item["image_name"],
+            }
+            for item in detections
+        ]
         payload = {
             "machine_id": batch.get("machine_id"),
             "order_id": batch.get("order_id"),
@@ -194,7 +231,7 @@ def _run_agent(alert_id: int, batch: dict) -> None:
             "detection_count": len(detections),
             "window_start": batch.get("window_start"),
             "window_end": batch.get("window_end"),
-            "detections": detections,
+            "detections": wire_detections,
         }
 
         logger.info("Alert %s: asking the agent to investigate %s×%s on machine %s",
@@ -203,8 +240,18 @@ def _run_agent(alert_id: int, batch: dict) -> None:
 
         # The blocking call. This thread waits here for the whole
         # investigation; the bridge keeps serving the camera meanwhile.
-        resp = requests.post(f"{AGENT_URL}/investigate", json=payload,
-                             timeout=AGENT_TIMEOUT_SECONDS)
+        internal_token = os.getenv("MES_INTERNAL_API_TOKEN", "")
+        if len(internal_token) < 32:
+            _set_status(
+                alert_id,
+                "failed",
+                "Investigation not run: internal service authentication is unavailable.",
+            )
+            return
+        resp = _post_agent(
+            payload,
+            {"X-MES-Internal-Token": internal_token},
+        )
 
         if not resp.ok:
             # Say WHICH failure it was - "failed" alone tells nobody anything.
@@ -212,11 +259,7 @@ def _run_agent(alert_id: int, batch: dict) -> None:
                 409: "the agent was busy with another run",
                 503: "the agent backend is not ready (check its API key and database)",
             }.get(resp.status_code, f"HTTP {resp.status_code}")
-            try:
-                detail = resp.json().get("detail", "")
-            except ValueError:
-                detail = resp.text[:200]
-            _set_status(alert_id, "failed", f"Investigation not run: {reason}. {detail}")
+            _set_status(alert_id, "failed", f"Investigation not run: {reason}.")
             return
 
         result = resp.json()
@@ -226,7 +269,7 @@ def _run_agent(alert_id: int, batch: dict) -> None:
                         f"Agent returned status {result.get('status')!r} with no report.")
             return
 
-        _set_status(alert_id, "done", report)
+        _set_status(alert_id, "done", report[:100_000])
         logger.info("Alert %s investigated in %.0fs (%s chars)",
                     alert_id, result.get("duration_s") or 0, len(report))
 
@@ -237,8 +280,12 @@ def _run_agent(alert_id: int, batch: dict) -> None:
         _set_status(alert_id, "failed",
                     f"The agent did not answer within {AGENT_TIMEOUT_SECONDS}s.")
     except Exception as exc:
-        logger.error("Agent run failed for alert %s: %s", alert_id, exc, exc_info=True)
-        _set_status(alert_id, "failed", f"Agent run failed: {exc}")
+        logger.error(
+            "Agent run failed for alert %s: %s",
+            alert_id,
+            safe_log_text(exc),
+        )
+        _set_status(alert_id, "failed", "Agent run failed; see server logs.")
 
 
 def analyze_batch(batch: dict) -> int:
@@ -300,5 +347,8 @@ def analyze_batch(batch: dict) -> int:
     except Exception as exc:
         # No alert row exists to mark 'failed', so report it and let the
         # bridge carry on serving the camera feed.
-        logger.error("analyze_batch could not create an alert: %s", exc, exc_info=True)
+        logger.error(
+            "analyze_batch could not create an alert: %s",
+            safe_log_text(exc),
+        )
         return -1

@@ -15,6 +15,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from app_factory.production_meeting.daily_analysis_scheduler import DailyAnalysisScheduler
+from app_factory.shared.display_security import safe_log_text
 
 async def main():
     """Run daily analysis"""
@@ -30,7 +31,7 @@ async def main():
         print("🚀 Your Streamlit app can now use fast cached insights!")
         
     except Exception as e:
-        print(f"\n❌ Daily analysis failed: {e}")
+        print(f"\n❌ Daily analysis failed: {safe_log_text(e)}")
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -1,27 +1,49 @@
-# Streamlit Dockerfile
-FROM python:3.10-slim
+FROM python:3.10.20-slim-bookworm@sha256:9643927a6fc74bd81b0f1bbb5cce3cb4a491f46b4c5dbee770f28e575f180015
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/home/app \
+    XDG_CACHE_HOME=/tmp/.cache \
+    XDG_CONFIG_HOME=/tmp/.config \
+    YOLO_CONFIG_DIR=/tmp/ultralytics \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    TORCH_HOME=/tmp/torch
 
 WORKDIR /app
 
-# Install dependencies
-RUN pip install --no-cache-dir \
-    streamlit \
-    ultralytics \
-    pillow \
-    pandas \
-    plotly \
-    numpy
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy application
-COPY streamlit_app.py /app/
-COPY runs/ /app/runs/
+COPY deployment/requirements-streamlit.txt /tmp/requirements-streamlit.txt
+RUN python -m pip install --no-compile --requirement /tmp/requirements-streamlit.txt \
+    && rm /tmp/requirements-streamlit.txt
 
-# Expose Streamlit port
+RUN groupadd --gid 10001 app \
+    && useradd \
+        --uid 10001 \
+        --gid app \
+        --create-home \
+        --shell /usr/sbin/nologin \
+        app
+
+COPY --chown=app:app streamlit_app.py /app/streamlit_app.py
+COPY --chown=app:app streamlit_image_security.py /app/streamlit_image_security.py
+COPY --chown=app:app deployment/model_integrity.py /app/deployment/model_integrity.py
+COPY --chown=app:app \
+    runs/detect/steel_defect_colab_50_epochs \
+    /app/runs/detect/steel_defect_colab_50_epochs
+
+USER 10001:10001
+
 EXPOSE 8501
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8501/_stcore/health || exit 1
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5).read()"]
 
-# Run Streamlit
-CMD ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--server.enableCORS=true", "--server.enableXsrfProtection=true", "--server.maxUploadSize=10", "--server.maxMessageSize=32", "--server.fileWatcherType=none", "--browser.gatherUsageStats=false"]

@@ -37,7 +37,8 @@ def build_conversational_agent(model, supervisor_agent, tracer, call_supervisor=
     chat_agent = Agent(
         model=model,
         tools=[ask_mes_supervisor],
-        system_prompt=SYSTEM_PROMPT
+        system_prompt=SYSTEM_PROMPT,
+        callback_handler=None,
     )
     attach_tracer(chat_agent, "Chat", tracer)
     return chat_agent

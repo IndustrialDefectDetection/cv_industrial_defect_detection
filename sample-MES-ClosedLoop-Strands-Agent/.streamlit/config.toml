@@ -1,0 +1,11 @@
+[server]
+# Both Streamlit surfaces expose internal MES data and can start cost-bearing
+# agent runs. They are local operator tools; remote access belongs behind a
+# separately authenticated reverse proxy, not Streamlit's bare listener.
+address = "127.0.0.1"
+headless = true
+enableCORS = true
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

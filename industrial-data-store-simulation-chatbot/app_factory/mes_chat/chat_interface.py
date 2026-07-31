@@ -16,17 +16,18 @@ from typing import Dict, Any, List, Optional
 
 import streamlit as st
 import pandas as pd
-from dotenv import load_dotenv
 
 # Import shared modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app_factory.shared.database import DatabaseManager
+from app_factory.shared.display_security import safe_log_text, safe_model_markdown
+from app_factory.shared.env_security import load_protected_env
 # Removed bedrock_utils dependency - using simplified model management
 from mes_agents.agent_manager import MESAgentManager
 from mes_agents.config import AgentConfig
 
 # Configuration
-load_dotenv()
+load_protected_env(Path(__file__).resolve().parents[2] / ".env")
 proj_dir = os.path.abspath('')
 db_path = os.path.join(proj_dir, 'mes.db')
 
@@ -92,7 +93,13 @@ def display_progress_updates(progress_updates: List[Dict[str, Any]]):
             else:
                 time_str = ''
             
-            st.write(f"{status_icon} **Step {update.get('step', i+1)}**: {update.get('message', 'Processing...')} {time_str}")
+            progress_text = (
+                f"{status_icon} **Step {update.get('step', i+1)}**: "
+                f"{update.get('message', 'Processing...')} {time_str}"
+            )
+            st.markdown(
+                safe_model_markdown(progress_text), unsafe_allow_html=False
+            )
 
 
 def display_agent_response(response: Dict[str, Any], message_index: int):
@@ -105,24 +112,30 @@ def display_agent_response(response: Dict[str, Any], message_index: int):
     """
     if not response.get('success', True):
         # Display error response
-        st.error(f"Analysis Error: {response.get('error', 'Unknown error')}")
+        logger.error(
+            "Agent analysis error: %s",
+            safe_log_text(response.get("error", "Unknown")),
+        )
+        st.error("Analysis failed. Check the server logs.")
         
         if response.get('suggested_actions'):
             st.markdown("**Suggested Actions:**")
             for action in response['suggested_actions']:
-                st.write(f"• {action}")
+                st.text(f"• {str(action)[:500]}")
         
         if response.get('recovery_options'):
             st.markdown("**Recovery Options:**")
             for option in response['recovery_options']:
-                st.write(f"• {option}")
+                st.text(f"• {str(option)[:500]}")
         
         return
     
     # Display successful analysis
     analysis_content = response.get('analysis', '')
     if analysis_content:
-        st.markdown(analysis_content)
+        st.markdown(
+            safe_model_markdown(analysis_content), unsafe_allow_html=False
+        )
     
     # Display progress updates if available
     progress_updates = response.get('progress_updates', [])
@@ -290,8 +303,12 @@ def run_mes_chat():
             # Initialize agent manager and store in session state
             st.session_state.agent_manager = MESAgentManager(agent_config)
             
-        except Exception as e:
-            st.error(f"Failed to initialize agent manager: {e}")
+        except Exception as exc:
+            logger.error(
+                "Agent manager initialization failed: %s",
+                safe_log_text(exc),
+            )
+            st.error("The agent manager could not be initialized. Check the logs.")
             st.stop()
     
     agent_manager = st.session_state.agent_manager
@@ -390,8 +407,12 @@ def run_mes_chat():
                 question_data = json.load(file)
                 question_list = list(question_data['general'].values())
                 category_questions = question_data['categories']
-        except Exception as e:
-            st.error(f"Error loading example questions: {e}")
+        except Exception as exc:
+            logger.error(
+                "Example questions could not be loaded: %s",
+                safe_log_text(exc),
+            )
+            st.error("Example questions could not be loaded.")
             question_list = []
             category_questions = {}
     
@@ -445,7 +466,10 @@ def run_mes_chat():
         for i, message in enumerate(st.session_state.messages):
             if message["role"] == "user":
                 with st.chat_message("user"):
-                    st.write(message["content"])
+                    st.markdown(
+                        safe_model_markdown(message["content"], max_chars=10_000),
+                        unsafe_allow_html=False,
+                    )
             else:
                 with st.chat_message("assistant"):
                     # Check if this is an agent response
@@ -453,7 +477,10 @@ def run_mes_chat():
                         display_agent_response(message["content"], i)
                     else:
                         # Simple text message
-                        st.markdown(message["content"])
+                        st.markdown(
+                            safe_model_markdown(message["content"]),
+                            unsafe_allow_html=False,
+                        )
         
         # Chat input
         user_input = st.chat_input("Ask your AI agent about manufacturing data...")
@@ -494,7 +521,10 @@ def run_mes_chat():
                 st.rerun()
                 
             except Exception as e:
-                logger.error(f"Error processing agent query: {e}")
+                logger.error(
+                    "Error processing agent query: %s",
+                    safe_log_text(e),
+                )
                 error_response = {
                     'success': False,
                     'error': str(e),

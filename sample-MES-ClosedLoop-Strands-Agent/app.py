@@ -27,10 +27,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import sys
 import os
-import json 
+import json
 import logging
 import time
-from pathlib import Path
 import base64
 import urllib.parse
 
@@ -39,6 +38,12 @@ import urllib.parse
 # sys.path.append(parent_dir)
 
 from strands_agent import MESAgentManager
+from report_paths import (
+    InvalidReportPath,
+    REPORTS_DIR,
+    resolve_existing_report,
+)
+from display_security import safe_log_text, safe_model_markdown
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -55,10 +60,6 @@ if 'selected_defect' not in st.session_state:
     st.session_state.selected_defect = None
 if 'analysis_running' not in st.session_state:
     st.session_state.analysis_running = False
-
-# Create reports directory
-REPORTS_DIR = Path("reports")
-REPORTS_DIR.mkdir(exist_ok=True)
 
 # JSON serialization helper
 def datetime_to_string(obj):
@@ -93,9 +94,12 @@ def get_agent_manager():
         manager = MESAgentManager()
 
         return manager
-    except Exception as e:
-        st.error(f"Failed to initialize agent manager: {e}")
-        logger.error(f"Agent manager initialization error: {e}")
+    except Exception as exc:
+        logger.error(
+            "Agent manager initialization failed: %s",
+            safe_log_text(exc),
+        )
+        st.error("The agent manager could not be initialized. Check the server logs.")
         return None
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
@@ -110,33 +114,51 @@ def load_defect_types(days_back: int = 365):
         logger.info(f"Loading defect types for last {days_back} days")
         result = agent_manager.get_defect_types(days_back)
         
-        logger.info(f"Defect types result: {result}")
+        logger.info("Defect types result: %s", safe_log_text(result))
         
         # Check if we have rows (the function returns rows directly, not wrapped in success)
         if result and result.get('rows'):
             defect_types = [row['DefectType'] for row in result['rows'] if row.get('DefectType')]
-            logger.info(f"Found {len(defect_types)} defect types: {defect_types}")
+            logger.info(
+                "Found %s defect types: %s",
+                len(defect_types),
+                safe_log_text(defect_types),
+            )
             return defect_types
         elif result and result.get('error'):
-            logger.error(f"Database error: {result['error']}")
-            st.error(f"Database error: {result['error']}")
+            logger.error(
+                "Defect-type query failed: %s",
+                safe_log_text(result["error"]),
+            )
+            st.error("Defect types could not be loaded. Check the server logs.")
             return []
         else:
             logger.warning("No defect types found in database")
             return []
             
-    except Exception as e:
-        logger.error(f"Error loading defect types: {e}")
-        st.error(f"Error loading defect types: {e}")
+    except Exception as exc:
+        logger.error(
+            "Defect types could not be loaded: %s",
+            safe_log_text(exc),
+        )
+        st.error("Defect types could not be loaded. Check the server logs.")
         return []
 
 def get_available_reports():
     """Get list of available PDF reports in the reports directory"""
     try:
-        pdf_files = list(REPORTS_DIR.glob("*.pdf"))
+        pdf_files = []
+        for candidate in REPORTS_DIR.glob("*.pdf"):
+            try:
+                pdf_files.append(resolve_existing_report(candidate.name))
+            except InvalidReportPath:
+                logger.warning(
+                    "Ignoring unsafe report entry: %s",
+                    safe_log_text(candidate),
+                )
         return sorted(pdf_files, key=lambda x: x.stat().st_mtime, reverse=True)
     except Exception as e:
-        logger.error(f"Error loading reports: {e}")
+        logger.error("Error loading reports: %s", safe_log_text(e))
         return []
 
 def get_pdf_from_url():
@@ -145,13 +167,13 @@ def get_pdf_from_url():
     pdf_file = query_params.get("pdf", None)
     
     if pdf_file:
-        # Decode URL-encoded filename
-        pdf_file = urllib.parse.unquote(pdf_file)
-        pdf_path = REPORTS_DIR / pdf_file
-        
-        if pdf_path.exists() and pdf_path.suffix.lower() == '.pdf':
-            return pdf_path
-    
+        try:
+            # Streamlit may already decode the parameter. Decoding once more is
+            # safe because the resolver only accepts a strict PDF basename.
+            return resolve_existing_report(urllib.parse.unquote(pdf_file))
+        except InvalidReportPath:
+            logger.warning("Rejected unsafe or missing PDF URL parameter")
+
     return None
 
 def generate_pdf_url(pdf_filename):
@@ -181,8 +203,12 @@ def display_pdf_viewer(pdf_path):
         st.markdown(pdf_display, unsafe_allow_html=True)
         
         return pdf_data
-    except Exception as e:
-        st.error(f"Error displaying PDF: {e}")
+    except Exception as exc:
+        logger.error(
+            "Failed to display a generated PDF: %s",
+            safe_log_text(exc),
+        )
+        st.error("The PDF could not be displayed. Check the server logs.")
         return None
 
 def run_defect_analysis(defect_type: str, days_back: int = 7, include_oee: bool = True, include_downtime: bool = True, include_changeover: bool = True, include_maintenance: bool = True):
@@ -230,15 +256,20 @@ def run_defect_analysis(defect_type: str, days_back: int = 7, include_oee: bool 
             # Store results in session state
             st.session_state.current_analysis = analysis_results
             st.session_state.analysis_started = True
-            print("analysis_results:",analysis_results)
             return analysis_results
         else:
-            st.error(f"Analysis failed: {analysis_results.get('error', 'Unknown error')}")
+            logger.error(
+                "Analysis failed: %s",
+                safe_log_text(analysis_results.get("error", "Unknown error"))
+                if isinstance(analysis_results, dict)
+                else "No result",
+            )
+            st.error("Analysis failed. Check the server logs.")
             return None
-        
-    except Exception as e:
-        st.error(f"Error during analysis: {e}")
-        logger.error(f"Analysis error: {e}")
+
+    except Exception as exc:
+        logger.error("Analysis failed: %s", safe_log_text(exc))
+        st.error("Analysis failed. Check the server logs.")
         return None
 
 def render_defect_selection():
@@ -268,7 +299,11 @@ def render_defect_selection():
                     for table, count in test_result.get('tables', {}).items():
                         st.write(f"- {table}: {count} records")
                 else:
-                    st.error(f"❌ Database connection failed: {test_result.get('error')}")
+                    logger.error(
+                        "Database connection test failed: %s",
+                        test_result.get("error"),
+                    )
+                    st.error("❌ Database connection failed. Check the server logs.")
             
             return None
         
@@ -342,13 +377,25 @@ def render_defect_preview(defect_type: str):
             st.info(f"**Risk Assessment:** {risk_level} | **Recommendation:** {'Immediate analysis recommended' if risk_score >= 3 else 'Standard analysis sufficient'}")
             
         else:
-            st.warning(f"No preview data available for defect type: {defect_type}")
+            st.warning(
+                safe_model_markdown(
+                    f"No preview data available for defect type: {defect_type}",
+                    max_chars=500,
+                )
+            )
             if result and result.get('error'):
-                st.error(f"Database error: {result['error']}")
-            
-    except Exception as e:
-        st.error(f"Error loading defect preview: {e}")
-        logger.error(f"Defect preview error: {e}")
+                logger.error(
+                    "Defect preview query failed: %s",
+                    safe_log_text(result["error"]),
+                )
+                st.error("The defect preview could not be loaded.")
+
+    except Exception as exc:
+        logger.error(
+            "Defect preview could not be loaded: %s",
+            safe_log_text(exc),
+        )
+        st.error("The defect preview could not be loaded.")
 
 def render_sidebar_configuration():
     """Render sidebar configuration options"""
@@ -545,7 +592,12 @@ def render_main_dashboard():
     # Main content area
     if selected_defect:
         # Show detailed defect preview in main area
-        st.subheader(f"📊 Defect Analysis: {selected_defect}")
+        st.subheader(
+            safe_model_markdown(
+                f"📊 Defect Analysis: {selected_defect}",
+                max_chars=500,
+            )
+        )
         with st.expander("Detailed Defect Information", expanded=True):
             render_defect_preview(selected_defect)
         
@@ -567,7 +619,12 @@ def render_main_dashboard():
             st.session_state.work_pending = False
             try:
                 st.divider()
-                st.subheader(f"🔄 Analyzing Defect Type: {selected_defect}")
+                st.subheader(
+                    safe_model_markdown(
+                        f"🔄 Analyzing Defect Type: {selected_defect}",
+                        max_chars=500,
+                    )
+                )
 
                 analysis_results = run_defect_analysis(
                     defect_type=selected_defect,
@@ -706,7 +763,7 @@ def render_executive_summary(analysis):
         
         scope_summary = analysis_scope.get('scope_summary', 'Basic Analysis')
         
-        st.markdown(f"""
+        st.markdown(safe_model_markdown(f"""
         **🎯 Analysis Target:**
         - Defect Type: {defect_type}
         - Analysis Period: {analysis.get('analysis_period', 7)} days
@@ -718,7 +775,7 @@ def render_executive_summary(analysis):
         - All specialized agents executed successfully within scope
         - Comprehensive analysis completed with actionable insights
         - Workflow orchestration ensured proper data flow and scope adherence
-        """)
+        """))
     
     with col2:
         enabled_areas = []
@@ -733,7 +790,7 @@ def render_executive_summary(analysis):
         
         areas_text = ", ".join(enabled_areas) if enabled_areas else "basic operational improvements"
         
-        st.markdown(f"""
+        st.markdown(safe_model_markdown(f"""
         **⚡ Immediate Actions Required:**
         1. Review supervisor agent findings and recommendations
         2. Implement coordinated action plans focusing on {areas_text}
@@ -745,11 +802,19 @@ def render_executive_summary(analysis):
         - Scope-specific performance monitoring KPIs defined
         - Coordinated implementation timeline created
         - Comprehensive resource allocation planned for enabled areas
-        """)
+        """))
     
     # Risk assessment
     st.markdown("**⚠️ Risk Assessment:**")
-    st.info(f"Comprehensive supervisor-coordinated analysis completed for {defect_type} within the specified scope ({scope_summary}). The integrated workflow has provided validated insights from all specialized agents for effective defect reduction.")
+    st.info(
+        safe_model_markdown(
+            f"Comprehensive supervisor-coordinated analysis completed for "
+            f"{defect_type} within the specified scope ({scope_summary}). "
+            "The integrated workflow has provided validated insights from all "
+            "specialized agents for effective defect reduction.",
+            max_chars=2_000,
+        )
+    )
 
 def main():
     """Main function to run the MES dashboard"""

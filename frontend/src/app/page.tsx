@@ -776,6 +776,16 @@ export default function Home() {
                     <Markdown
                       remarkPlugins={[remarkGfm]}
                       components={{
+                        img: ({ alt }) => (
+                          <span
+                            role="note"
+                            className="text-sm italic text-slate-500 dark:text-zinc-400"
+                          >
+                            {alt
+                              ? `[Image omitted: ${alt}]`
+                              : "[Image omitted]"}
+                          </span>
+                        ),
                         table: ({ children }) => (
                           <div className="assistant-table-wrap">
                             <table>{children}</table>

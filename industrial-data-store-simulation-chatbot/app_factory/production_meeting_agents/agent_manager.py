@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .config import ProductionMeetingConfig, default_config
 from .error_handling import ProductionMeetingErrorHandler, ProductionMeetingError
 from .production_meeting_agent import production_meeting_analysis_tool
+from app_factory.shared.display_security import safe_log_text
 
 # Thread pool for parallel agent execution
 _executor = ThreadPoolExecutor(max_workers=5)
@@ -50,10 +51,12 @@ class ProductionMeetingAgentManager:
         # Initialize immediately if agent is enabled
         if self.config.agent_enabled:
             try:
-                asyncio.create_task(self.initialize())
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                # If no event loop is running, initialize synchronously
+                # If no event loop is running, initialize lazily.
                 pass
+            else:
+                loop.create_task(self.initialize())
     
     async def initialize(self):
         """Initialize the agent manager and verify agent availability."""
@@ -72,7 +75,10 @@ class ProductionMeetingAgentManager:
             }
             logger.info("Production meeting agents initialized successfully")
         except Exception as e:
-            logger.error(f"Failed to initialize production meeting agents: {e}")
+            logger.error(
+                "Failed to initialize production meeting agents: %s",
+                safe_log_text(e),
+            )
             raise ProductionMeetingError(f"Agent initialization failed: {e}")
     
     def _verify_agent_tools(self):
@@ -84,7 +90,10 @@ class ProductionMeetingAgentManager:
             
             logger.info("Agent tools verification completed successfully")
         except Exception as e:
-            logger.error(f"Agent tools verification failed: {e}")
+            logger.error(
+                "Agent tools verification failed: %s",
+                safe_log_text(e),
+            )
             raise ProductionMeetingError(f"Agent tools not available: {e}")
     
     async def process_query(self, query: str, context: Optional[Dict] = None) -> Dict[str, Any]:
@@ -151,7 +160,7 @@ class ProductionMeetingAgentManager:
             return response
 
         except Exception as e:
-            logger.error(f"Error processing query: {e}")
+            logger.error("Error processing query: %s", safe_log_text(e))
             return self.error_handler.handle_error(e, {'query': query, 'context': context})
     
     def _update_session_context(self, query: str, context: Optional[Dict] = None):
@@ -217,7 +226,11 @@ class ProductionMeetingAgentManager:
             'last_updated': datetime.now().isoformat()
         }
         
-        logger.info(f"Meeting context set: {meeting_type} meeting with focus on {focus_areas}")
+        logger.info(
+            "Meeting context set: %s meeting with focus on %s",
+            safe_log_text(meeting_type),
+            safe_log_text(focus_areas),
+        )
     
     def get_meeting_context(self) -> Dict[str, Any]:
         """Get current meeting context."""
@@ -315,11 +328,17 @@ Focus on information most relevant for a daily production meeting and provide ac
             # Use the main orchestrator tool for comprehensive briefing
             briefing_result = production_meeting_analysis_tool(briefing_query)
             
-            logger.info(f"Daily briefing generated successfully for {briefing_date}")
+            logger.info(
+                "Daily briefing generated successfully for %s",
+                safe_log_text(briefing_date),
+            )
             return briefing_result
             
         except Exception as e:
-            logger.error(f"Error generating daily briefing: {e}")
+            logger.error(
+                "Error generating daily briefing: %s",
+                safe_log_text(e),
+            )
             error_response = self.error_handler.handle_error(e, {'operation': 'daily_briefing', 'date': date})
             return error_response.get('user_message', 'Unable to generate daily briefing')
     
@@ -344,11 +363,17 @@ Focus on information most relevant for a daily production meeting and provide ac
             # Use the main orchestrator tool for contextual analysis
             insights_result = production_meeting_analysis_tool(contextual_query)
             
-            logger.info(f"Contextual insights generated successfully for {tab_name} tab")
+            logger.info(
+                "Contextual insights generated successfully for %s tab",
+                safe_log_text(tab_name),
+            )
             return insights_result
             
         except Exception as e:
-            logger.error(f"Error generating contextual insights: {e}")
+            logger.error(
+                "Error generating contextual insights: %s",
+                safe_log_text(e),
+            )
             error_response = self.error_handler.handle_error(e, {
                 'operation': 'contextual_insights', 
                 'tab_name': tab_name
@@ -543,7 +568,10 @@ Focus on actionable insights that production managers should be aware of proacti
             return insights_list
             
         except Exception as e:
-            logger.error(f"Error generating proactive insights: {e}")
+            logger.error(
+                "Error generating proactive insights: %s",
+                safe_log_text(e),
+            )
             return [
                 "Unable to generate proactive insights at this time",
                 "Consider checking production metrics manually",
@@ -618,7 +646,10 @@ Provide actionable, meeting-ready insights that enable efficient decision-making
             }
             
         except Exception as e:
-            logger.error(f"Error generating meeting summary insights: {e}")
+            logger.error(
+                "Error generating meeting summary insights: %s",
+                safe_log_text(e),
+            )
             return {
                 'meeting_type': meeting_data.get('type', 'daily'),
                 'focus_areas': meeting_data.get('focus_areas', []),
@@ -641,10 +672,12 @@ Provide actionable, meeting-ready insights that enable efficient decision-making
         
         if self.config.agent_enabled:
             try:
-                asyncio.create_task(self.initialize())
+                loop = asyncio.get_running_loop()
             except RuntimeError:
                 # If no event loop is running, mark for lazy initialization
                 pass
+            else:
+                loop.create_task(self.initialize())
         
         logger.info("Agent manager reloaded")
     
@@ -725,4 +758,4 @@ Provide actionable, meeting-ready insights that enable efficient decision-making
             self._proactive_insights_cache = {}
             logger.info("Production meeting agent manager shutdown complete")
         except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
+            logger.error("Error during shutdown: %s", safe_log_text(e))

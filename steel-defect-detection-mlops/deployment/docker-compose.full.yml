@@ -1,139 +1,223 @@
-version: "3.8"
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
-  # ========================================
-  # CORE API SERVICE
-  # ========================================
   defect-api:
     build:
       context: ..
       dockerfile: deployment/Dockerfile
-    container_name: steel-defect-api
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
-      - MODEL_PATH=/app/models/best.pt
-      - PYTHONUNBUFFERED=1
-      - PROMETHEUS_ENABLED=true
+      MODEL_PATH: /app/models/best.pt
+      MES_INTERNAL_API_TOKEN_FILE: /run/secrets/mes_internal_api_token
+      MES_MAX_IMAGE_BYTES: "${MES_MAX_IMAGE_BYTES:-10485760}"
+      MES_MAX_IMAGE_PIXELS: "${MES_MAX_IMAGE_PIXELS:-16000000}"
+      MES_MAX_BATCH_FILES: "${MES_MAX_BATCH_FILES:-16}"
+      MES_MAX_BATCH_BYTES: "${MES_MAX_BATCH_BYTES:-33554432}"
+      MES_INFERENCE_CONCURRENCY: "${MES_INFERENCE_CONCURRENCY:-1}"
+    secrets:
+      - source: mes_internal_api_token
+        target: mes_internal_api_token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    user: "10001:10001"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    logging: *default-logging
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()"
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
     networks:
       - steel-network
-    volumes:
-      - ../uploads:/app/uploads
 
-  # ========================================
-  # MLFLOW TRACKING SERVER
-  # ========================================
   mlflow:
-    image: python:3.10-slim
-    container_name: mlflow-server
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.mlflow
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
-      - ../mlruns:/mlruns
-      - ../models:/models
-    command: >
-      sh -c "pip install mlflow boto3 && 
-             mlflow server 
-             --backend-store-uri file:///mlruns 
-             --default-artifact-root file:///models
-             --host 0.0.0.0 
-             --port 5000"
+      - mlruns-data:/mlruns
+      - models-data:/models
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    user: "10001:10001"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    logging: *default-logging
     restart: unless-stopped
     networks:
       - steel-network
 
-  # ========================================
-  # PROMETHEUS (Metrics Collection)
-  # ========================================
   prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
+    image: prom/prometheus:v3.13.1-distroless@sha256:214f8427c8fba80c327bb94a75feb802ae12f2d6ca30812aa6e7d22f09bbea80
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
-      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
+    secrets:
+      - source: mes_internal_api_token
+        target: mes_internal_api_token
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
-      - "--web.console.libraries=/etc/prometheus/console_libraries"
-      - "--web.console.templates=/etc/prometheus/consoles"
-      - "--web.enable-lifecycle"
+      - "--storage.tsdb.retention.time=7d"
+      - "--storage.tsdb.retention.size=1GB"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    user: "65532:65532"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    logging: *default-logging
     restart: unless-stopped
     networks:
       - steel-network
+    depends_on:
+      defect-api:
+        condition: service_healthy
 
-  # ========================================
-  # GRAFANA (Visualization Dashboard)
-  # ========================================
   grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
+    image: grafana/grafana:13.1.1-slim@sha256:883bb3ccfb38250cdf170e7f12ce5b0013c70e8575b7ab1aea67dd45481016f5
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_SECURITY_SECRET_KEY__FILE: /run/secrets/grafana_secret_key
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SECURITY_COOKIE_SAMESITE: strict
+      GF_SECURITY_CONTENT_SECURITY_POLICY: "true"
+      GF_LOG_MODE: console
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SERVER_DOMAIN: localhost
+      GF_SERVER_ROOT_URL: http://localhost:3000
+    secrets:
+      - source: grafana_admin_password
+        target: grafana_admin_password
+        uid: "472"
+        gid: "0"
+        mode: 0400
+      - source: grafana_secret_key
+        target: grafana_secret_key
+        uid: "472"
+        gid: "0"
+        mode: 0400
     volumes:
       - grafana-data:/var/lib/grafana
-      - ../monitoring/grafana-dashboard.yml:/etc/grafana/provisioning/dashboards/dashboard.yml
+      - ../monitoring/grafana-dashboard.yml:/etc/grafana/provisioning/dashboards/dashboard.yml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=472,gid=0
+      - /var/log/grafana:rw,noexec,nosuid,nodev,size=32m,uid=472,gid=0
+    user: "472:0"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    logging: *default-logging
     restart: unless-stopped
     networks:
       - steel-network
     depends_on:
       - prometheus
 
-  # ========================================
-  # NODE EXPORTER (System Metrics)
-  # ========================================
   node-exporter:
-    image: prom/node-exporter:latest
-    container_name: node-exporter
-    ports:
-      - "9100:9100"
+    image: prom/node-exporter:v1.11.1@sha256:e9cff4fc67b1818f8c97adb115b9f12c9a54b533de86765d4a0effc01b357205
+    expose:
+      - "9100"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    user: "65534:65534"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    logging: *default-logging
     restart: unless-stopped
     networks:
       - steel-network
 
-  # ========================================
-  # STREAMLIT WEB UI
-  # ========================================
   streamlit-ui:
     build:
       context: ..
       dockerfile: deployment/Dockerfile.streamlit
-    container_name: streamlit-ui
     ports:
-      - "8501:8501"
-    volumes:
-      - ../streamlit_app.py:/app/streamlit_app.py
-      - ../runs:/app/runs
-    environment:
-      - PYTHONUNBUFFERED=1
+      - "127.0.0.1:8501:8501"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    user: "10001:10001"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    logging: *default-logging
     restart: unless-stopped
     networks:
       - steel-network
     depends_on:
-      - defect-api
+      defect-api:
+        condition: service_healthy
 
-# ========================================
-# NETWORKS
-# ========================================
 networks:
   steel-network:
     driver: bridge
+    internal: true
 
-# ========================================
-# VOLUMES
-# ========================================
+secrets:
+  mes_internal_api_token:
+    environment: MES_INTERNAL_API_TOKEN
+  grafana_admin_password:
+    environment: GRAFANA_ADMIN_PASSWORD
+  grafana_secret_key:
+    environment: GRAFANA_SECRET_KEY
+
 volumes:
+  mlruns-data:
+  models-data:
   prometheus-data:
   grafana-data:

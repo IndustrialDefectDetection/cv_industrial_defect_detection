@@ -19,6 +19,7 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 from .config import AgentConfig, default_config
 from .mes_analysis_agent import MESAnalysisAgent, reset_persistent_agent
+from app_factory.shared.display_security import safe_log_text
 
 
 class MESAgentManager:
@@ -46,7 +47,10 @@ class MESAgentManager:
             try:
                 self.agent = MESAnalysisAgent(self.config)
             except Exception as e:
-                print(f"Warning: Failed to initialize MES Analysis Agent: {e}")
+                print(
+                    "Warning: Failed to initialize MES Analysis Agent: "
+                    f"{safe_log_text(e)}"
+                )
                 self.agent = None
         
     async def process_query(self, query: str, context: Dict = None) -> Dict[str, Any]:

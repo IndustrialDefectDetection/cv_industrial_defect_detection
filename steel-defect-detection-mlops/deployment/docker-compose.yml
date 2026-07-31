@@ -1,41 +1,75 @@
-version: "3.8"
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
-  # Steel Defect Detection API
   defect-api:
     build:
       context: ..
       dockerfile: deployment/Dockerfile
-    container_name: steel-defect-api
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
-      - MODEL_PATH=/app/models/best.pt
-      - PYTHONUNBUFFERED=1
+      MODEL_PATH: /app/models/best.pt
+      MES_INTERNAL_API_TOKEN_FILE: /run/secrets/mes_internal_api_token
+      MES_MAX_IMAGE_BYTES: "${MES_MAX_IMAGE_BYTES:-10485760}"
+      MES_MAX_IMAGE_PIXELS: "${MES_MAX_IMAGE_PIXELS:-16000000}"
+      MES_MAX_BATCH_FILES: "${MES_MAX_BATCH_FILES:-16}"
+      MES_MAX_BATCH_BYTES: "${MES_MAX_BATCH_BYTES:-33554432}"
+      MES_INFERENCE_CONCURRENCY: "${MES_INFERENCE_CONCURRENCY:-1}"
+    secrets:
+      - source: mes_internal_api_token
+        target: mes_internal_api_token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    user: "10001:10001"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    logging: *default-logging
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()"
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
     networks:
       - steel-network
 
-  # MLflow Tracking Server
   mlflow:
-    image: python:3.10-slim
-    container_name: mlflow-server
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.mlflow
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
-      - ../mlruns:/mlruns
-    command: >
-      sh -c "pip install mlflow && 
-             mlflow server 
-             --backend-store-uri file:///mlruns 
-             --host 0.0.0.0 
-             --port 5000"
+      - mlruns-data:/mlruns
+      - models-data:/models
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    user: "10001:10001"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    logging: *default-logging
     restart: unless-stopped
     networks:
       - steel-network
@@ -43,3 +77,12 @@ services:
 networks:
   steel-network:
     driver: bridge
+    internal: true
+
+secrets:
+  mes_internal_api_token:
+    environment: MES_INTERNAL_API_TOKEN
+
+volumes:
+  mlruns-data:
+  models-data:
