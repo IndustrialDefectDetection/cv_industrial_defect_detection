@@ -125,33 +125,70 @@ python docs/evaluate_agent.py --rescore docs/evaluation-run1.json
 
 ## Running it
 
+**You do not need an Anthropic API key to see this work.** The trained weights
+and a full snapshot of the MES database are both committed, and
+`MES_ANALYZE_STUB=1` runs the entire pipeline — camera, confidence gate,
+batching, alert lifecycle — with only the model call stubbed out. That path is
+free and is the one to start with.
+
+### Setup, once
+
 ```bash
-python Launch.py     # starts all five services; refuses to start if a port is taken
+# 1. The database. The dump is in the repo; restore it into a fresh database.
+createdb -U postgres mescopy_v1
+psql -U postgres -d mescopy_v1 -f sample-MES-ClosedLoop-Strands-Agent/mescopy_backup.sql
+
+# 2. Configuration.
+cp .env.example .env         # then set MES_PG_PASSWORD; chmod 600 .env on Linux/macOS
+
+# 3. The two virtualenvs the pipeline needs.
+python -m venv steel-defect-detection-mlops/.venv
+steel-defect-detection-mlops/.venv/Scripts/pip install ultralytics fastapi uvicorn python-multipart prometheus-client
+cd sample-MES-ClosedLoop-Strands-Agent && python startup.py    # bootstraps its own venv
 ```
 
-Then fire a camera burst from a second terminal:
+`ANTHROPIC_API_KEY` is only needed for step 3 of the next section. The frontend
+needs `npm` and its own auth values; skip it unless you want the chat UI —
+nothing in the pipeline below depends on it.
+
+### See the pipeline run — free
+
+Three terminals:
 
 ```bash
+# 1. the camera
+cd steel-defect-detection-mlops
+.venv/Scripts/python.exe -m uvicorn deployment.api:app --port 8080
+
+# 2. the bridge, with the agent stubbed out so this costs nothing
+cd industrial-data-store-simulation-chatbot
+MES_ANALYZE_STUB=1 ../sample-MES-ClosedLoop-Strands-Agent/.venv/Scripts/python.exe \
+    -m uvicorn bridge.bridge:app --port 8081
+
+# 3. the burst
 cd industrial-data-store-simulation-chatbot
 ../sample-MES-ClosedLoop-Strands-Agent/.venv/Scripts/python.exe -m bridge.simulator \
     --image-dir ../steel-defect-detection-mlops/data/demo_burst --interval 0.5
 ```
 
-Within about a minute an alert appears on the dashboard at `localhost:8502` and
-moves from `analyzing` to `done` with a full report.
+24 detections are stored, 6 clear the 0.80 gate, and ~30 seconds later a row in
+`AgentAlerts` reaches `done` — machine Fra-10, work order 4901, defect type
+`patches`. That is every seam in the system, exercised, for nothing.
 
-**To watch the whole pipeline without spending anything**, set
-`MES_ANALYZE_STUB=1` first. Every stage runs — gate, batching, alert lifecycle —
-with the model call stubbed out.
+### The real thing — costs money
 
-Prerequisites: PostgreSQL with `mescopy_v1`, the three per-project virtualenvs,
-and a `.env` at the repo root — copy `.env.example` and fill in
-`ANTHROPIC_API_KEY`, `MES_PG_PASSWORD` and the frontend's auth values. On Linux
-or macOS also `chmod 600 .env`. `Launch.py` reads that file and passes each
-service only the names it is allowed to see; it is also the only way the Next.js
-app can be configured on Windows, where its startup script refuses to read an
-`.env` inside `frontend/` because it cannot verify that file's permissions
-there.
+```bash
+python Launch.py     # all five services; refuses to start if a port is taken
+```
+
+Then the same simulator command. The agent actually reasons this time; the alert
+appears on the dashboard at `localhost:8502` and moves `analyzing → done` with a
+full report in about 73 seconds. Needs `ANTHROPIC_API_KEY` in `.env`.
+
+`Launch.py` reads that one root `.env` and passes each service only the names it
+is allowed to see. It is also the only way the Next.js app can be configured on
+Windows, where its startup script refuses to read an `.env` inside `frontend/`
+because it cannot verify that file's permissions there.
 
 ## What is in this repository
 
