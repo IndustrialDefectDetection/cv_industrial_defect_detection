@@ -1,0 +1,10 @@
+[server]
+# These dashboards expose internal MES data and can start costly agent work.
+# Direct `streamlit run` commands are local operator tools.
+address = "127.0.0.1"
+headless = true
+enableCORS = true
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
