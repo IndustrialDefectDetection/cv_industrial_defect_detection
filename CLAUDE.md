@@ -27,7 +27,8 @@ mlflow ui --port 5000
 ```
 
 - The five packages above are all `deployment/api.py` imports — enough to serve `/predict`. `requirements.txt` additionally pulls jupyter, mlflow, tensorboard, black, mypy and pre-commit; install it only when you need training or experiment tracking.
-- **Model weights are not in git**, but `best.pt` **is present on this machine** (6.3 MB). `deployment/api.py` expects `runs/detect/steel_defect_colab_50_epochs/weights/best.pt` (override with `MODEL_PATH`); training happens on Colab via `notebooks/steel_defect_colab_50_epochs.ipynb`-style notebooks. Without the file, `/predict` 503s — so a fresh clone still needs it copied across.
+- **Model weights *are* in git** — verified by cloning: `runs/detect/steel_defect_colab_50_epochs/weights/best.pt` (6.25 MB) and a second copy at `models/best.pt`. A fresh clone can serve `/predict` with no extra steps. (This entry previously said the opposite; it was wrong.) Override the location with `MODEL_PATH` — but note a *blank* `MODEL_PATH` is treated as unset, deliberately, because an empty assignment in `.env` would otherwise resolve the weights to `""`. Training happens on Colab via `notebooks/steel_defect_colab_50_epochs.ipynb`-style notebooks.
+- **`sample-MES-.../mescopy_backup.sql` is the database**, restorable into an empty `mescopy_v1` with `psql -f`. It is regenerated with `--no-owner --no-privileges`; do not re-dump it without those flags or it will carry the dumping machine's role name and fail to replay anywhere else.
 - Test images: `data/dataset/images/test/`.
 
 ### industrial-data-store-simulation-chatbot — the MES side (bridge, agent, and dashboard land here)
