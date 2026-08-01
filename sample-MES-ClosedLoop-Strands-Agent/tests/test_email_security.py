@@ -83,12 +83,20 @@ def test_live_email_escapes_model_html_and_uses_safe_report_link(
     assert "pdf=root-cause_2026.pdf" in text_body
 
 
+# Explicit ids because pytest puts the generated id in PYTEST_CURRENT_TEST, and
+# a 50,001-character body inlined into that name exceeds the 32,767-character
+# Windows environment-variable limit - the test errors before it runs.
 @pytest.mark.parametrize(
     ("subject", "body", "filename"),
     [
-        ("Header\r\nBcc: attacker@example.com", "Body", None),
-        ("Subject", "x" * 50_001, None),
-        ("Subject", "Body", "../outside.pdf"),
+        pytest.param(
+            "Header\r\nBcc: attacker@example.com",
+            "Body",
+            None,
+            id="header-injection",
+        ),
+        pytest.param("Subject", "x" * 50_001, None, id="oversized-body"),
+        pytest.param("Subject", "Body", "../outside.pdf", id="path-traversal"),
     ],
 )
 def test_invalid_live_email_input_never_reaches_ses(

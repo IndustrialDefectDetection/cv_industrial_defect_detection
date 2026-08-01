@@ -70,7 +70,7 @@ npm run dev / build / lint
 
 **Read `frontend/AGENTS.md` before writing any frontend code.** Its key warning: this Next.js version has breaking changes relative to training data — consult `node_modules/next/dist/docs/` for current APIs; prefer small incremental edits.
 
-## Task plan and current status (as of 2026-07-19 — verify before trusting; update markers as tasks move)
+## Task plan and current status (as of 2026-08-01 — verify before trusting; update markers as tasks move)
 
 Two-person build: **A** = agentic side (agent runner, tools, prompts, dashboard tab, evaluation, README) · **B** = DB + plumbing (model training, tables, lookup helpers, simulator, bridge, startup script). Interfaces are pinned in CONTRACTS.md.
 
@@ -88,11 +88,11 @@ Execution order, with status (✅ done · 🟡 partial · ⬜ open):
 10. ✅ Real `analyze_batch()` agent runner (A) — posts to `/investigate`; alert goes `pending → analyzing → done`.
 11. ✅ A's agent tool `get_recent_detections(machine_id, hours)` (A) — registered on Monitor and Analyzer.
 12. 🟡 Prompt iteration loop (A) — **checkpoint met**: a burst produced a 4,733-char root-cause report naming the machine, work order, product, operator and shift correctly. Still worth iterating: the report ranked "vision system anomaly" HIGH certainty on the strength of a 1,200 ms inference time that was really just model warm-up on the first request.
-13. ⬜ Guardrails: one run at a time, hourly cap, failures → `failed` (A).
-14. ⬜ Live dashboard tab (A) — **open decision:** plan says Streamlit tab, but a Next.js frontend was started; pick deliberately.
-15. ⬜ Evaluation vs. the generator's injected incidents → `docs/evaluation.md` (A).
-16. ⬜ One-command startup script (B).
-17. ⬜ README + demo GIF + latency numbers (A).
+13. ✅ Guardrails (A) — one run at a time, an hourly budget on every paid endpoint, and failures marked `failed` with a reason. See the spend note under cross-cutting gotchas.
+14. ✅ Live alerts view (A) — decided in favour of the trace viewer (`trace_viewer.py`, port 8502), fed by `GET /alerts` so it stays a pure HTTP client. The Next.js frontend is Rithvik's chat UI, not the alerts surface.
+15. 🟡 Evaluation vs. the generator's injected incidents → `docs/evaluation.md` (A) — 1 of 3 runs done. The run invalidated the cause metric: `Defects.RootCause` already contains the literal string `Supplier Quality` in 939 rows, so an agent parroting the modal value scores correct without reasoning. Redesign that metric before paying for the remaining two runs.
+16. ✅ One-command startup (B) — `python Launch.py` starts inference (8080), bridge (8081), agent API (8000), Next.js (3000) and the trace viewer (8502), refuses to start if a port is taken, and reads the root `.env`.
+17. 🟡 README + demo GIF + latency numbers (A) — README rewritten with measured numbers; the demo GIF is still missing.
 
 **Explicitly cut — don't let these creep back in:** Kafka/queues, WebSockets, Grafana polish, steelMLOps CI fixes.
 
@@ -102,5 +102,7 @@ Execution order, with status (✅ done · 🟡 partial · ⬜ open):
 
 - Three Python toolchains coexist: uv (chatbot), plain venv via `startup.py` (sample-MES), pip requirements (mlops). Don't mix them.
 - Two Claude access paths coexist: Bedrock/boto3 (chatbot repo, original code) and direct Anthropic API via `.env` (sample-MES, the direction the project is moving).
-- Agent runs cost real money and take ~40–260s. The design guards against spam by contract, and all of it is implemented: confidence gate ≥ 0.80 and 30-second batching in the bridge; one run at a time (`_run_guard`) and an hourly cap (`MES_MAX_RUNS_PER_HOUR`, default 20 → HTTP 429) on `/investigate`; one supervisor delegation per chat question (`MES_CHAT_SUPERVISOR_CALLS`); failures mark alerts `failed` with a reason rather than crashing (CONTRACTS.md §5–6).
+- Agent runs cost real money and take ~40–260s. The design guards against spam by contract, and all of it is implemented: confidence gate ≥ 0.80 and 30-second batching in the bridge; one run at a time (`_run_guard`) and an hourly budget on *every* cost-bearing endpoint — `/investigate`, `/analysis` and `/chat/` all go through `_acquire_run_slot` → `_reserve_run_budget` (`MES_MAX_RUNS_PER_HOUR`, default 10, clamped 1–100 → HTTP 429 with `Retry-After`); one supervisor delegation per chat question (`MES_CHAT_SUPERVISOR_CALLS`); failures mark alerts `failed` with a reason rather than crashing (CONTRACTS.md §5–6).
 - Everything reads and writes PostgreSQL `mescopy_v1`. If a service reports missing tables or no defects, check `MES_DB_BACKEND` before anything else — a service left on SQLite looks healthy and simply finds nothing.
+- **Secure file output has two implementations, chosen by platform** — `sample-MES-.../report_paths.py` (PDF reports) and `industrial-data-store-simulation-chatbot/app_factory/shared/output_security.py` (cached analyses, scheduler logs). POSIX writes relative to an open directory descriptor with `O_NOFOLLOW` and `fchmod`; Windows validates by path and inherits the NTFS ACL, because it has none of those primitives. Both refuse symlinks, create exclusively, and publish atomically without overwriting. A platform that is neither fails closed. Tests assert exact 0600/0700 modes on POSIX only — don't "fix" that by asserting them everywhere.
+- **Secrets reach the services through the root `.env`** (gitignored; copy `.env.example`). `Launch.py` reads it and hands each service only its allowlisted names. The frontend depends on this specifically: `frontend/scripts/run-next-secure.mjs` refuses to start on Windows if any `.env` file exists inside `frontend/`, so its `BETTER_AUTH_SECRET`/`DATABASE_URL` must arrive through the process environment. Real environment variables override the file.

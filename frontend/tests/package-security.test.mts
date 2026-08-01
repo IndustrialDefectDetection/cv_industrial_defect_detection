@@ -68,7 +68,15 @@ test("Next.js children cannot inherit ambient proxy or CA overrides", () => {
 });
 
 
-test("Next.js rejects exposed or symlinked secret files", async () => {
+// The POSIX branch is asserted by passing "darwin" explicitly, but the setup
+// itself needs real permission bits: on Windows, writeFile({mode: 0o600})
+// still reports a world-readable mode, so the first assertion fails before it
+// can test anything. The win32 branch is covered by the test below instead.
+test("Next.js rejects exposed or symlinked secret files", {
+  skip: process.platform === "win32"
+    ? "POSIX file modes cannot be created on Windows"
+    : false,
+}, async () => {
   const directory = await mkdtemp(join(tmpdir(), "mes-next-env-"));
   const envFile = join(directory, ".env.local");
   try {
@@ -87,6 +95,27 @@ test("Next.js rejects exposed or symlinked secret files", async () => {
       () => validateNextEnvironmentFiles(directory, "dev", "darwin"),
       /non-regular/,
     );
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+
+test("Windows refuses env files it cannot permission-check", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mes-next-env-win-"));
+  const envFile = join(directory, ".env.local");
+  try {
+    await writeFile(envFile, "BETTER_AUTH_SECRET=not-real\n");
+
+    assert.throws(
+      () => validateNextEnvironmentFiles(directory, "dev", "win32"),
+      /process environment/,
+    );
+
+    // With no env file present, Windows startup proceeds - the values arrive
+    // through the environment, which is what Launch.py's root .env feeds.
+    await rm(envFile);
+    validateNextEnvironmentFiles(directory, "dev", "win32");
   } finally {
     await rm(directory, { force: true, recursive: true });
   }

@@ -124,3 +124,55 @@ def test_child_services_receive_only_their_own_secrets():
     assert "AWS_SECRET_ACCESS_KEY" not in viewer
     assert "MES_PG_PASSWORD" not in viewer
     assert "DATABASE_URL" not in viewer
+
+
+def _write_launch_env(tmp_path: Path, text: str) -> Path:
+    env_file = tmp_path / ".env"
+    env_file.write_text(text, encoding="utf-8")
+    env_file.chmod(0o600)
+    return env_file
+
+
+def test_launch_env_file_feeds_the_frontend_its_secrets(tmp_path):
+    """The frontend has no other way in: it may not hold an .env of its own."""
+    env_file = _write_launch_env(
+        tmp_path,
+        "BETTER_AUTH_SECRET='auth-secret'\n"
+        '# a comment\n'
+        "\n"
+        'DATABASE_URL="postgresql://frontend-secret"\n'
+        "ANTHROPIC_API_KEY=anthropic-secret\n",
+    )
+
+    values = launch.load_launch_env_file(env_file)
+    frontend = launch.service_environment("frontend", values)
+
+    assert values["BETTER_AUTH_SECRET"] == "auth-secret"
+    assert values["DATABASE_URL"] == "postgresql://frontend-secret"
+    assert frontend["BETTER_AUTH_SECRET"] == "auth-secret"
+    # The allowlist still applies to file-supplied values.
+    assert "ANTHROPIC_API_KEY" not in frontend
+
+
+def test_launch_env_file_is_optional(tmp_path):
+    assert launch.load_launch_env_file(tmp_path / "absent.env") == {}
+
+
+def test_real_environment_overrides_the_launch_env_file(tmp_path):
+    """A one-off `NAME=value python Launch.py` must still win for that run."""
+    env_file = _write_launch_env(tmp_path, "MES_MODEL_ID=from-file\n")
+
+    merged = dict(launch.load_launch_env_file(env_file))
+    merged.update({"MES_MODEL_ID": "from-shell"})
+
+    assert merged["MES_MODEL_ID"] == "from-shell"
+
+
+def test_launch_env_file_never_prints_its_values(tmp_path, capsys):
+    env_file = _write_launch_env(tmp_path, "BETTER_AUTH_SECRET=super-secret\n")
+
+    launch.load_launch_env_file(env_file)
+
+    printed = capsys.readouterr().out
+    assert "BETTER_AUTH_SECRET" in printed
+    assert "super-secret" not in printed

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 
 import pytest
@@ -15,6 +16,26 @@ from report_paths import (
     resolve_existing_report,
     sanitize_report_stem,
 )
+
+# Windows has no POSIX permission bits: os.chmod only toggles the read-only
+# flag, and st_mode is synthesised. Confidentiality there comes from the
+# inherited NTFS ACL of the reports directory, which these tests cannot assert
+# on portably. Everything else about the contract is checked on both platforms.
+POSIX_MODES_ENFORCED = os.name == "posix"
+
+
+def assert_private_file(path):
+    assert path.is_file()
+    assert not path.is_symlink()
+    if POSIX_MODES_ENFORCED:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def assert_private_directory(path):
+    assert path.is_dir()
+    assert not path.is_symlink()
+    if POSIX_MODES_ENFORCED:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
 
 
 @pytest.fixture
@@ -53,11 +74,9 @@ def test_new_report_path_is_server_generated_and_contained(reports_directory):
     assert chosen_path.name.startswith("evil_")
     assert chosen_path != second_path
     assert ".." not in chosen_path.name
-    assert chosen_path.is_file()
-    assert second_path.is_file()
-    assert stat.S_IMODE(chosen_path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(second_path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(reports_directory.stat().st_mode) == 0o700
+    assert_private_file(chosen_path)
+    assert_private_file(second_path)
+    assert_private_directory(reports_directory)
 
 
 def test_report_file_is_exclusive_private_and_removed_when_incomplete(
@@ -68,7 +87,7 @@ def test_report_file_is_exclusive_private_and_removed_when_incomplete(
         assert not report.exists()
 
     assert report.read_bytes() == b"%PDF-private"
-    assert stat.S_IMODE(report.stat().st_mode) == 0o600
+    assert_private_file(report)
     assert list(reports_directory.glob(".*.tmp")) == []
 
     with pytest.raises(RuntimeError, match="interrupted"):
@@ -104,9 +123,8 @@ def test_model_cannot_choose_or_overwrite_an_existing_report(reports_directory):
 
     assert generated_path != existing_report
     assert existing_report.read_bytes() == b"original"
-    assert generated_path.is_file()
     assert generated_path.read_bytes() == b""
-    assert stat.S_IMODE(generated_path.stat().st_mode) == 0o600
+    assert_private_file(generated_path)
 
 
 def test_final_report_writer_uses_server_generated_contained_path(
@@ -118,11 +136,10 @@ def test_final_report_writer_uses_server_generated_contained_path(
         "# Contained report", "../../outside/model-chosen.pdf"
     )
 
-    assert generated_report.is_file()
     assert generated_report.parent == reports_directory.resolve()
     assert generated_report.name.startswith("model-chosen_")
-    assert stat.S_IMODE(reports_directory.stat().st_mode) == 0o700
-    assert stat.S_IMODE(generated_report.stat().st_mode) == 0o600
+    assert_private_directory(reports_directory)
+    assert_private_file(generated_report)
 
 
 def test_existing_report_resolver_accepts_safe_pdf(reports_directory):
@@ -133,7 +150,7 @@ def test_existing_report_resolver_accepts_safe_pdf(reports_directory):
     resolved = resolve_existing_report(report.name)
 
     assert resolved == report.resolve()
-    assert stat.S_IMODE(report.stat().st_mode) == 0o600
+    assert_private_file(report)
 
 
 @pytest.mark.parametrize(
@@ -193,11 +210,40 @@ def test_report_directory_symlink_is_rejected(tmp_path, monkeypatch):
 def test_unsupported_platform_fails_closed_before_creating_output(
     tmp_path, monkeypatch,
 ):
+    """Neither POSIX nor Windows means no output at all, not a weaker write.
+
+    Windows used to land here. It now has its own implementation, so the
+    fail-closed path is checked with a platform that has neither the POSIX
+    primitives nor the Windows ones.
+    """
     reports = tmp_path / "reports"
     monkeypatch.setattr(report_paths, "REPORTS_DIR", reports)
-    monkeypatch.setattr(report_paths.os, "name", "nt")
+    monkeypatch.setattr(report_paths.os, "name", "java")
 
     with pytest.raises(UnsupportedReportPlatform, match="not supported"):
         create_report_path("unsupported.pdf")
+
+    assert not reports.exists()
+
+
+@pytest.mark.skipif(
+    os.name == "posix", reason="only meaningful where the primitives are absent"
+)
+def test_claiming_to_be_posix_does_not_unlock_the_posix_writer(
+    tmp_path, monkeypatch
+):
+    """Selection follows the primitives that exist, not the name of the OS.
+
+    If it followed the name, a spoofed os.name would send descriptor-relative
+    writes at an OS that cannot do them, and the failure would surface as a
+    corrupt report rather than a refusal.
+    """
+    reports = tmp_path / "reports"
+    monkeypatch.setattr(report_paths, "REPORTS_DIR", reports)
+    monkeypatch.setattr(report_paths.os, "name", "posix")
+
+    assert report_paths._posix_primitives_available() is False
+    with pytest.raises(UnsupportedReportPlatform):
+        create_report_path("spoofed.pdf")
 
     assert not reports.exists()

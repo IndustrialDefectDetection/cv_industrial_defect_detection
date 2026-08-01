@@ -133,7 +133,9 @@ class TestAIInsightsReplacement:
         # Should not have converse method calls
         module_source = ai_insights_module.__file__
         if module_source:
-            with open(module_source, 'r') as f:
+            # Explicit encoding: Windows defaults to cp1252, which cannot
+            # decode the non-ASCII characters in the source being read.
+            with open(module_source, 'r', encoding='utf-8') as f:
                 content = f.read()
                 assert 'client.converse' not in content, "Found direct Bedrock converse calls"
                 assert 'get_bedrock_client' not in content, "Found Bedrock client initialization"

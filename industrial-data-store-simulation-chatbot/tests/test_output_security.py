@@ -24,8 +24,22 @@ from app_factory.shared.output_security import (
 )
 
 
+# Windows has no POSIX permission bits, so 0600/0700 cannot be asserted there;
+# confidentiality comes from the inherited NTFS ACL instead. Every other
+# property in these tests - exclusive creation, no symlink writes, atomic
+# publish, no partial output - is checked on both platforms.
+POSIX_MODES_ENFORCED = os.name == "posix"
+
+
 def _mode(path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
+
+
+def assert_private(path, expected_mode) -> None:
+    assert path.exists()
+    assert not path.is_symlink()
+    if POSIX_MODES_ENFORCED:
+        assert _mode(path) == expected_mode
 
 
 def test_private_directory_and_atomic_json_modes(tmp_path):
@@ -38,9 +52,9 @@ def test_private_directory_and_atomic_json_modes(tmp_path):
     output = cache / "daily_analysis_2026-07-31.json"
     atomic_write_private_json(output, {"status": "private"})
 
-    assert _mode(reports) == 0o700
-    assert _mode(cache) == 0o700
-    assert _mode(output) == 0o600
+    assert_private(reports, 0o700)
+    assert_private(cache, 0o700)
+    assert_private(output, 0o600)
     assert json.loads(output.read_text(encoding="utf-8")) == {
         "status": "private"
     }
@@ -62,7 +76,7 @@ def test_atomic_json_replaces_symlink_without_touching_target(tmp_path):
     assert not output.is_symlink()
     assert json.loads(output.read_text(encoding="utf-8")) == {"safe": True}
     assert outside.read_text(encoding="utf-8") == '{"secret": true}'
-    assert _mode(output) == 0o600
+    assert_private(output, 0o600)
 
 
 def test_failed_json_serialization_leaves_no_partial_output(tmp_path):
@@ -84,7 +98,7 @@ def test_private_json_reader_rejects_links_and_repairs_legacy_mode(tmp_path):
 
     with open_private_json(output) as source:
         assert json.load(source) == {"safe": True}
-    assert _mode(output) == 0o600
+    assert_private(output, 0o600)
 
     outside = tmp_path / "outside.json"
     outside.write_text("{}", encoding="utf-8")
@@ -114,8 +128,14 @@ def test_output_directory_symlink_is_rejected(tmp_path):
 def test_unsupported_platform_fails_closed_before_creating_output(
     tmp_path, monkeypatch,
 ):
+    """Windows used to land here; it now has its own implementation.
+
+    The guarantee being pinned is unchanged: a platform with neither the POSIX
+    primitives nor the Windows ones writes nothing at all rather than falling
+    back to an unprotected write.
+    """
     cache = tmp_path / "cache"
-    monkeypatch.setattr(output_security.os, "name", "nt")
+    monkeypatch.setattr(output_security.os, "name", "java")
 
     with pytest.raises(UnsupportedOutputPlatform, match="not supported"):
         ensure_private_directory(cache)
@@ -136,8 +156,8 @@ def test_private_log_handler_uses_owner_only_append_file(tmp_path):
         logger.removeHandler(handler)
         handler.close()
 
-    assert _mode(log_path.parent) == 0o700
-    assert _mode(log_path) == 0o600
+    assert_private(log_path.parent, 0o700)
+    assert_private(log_path, 0o600)
     assert "operational detail" in log_path.read_text(encoding="utf-8")
 
 
@@ -181,6 +201,6 @@ def test_scheduler_cache_is_atomic_private_and_loadable(
     manager = AnalysisCacheManager(str(cache))
 
     assert manager.load_cached_analysis(generated_at) == payload
-    assert _mode(cache.parent) == 0o700
-    assert _mode(cache) == 0o700
-    assert _mode(output) == 0o600
+    assert_private(cache.parent, 0o700)
+    assert_private(cache, 0o700)
+    assert_private(output, 0o600)

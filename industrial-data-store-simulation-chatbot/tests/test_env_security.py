@@ -40,7 +40,12 @@ def test_symlinked_env_file_is_rejected(tmp_path):
     )
     target.chmod(0o600)
     env_file = tmp_path / ".env"
-    env_file.symlink_to(target)
+    try:
+        env_file.symlink_to(target)
+    except OSError:
+        # Windows needs administrator rights or Developer Mode to create one.
+        # Same guard the other symlink tests in this suite use.
+        pytest.skip("Symbolic links are not supported in this environment")
 
     with pytest.raises(RuntimeError, match="non-regular"):
         load_protected_env(env_file)

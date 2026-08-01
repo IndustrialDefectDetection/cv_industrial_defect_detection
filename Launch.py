@@ -17,6 +17,8 @@ CHATBOT_DIR = ROOT_DIR / "industrial-data-store-simulation-chatbot"
 MLOPS_DIR = ROOT_DIR / "steel-defect-detection-mlops"
 MODEL_WEIGHTS = MLOPS_DIR / "runs/detect/steel_defect_colab_50_epochs/weights/best.pt"
 
+LAUNCH_ENV_FILE = ROOT_DIR / ".env"
+
 _BASE_CHILD_ENV_NAMES = frozenset({
     "APPDATA",
     "CI",
@@ -119,6 +121,66 @@ def service_environment(
     }
     child_environment.setdefault("PYTHONIOENCODING", "utf-8")
     return child_environment
+
+
+def load_launch_env_file(env_path: Path = LAUNCH_ENV_FILE) -> dict:
+    """Read the launcher's own .env, which every service draws its share from.
+
+    Each sub-project already loads its own .env once it is running. The
+    frontend cannot: `frontend/scripts/run-next-secure.mjs` refuses to start if
+    an .env file exists there at all on Windows, because it cannot verify the
+    file's permissions, and tells the operator to supply the values through the
+    process environment instead. This is that process environment - one
+    gitignored file at the repo root, filtered per service by the allowlists
+    above, so BETTER_AUTH_SECRET and DATABASE_URL reach Next.js without ever
+    being written inside frontend/.
+
+    Real environment variables win, so `MES_MODEL_ID=... python Launch.py`
+    still overrides the file for one run.
+    """
+
+    if not env_path.exists():
+        return {}
+
+    if env_path.is_symlink() or not env_path.is_file():
+        print(f"Refusing to read {env_path.name}: not a regular file")
+        sys.exit(1)
+
+    if os.name == "posix":
+        # Same standard the sub-projects hold their own .env files to. Windows
+        # has no equivalent bit to check; the file inherits the profile's ACL.
+        mode = env_path.stat().st_mode & 0o077
+        if mode:
+            print(
+                f"Refusing to read {env_path.name}: it is readable or writable "
+                "by other users. Run: chmod 600 .env"
+            )
+            sys.exit(1)
+
+    values = {}
+    for line_number, raw_line in enumerate(
+        env_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, separator, value = line.partition("=")
+        if not separator:
+            print(f"Ignoring {env_path.name} line {line_number}: no '=' found")
+            continue
+        name = name.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if name:
+            values[name] = value
+
+    if values:
+        # Names only. Printing a value would put a secret in the terminal
+        # scrollback and in any log the operator pastes into a bug report.
+        print(f"Loaded {len(values)} values from {env_path.name}: "
+              f"{', '.join(sorted(values))}")
+    return values
 
 
 def venv_python(project_dir: Path) -> Path:
@@ -279,7 +341,8 @@ def main():
    # wrong place and report that no defects were found.
    if not manage_frontend_dependencies():
         sys.exit(1)
-   parent_env = dict(os.environ)
+   parent_env = dict(load_launch_env_file())
+   parent_env.update(os.environ)
    parent_env.setdefault("MES_DB_BACKEND", "postgres")
    if len(parent_env.get("MES_INTERNAL_API_TOKEN", "")) < 32:
        # One high-entropy secret authenticates every loopback-only service.
