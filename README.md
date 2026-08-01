@@ -126,10 +126,25 @@ python docs/evaluate_agent.py --rescore docs/evaluation-run1.json
 ## Running it
 
 **You do not need an Anthropic API key to see this work.** The trained weights
-and a full snapshot of the MES database are both committed, and
-`MES_ANALYZE_STUB=1` runs the entire pipeline — camera, confidence gate,
-batching, alert lifecycle — with only the model call stubbed out. That path is
-free and is the one to start with.
+and a full snapshot of the MES database are both committed, and the free mode
+runs the entire pipeline — camera, confidence gate, batching, alert lifecycle —
+with only the model call stubbed out. Start there.
+
+### The short way: double-click `Start Demo.bat`
+
+No terminal required. A small launcher (`demo.py`, tkinter, standard library
+only) opens with:
+
+- a preflight panel that checks the database, the weights, the virtualenvs and
+  the `.env` **before** anything starts, and reports every problem at once
+  rather than one per restart;
+- **Free demo** and **Full demo** buttons, the paid one behind a confirmation;
+- a **Fire a camera burst** button;
+- a live table of investigations, so you watch an alert move to `done` without
+  opening a database client;
+- **Stop everything**, which also clears any port a crashed run left held.
+
+Everything below still works exactly as it did — the launcher only drives it.
 
 ### Setup, once
 
@@ -151,9 +166,9 @@ cd sample-MES-ClosedLoop-Strands-Agent && python startup.py    # bootstraps its 
 needs `npm` and its own auth values; skip it unless you want the chat UI —
 nothing in the pipeline below depends on it.
 
-### See the pipeline run — free
+### The long way: see the pipeline run from a terminal — free
 
-Three terminals:
+Three terminals. This is what the launcher's **Free demo** button does:
 
 ```bash
 # 1. the camera
