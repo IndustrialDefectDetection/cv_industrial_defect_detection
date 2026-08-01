@@ -1,0 +1,14 @@
+**
+
+!deployment/
+!deployment/**
+deployment/__pycache__/
+deployment/**/*.pyc
+
+!streamlit_app.py
+!streamlit_image_security.py
+
+!runs/
+!runs/detect/
+!runs/detect/steel_defect_colab_50_epochs/
+!runs/detect/steel_defect_colab_50_epochs/**

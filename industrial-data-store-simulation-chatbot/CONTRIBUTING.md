@@ -25,7 +25,7 @@ reported the issue. Please try to include as much information as you can. Detail
 This project uses `uv` for Python package management. Follow these steps to set up your development environment:
 
 ### Prerequisites
-- Python 3.9 or higher
+- Python 3.11 or higher
 - `uv` package manager (install from https://docs.astral.sh/uv/getting-started/installation/)
 
 ### Setting up the Development Environment

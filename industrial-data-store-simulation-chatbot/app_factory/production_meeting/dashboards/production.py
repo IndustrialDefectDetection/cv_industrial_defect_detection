@@ -866,11 +866,17 @@ def display_bottlenecks_and_issues():
                     status_color = "green"
                     status_text = "Normal"
 
+                status_icon = {
+                    "red": "🔴",
+                    "orange": "🟠",
+                    "blue": "🔵",
+                    "green": "🟢",
+                }[status_color]
                 st.markdown(f"""
-                **{row['WorkCenterName']}**: <span style='color:{status_color}'>{status_text}</span>
+                **{row['WorkCenterName']}**: **{status_icon} {status_text}**
                 {row['ActiveOrders']} active orders, {int(row['TotalQuantity']):,} units
                 Est. time to complete: {row['EstimatedHours']:.1f} hours ({row['EstimatedDays']:.1f} days)
-                """, unsafe_allow_html=True)
+                """)
 
                 # Add progress bar to visualize load (scale: 0-10 days)
                 st.progress(min(backlog_days / 10, 1.0))
@@ -938,11 +944,14 @@ def display_bottlenecks_and_issues():
             for i, row in downtime_df.iterrows():
                 downtime_color = "blue" if row['DowntimeCategory'] == 'planned' else "red"
                 
+                downtime_icon = "🔵" if downtime_color == "blue" else "🔴"
                 st.markdown(f"""
-                **{row['MachineName']} ({row['MachineType']})**: <span style='color:{downtime_color}'>{row['DurationMinutes']} minutes</span>  
-                Reason: {row['DowntimeReason']} ({row['DowntimeCategory']})  
+                **{row['MachineName']} ({row['MachineType']})**: **{downtime_icon} {row['DurationMinutes']} minutes**
+
+                Reason: {row['DowntimeReason']} ({row['DowntimeCategory']})
+
                 Description: {row['Description']}
-                """, unsafe_allow_html=True)
+                """)
                 st.markdown("---")
         else:
             st.info("No downtime events in the last 24 hours")
@@ -1311,11 +1320,18 @@ def display_production_schedule():
             else:
                 days_until_depletion = "N/A"
             
+            risk_icon = {
+                "red": "🔴",
+                "orange": "🟠",
+                "blue": "🔵",
+            }[risk_color]
             st.markdown(f"""
-            **{row['ItemName']}**: <span style='color:{risk_color}'>{row['Risk']} Risk</span>  
-            Current: {int(row['CurrentInventory']):,} | Required: {int(row['RequiredQuantity']):,} | Projected Balance: {int(row['ProjectedBalance']):,}  
+            **{row['ItemName']}**: **{risk_icon} {row['Risk']} Risk**
+
+            Current: {int(row['CurrentInventory']):,} | Required: {int(row['RequiredQuantity']):,} | Projected Balance: {int(row['ProjectedBalance']):,}
+
             Lead Time: {row['LeadTimeInDays']} days | Days Until Depletion: {days_until_depletion} | Supplier: {row['SupplierName']}
-            """, unsafe_allow_html=True)
+            """)
             
             # Add progress/warning bar
             if row['ProjectedBalance'] < 0:

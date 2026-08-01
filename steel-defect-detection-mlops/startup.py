@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from deployment.model_integrity import verify_model_integrity
+
 
 def run(cmd, cwd=None):
     print(f"\n>>> {' '.join(cmd)}")
@@ -24,23 +26,26 @@ def main():
     else:
         print("Virtual environment already exists.")
 
-    # Locate Python and pip inside the venv
+    # Locate Python inside the venv
     if os.name == "nt":
         python = venv_dir / "Scripts" / "python.exe"
-        pip = venv_dir / "Scripts" / "pip.exe"
     else:
         python = venv_dir / "bin" / "python"
-        pip = venv_dir / "bin" / "pip"
 
-    # Upgrade pip
-    print("\nUpgrading pip...")
-    run([str(python), "-m", "pip", "install", "--upgrade", "pip"])
+    # Install the exact top-level UI runtime instead of the much larger
+    # floating training/notebook environment.
+    print("\nInstalling pinned Streamlit requirements...")
+    run([
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "--requirement",
+        "deployment/requirements-streamlit.txt",
+    ])
 
-    # Install dependencies
-    print("\nInstalling requirements...")
-    run([str(pip), "install", "-r", "requirements.txt"])
-
-    # Download model
+    # PyTorch model files are executable serialized artifacts. Never download
+    # or deserialize an unreviewed replacement automatically.
     weights = (
         project_dir
         / "runs"
@@ -50,15 +55,28 @@ def main():
         / "best.pt"
     )
 
-    if weights.exists():
-        print("\nModel weights already exist.")
-    else:
-        print("\nDownloading model weights...")
-        run([str(python), "scripts/download_model.py"])
+    try:
+        verify_model_integrity(weights)
+    except RuntimeError as exc:
+        raise SystemExit(
+            f"Model verification failed: {exc}. Copy the reviewed best.pt "
+            "artifact into the documented weights path."
+        ) from exc
+    print("\nModel weights passed SHA-256 verification.")
 
     # Launch Streamlit
     print("\nLaunching Streamlit application...")
-    run([str(python), "-m", "streamlit", "run", "streamlit_app.py"])
+    run([
+        str(python),
+        "-m",
+        "streamlit",
+        "run",
+        "streamlit_app.py",
+        "--server.address",
+        "127.0.0.1",
+        "--server.headless",
+        "true",
+    ])
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ from .tools.database_tools import run_sqlite_query, get_database_schema, get_pro
 from .tools.visualization_tools import create_intelligent_visualization
 from .config import ProductionMeetingConfig
 from .error_handling import IntelligentErrorAnalyzer, ErrorContext
+from app_factory.shared.aws_security import create_bedrock_model
+from app_factory.shared.display_security import safe_log_text
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +53,20 @@ def production_analysis_tool(query: str) -> str:
         Production analysis results with insights and recommendations
     """
     try:
-        logger.info(f"Production analysis tool processing query: {query[:100]}...")
+        logger.info(
+            "Production analysis tool processing query: %s",
+            safe_log_text(query, max_chars=100),
+        )
         
         # Create the specialized production analysis agent
         production_agent = Agent(
             system_prompt=_get_production_analysis_system_prompt(),
             tools=[run_sqlite_query, get_database_schema, get_production_context, create_intelligent_visualization],
-            model=_config.default_model
+            callback_handler=None,
+            model=create_bedrock_model(
+                _config.default_model,
+                read_timeout_seconds=_config.timeout_seconds,
+            ),
         )
         
         # Format the query for production analysis focus
@@ -80,7 +89,7 @@ Use get_production_context() for timeframes, then run_sqlite_query() to get rele
         return content
         
     except Exception as e:
-        logger.error(f"Production analysis failed: {e}")
+        logger.error("Production analysis failed: %s", safe_log_text(e))
         return _handle_production_analysis_error(query, str(e))
 
 
@@ -114,13 +123,20 @@ def quality_analysis_tool(query: str) -> str:
         Quality analysis results with defect patterns and recommendations
     """
     try:
-        logger.info(f"Quality analysis tool processing query: {query[:100]}...")
+        logger.info(
+            "Quality analysis tool processing query: %s",
+            safe_log_text(query, max_chars=100),
+        )
         
         # Create the specialized quality analysis agent
         quality_agent = Agent(
             system_prompt=_get_quality_analysis_system_prompt(),
             tools=[run_sqlite_query, get_database_schema, get_production_context, create_intelligent_visualization],
-            model=_config.default_model
+            callback_handler=None,
+            model=create_bedrock_model(
+                _config.default_model,
+                read_timeout_seconds=_config.timeout_seconds,
+            ),
         )
         
         # Format the query for quality analysis focus
@@ -143,7 +159,7 @@ Use get_production_context() for timeframes, then run_sqlite_query() to get rele
         return content
         
     except Exception as e:
-        logger.error(f"Quality analysis failed: {e}")
+        logger.error("Quality analysis failed: %s", safe_log_text(e))
         return _handle_quality_analysis_error(query, str(e))
 
 
@@ -177,13 +193,20 @@ def equipment_analysis_tool(query: str) -> str:
         Equipment analysis results with OEE insights and maintenance recommendations
     """
     try:
-        logger.info(f"Equipment analysis tool processing query: {query[:100]}...")
+        logger.info(
+            "Equipment analysis tool processing query: %s",
+            safe_log_text(query, max_chars=100),
+        )
         
         # Create the specialized equipment analysis agent
         equipment_agent = Agent(
             system_prompt=_get_equipment_analysis_system_prompt(),
             tools=[run_sqlite_query, get_database_schema, get_production_context, create_intelligent_visualization],
-            model=_config.default_model
+            callback_handler=None,
+            model=create_bedrock_model(
+                _config.default_model,
+                read_timeout_seconds=_config.timeout_seconds,
+            ),
         )
         
         # Format the query for equipment analysis focus
@@ -206,7 +229,7 @@ Use get_production_context() for timeframes, then run_sqlite_query() to get rele
         return content
         
     except Exception as e:
-        logger.error(f"Equipment analysis failed: {e}")
+        logger.error("Equipment analysis failed: %s", safe_log_text(e))
         return _handle_equipment_analysis_error(query, str(e))
 
 
@@ -240,13 +263,20 @@ def inventory_analysis_tool(query: str) -> str:
         Inventory analysis results with shortage predictions and recommendations
     """
     try:
-        logger.info(f"Inventory analysis tool processing query: {query[:100]}...")
+        logger.info(
+            "Inventory analysis tool processing query: %s",
+            safe_log_text(query, max_chars=100),
+        )
         
         # Create the specialized inventory analysis agent
         inventory_agent = Agent(
             system_prompt=_get_inventory_analysis_system_prompt(),
             tools=[run_sqlite_query, get_database_schema, get_production_context, create_intelligent_visualization],
-            model=_config.default_model
+            callback_handler=None,
+            model=create_bedrock_model(
+                _config.default_model,
+                read_timeout_seconds=_config.timeout_seconds,
+            ),
         )
         
         # Format the query for inventory analysis focus
@@ -269,13 +299,16 @@ Use get_production_context() for timeframes, then run_sqlite_query() to get rele
         return content
         
     except Exception as e:
-        logger.error(f"Inventory analysis failed: {e}")
+        logger.error("Inventory analysis failed: %s", safe_log_text(e))
         return _handle_inventory_analysis_error(query, str(e))
 
 
 def _handle_production_analysis_error(query: str, error_message: str) -> str:
     """Handle production analysis errors with intelligent recovery."""
-    logger.warning(f"Production analysis failed, providing error guidance: {error_message}")
+    logger.warning(
+        "Production analysis failed, providing error guidance: %s",
+        safe_log_text(error_message),
+    )
     
     # Create error context
     error_context = ErrorContext(
@@ -312,7 +345,10 @@ def _handle_production_analysis_error(query: str, error_message: str) -> str:
 
 def _handle_quality_analysis_error(query: str, error_message: str) -> str:
     """Handle quality analysis errors with intelligent recovery."""
-    logger.warning(f"Quality analysis failed, providing error guidance: {error_message}")
+    logger.warning(
+        "Quality analysis failed, providing error guidance: %s",
+        safe_log_text(error_message),
+    )
     
     error_response = f"""I encountered an issue while analyzing your quality query: "{query}"
 
@@ -334,7 +370,10 @@ def _handle_quality_analysis_error(query: str, error_message: str) -> str:
 
 def _handle_equipment_analysis_error(query: str, error_message: str) -> str:
     """Handle equipment analysis errors with intelligent recovery."""
-    logger.warning(f"Equipment analysis failed, providing error guidance: {error_message}")
+    logger.warning(
+        "Equipment analysis failed, providing error guidance: %s",
+        safe_log_text(error_message),
+    )
     
     error_response = f"""I encountered an issue while analyzing your equipment query: "{query}"
 
@@ -356,7 +395,10 @@ def _handle_equipment_analysis_error(query: str, error_message: str) -> str:
 
 def _handle_inventory_analysis_error(query: str, error_message: str) -> str:
     """Handle inventory analysis errors with intelligent recovery."""
-    logger.warning(f"Inventory analysis failed, providing error guidance: {error_message}")
+    logger.warning(
+        "Inventory analysis failed, providing error guidance: %s",
+        safe_log_text(error_message),
+    )
     
     error_response = f"""I encountered an issue while analyzing your inventory query: "{query}"
 
@@ -412,7 +454,10 @@ def production_meeting_analysis_tool(query: str) -> str:
         Comprehensive analysis results for production meetings
     """
     try:
-        logger.info(f"Production meeting orchestrator processing query: {query[:100]}...")
+        logger.info(
+            "Production meeting orchestrator processing query: %s",
+            safe_log_text(query, max_chars=100),
+        )
         
         # Create the main orchestrator agent with access to all specialized tools
         orchestrator_agent = Agent(
@@ -427,7 +472,11 @@ def production_meeting_analysis_tool(query: str) -> str:
                 get_production_context,
                 create_intelligent_visualization
             ],
-            model=_config.default_model
+            callback_handler=None,
+            model=create_bedrock_model(
+                _config.default_model,
+                read_timeout_seconds=_config.timeout_seconds,
+            ),
         )
         
         # Classify the query type for appropriate handling
@@ -460,7 +509,10 @@ def production_meeting_analysis_tool(query: str) -> str:
         return orchestrated_response
         
     except Exception as e:
-        logger.error(f"Production meeting orchestration failed: {e}")
+        logger.error(
+            "Production meeting orchestration failed: %s",
+            safe_log_text(e),
+        )
         return _handle_orchestrator_error(query, str(e))
 
 
@@ -562,7 +614,10 @@ def _enhance_orchestrator_response(content: str, original_query: str, classifica
 
 def _handle_orchestrator_error(query: str, error_message: str) -> str:
     """Handle orchestrator errors with intelligent recovery and meeting context."""
-    logger.warning(f"Orchestrator analysis failed, providing error guidance: {error_message}")
+    logger.warning(
+        "Orchestrator analysis failed, providing error guidance: %s",
+        safe_log_text(error_message),
+    )
     
     # Create error context
     error_context = ErrorContext(

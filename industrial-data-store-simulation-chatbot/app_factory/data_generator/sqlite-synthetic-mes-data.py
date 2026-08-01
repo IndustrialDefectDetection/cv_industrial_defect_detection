@@ -2901,7 +2901,8 @@ def truncate_all_tables(db_path):
             table_name = table[0]
             if table_name != "sqlite_sequence":  # Skip internal SQLite tables
                 logger.info(f"Truncating table: {table_name}")
-                cursor.execute(f"DELETE FROM {table_name};")
+                quoted_table_name = '"' + table_name.replace('"', '""') + '"'
+                cursor.execute(f"DELETE FROM {quoted_table_name};")
         
         # Reset autoincrement counters if sqlite_sequence exists
         try:

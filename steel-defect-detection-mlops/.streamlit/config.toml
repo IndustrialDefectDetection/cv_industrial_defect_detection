@@ -1,0 +1,14 @@
+[server]
+# Apply the same boundary to `streamlit run streamlit_app.py` as the hardened
+# container command. Streamlit rejects oversized WebSocket uploads before the
+# application receives them.
+address = "127.0.0.1"
+headless = true
+maxUploadSize = 10
+maxMessageSize = 32
+enableXsrfProtection = true
+enableCORS = true
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false

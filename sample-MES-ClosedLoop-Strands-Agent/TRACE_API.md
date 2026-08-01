@@ -4,33 +4,46 @@ The FastAPI backend (`api.py`, `http://127.0.0.1:8000`, started with
 `python startup.py --api`) exposes everything the agent system does — per-agent
 streamed text, every tool call with arguments/results/durations, the literal
 SQL each tool ran, and run status — over three endpoints. `trace_viewer.py`
-(Streamlit, `streamlit run trace_viewer.py --server.port 8502`) is a working
+(Streamlit, `streamlit run trace_viewer.py --server.port 8502 --server.address
+127.0.0.1`) is a working
 reference client for this exact contract; a Next.js consumer can be built
-against the same endpoints without any backend changes (CORS already allows
-`http://localhost:3000` for GET and POST).
+against the same endpoints through authenticated server-side proxy routes.
+
+## Authentication and isolation
+
+Every endpoint below except `GET /health` requires the server-only header
+`X-MES-Internal-Token`. The configured token must be at least 32 characters;
+missing configuration returns `503`, and an invalid or missing caller token
+returns `401`. Never expose this token to browser JavaScript.
+
+Next.js validates the Better Auth session before proxying a request and adds
+`X-MES-User-ID` from that validated session to `/chat/`, `/trace`, and
+`/cancel`. The backend uses that value to prevent one signed-in user from
+observing or cancelling another user's run. The browser cannot choose the
+header value. Trusted loopback clients such as `trace_viewer.py` omit the user
+header and act as operator clients.
+
+For chat, Next.js also verifies that `conversation_id` belongs to the
+authenticated user and loads the saved transcript from PostgreSQL. The
+browser cannot supply chat history directly to this service.
 
 ## Endpoints
 
 ### `GET /health`
 
-Always answers 200, even when the agent side is broken — this is the first
-debugging stop. Never contains the API key itself.
+Answers `200` when ready and `503` when unavailable. It deliberately exposes
+no paths, model names, credentials, or exception text.
 
 ```json
 {
   "status": "ok",
-  "model_id": "claude-sonnet-4-6",
-  "db_path": "C:\\...\\sample-MES-ClosedLoop-Strands-Agent\\mes.db",
-  "db_exists": true,
-  "anthropic_api_key_set": true,
-  "agent_manager_ready": true,
-  "agent_manager_error": null
+  "agent_manager_ready": true
 }
 ```
 
-If the manager failed to build (missing key, bad config), `agent_manager_ready`
-is `false` and `agent_manager_error` holds the exception text; `/chat/` will
-return 503 until it's fixed and the server restarted.
+If manager construction fails, the response is
+`{"status":"unavailable","agent_manager_ready":false}` with status `503`.
+Diagnostic details remain in server logs.
 
 ### `GET /trace?since=N`
 
@@ -48,6 +61,9 @@ Poll this (~800 ms works well) to render the live trace. Returns events with
   "current": { "agent": "Analyzer", "tool": "get_defect_data" }
 }
 ```
+
+A signed-in user's server-side proxy receives `403` when the retained trace
+belongs to another user or to an operator-triggered run.
 
 - `run.status`: `idle` | `running` | `completed` | `failed`. When ended, `run`
   also has `ended_at`, `duration_ms`, and (on failure) the `run_end` event
@@ -152,12 +168,64 @@ from today, so a "last 7 days" run always overlaps the data.
 
 ## `POST /chat/`
 
-Unchanged request/response: `{"user_input": "..."}` → `{"analysis": "..."}`.
-The call blocks for the whole run (minutes); poll `/trace` in parallel for
-live progress. Errors are FastAPI-standard `{"detail": "..."}`:
+Request:
+
+```json
+{
+  "conversation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_input": "Do it on some random machines",
+  "history": [
+    {"role": "user", "content": "maintenance correlation"},
+    {"role": "assistant", "content": "Which machines should I analyze?"}
+  ]
+}
+```
+
+`conversation_id` is a UUID. `user_input` is nonblank and at most 4,000
+characters. `history` is required, contains at most 20 messages as complete,
+alternating user/assistant pairs, and is limited to 64 KiB of UTF-8 text. The
+authenticated Next.js proxy constructs this bounded history from the
+owner-scoped PostgreSQL conversation. The backend replaces all in-process
+chat and workflow history from it on every request, so chat switches and
+backend restarts do not lose or leak context.
+
+A successful call returns an NDJSON stream
+(`application/x-ndjson`) so long reports do not look like an idle HTTP
+connection:
+
+```jsonl
+{"type":"started"}
+{"type":"heartbeat"}
+{"type":"result","data":{"analysis":"..."}}
+```
+
+That is the internal Python response. The authenticated Next.js proxy saves the
+assistant text to the same owner-scoped PostgreSQL conversation before exposing
+success to the browser, then adds the server-generated saved-message ID:
+`{"type":"result","data":{"analysis":"...","messageId":"<uuid>"}}`. The browser
+cannot submit that assistant row itself.
+
+Heartbeats arrive every 10 seconds until the terminal `result` or `error`
+event. Cancellation ends with
+`{"type":"result","data":{"status":"cancelled"}}`. The run guard is released
+before the terminal event is emitted, so completion also means the API is
+ready for the next prompt. Poll `/trace` in parallel for detailed live
+progress. `POST /cancel` signals the chat agent, Supervisor, and any active
+specialist, then prevents later phases and retries from starting. Cancellation
+is cooperative: Python already executing inside a tool, or a model request
+that has not started streaming, may still wait for its configured timeout.
+Errors detected before streaming starts remain FastAPI-standard
+`{"detail": "..."}`:
 
 | status | meaning |
 |---|---|
+| 400 | invalid input or missing server-derived user identity |
+| 401 | invalid internal service credentials |
+| 403 | the active/retained run belongs to another signed-in user |
 | 409 | a run is already in progress (one traced run at a time) |
-| 500 | the run failed; the trace also ends with `error` + `run_end{status:"failed"}` |
-| 503 | agent manager not ready — see `GET /health` for why |
+| 429 | rolling hourly run budget exhausted; respect `Retry-After` |
+| 503 | agent manager or internal authentication is not configured |
+
+Once streaming starts, a run failure is delivered as
+`{"type":"error","error":"The analysis failed"}` and the trace ends with a
+generic failed run marker. Detailed exceptions remain in server logs.

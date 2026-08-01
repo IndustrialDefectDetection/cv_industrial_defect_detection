@@ -32,7 +32,7 @@ The AI Insights tab in your production dashboard can take 2+ minutes to generate
 
 ### System Requirements
 - **Linux with systemd** (Amazon Linux 2023, Ubuntu 16.04+, CentOS 7+, etc.)
-- **Python 3.10+** with `uv` package manager
+- **Python 3.11+** with `uv` package manager
 
 ### Setup
 ```bash

@@ -23,6 +23,8 @@ from .tools.database_tools import run_sqlite_query, get_database_schema
 from .tools.visualization_tools import create_intelligent_visualization
 from .config import AgentConfig
 from .error_handling import IntelligentErrorAnalyzer, ErrorContext, PartialResultPresenter
+from app_factory.shared.aws_security import create_bedrock_model
+from app_factory.shared.display_security import safe_log_text
 
 # Global configuration and error handling components
 _config = AgentConfig()
@@ -139,7 +141,11 @@ def _get_or_create_persistent_agent():
         _persistent_agent = Agent(
             system_prompt=_get_system_prompt(),
             tools=[run_sqlite_query, get_database_schema, create_intelligent_visualization],
-            model=_config.default_model
+            callback_handler=None,
+            model=create_bedrock_model(
+                _config.default_model,
+                read_timeout_seconds=_config.timeout_seconds,
+            ),
         )
         _agent_creation_date = current_date
     
@@ -171,7 +177,10 @@ def mes_analysis_tool(query: str) -> str:
     global _progress_updates, _logger
     
     try:
-        _logger.info(f"Processing MES analysis query: {query[:100]}...")
+        _logger.info(
+            "Processing MES analysis query: %s",
+            safe_log_text(query, max_chars=100),
+        )
         
         # Reset progress tracking
         _progress_updates = []
@@ -224,7 +233,7 @@ Use the available tools to access database information and create appropriate vi
         return content
         
     except Exception as e:
-        _logger.error(f"MES analysis failed: {e}")
+        _logger.error("MES analysis failed: %s", safe_log_text(e))
         return _handle_analysis_error(query, str(e))
 
 
@@ -245,7 +254,10 @@ def _handle_analysis_error(query: str, error_message: str) -> str:
     """Handle analysis errors with intelligent recovery."""
     global _error_analyzer, _logger
     
-    _logger.warning(f"Analysis failed, providing error guidance: {error_message}")
+    _logger.warning(
+        "Analysis failed, providing error guidance: %s",
+        safe_log_text(error_message),
+    )
     
     # Create error context
     error_context = ErrorContext(
@@ -301,7 +313,10 @@ def update_config(config: AgentConfig):
     
     # Reset agent if model changed to use new model
     if model_changed and _persistent_agent is not None:
-        _logger.info(f"Model changed to {config.default_model}, resetting persistent agent")
+        _logger.info(
+            "Model changed to %s, resetting persistent agent",
+            safe_log_text(config.default_model),
+        )
         reset_persistent_agent()
 
 
@@ -354,7 +369,7 @@ class MESAnalysisAgent:
             }
             
         except Exception as e:
-            self.logger.error(f"Analysis failed: {e}")
+            self.logger.error("Analysis failed: %s", safe_log_text(e))
             return {
                 'success': False,
                 'error': str(e),

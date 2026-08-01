@@ -11,6 +11,7 @@ import os
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
 from app_factory.shared.database import DatabaseManager
+from app_factory.shared.display_security import safe_model_markdown
 from app_factory.shared.db_utils import days_ago
 
 # Import production meeting modules
@@ -216,10 +217,16 @@ def display_ai_summary_card():
                         if exec_summary:
                             # Remove emojis for professional appearance
                             clean_summary = remove_status_emojis(exec_summary)
-                            st.markdown(clean_summary)
+                            st.markdown(
+                                safe_model_markdown(clean_summary),
+                                unsafe_allow_html=False,
+                            )
                         else:
                             # Fallback to raw if extraction fails
-                            st.markdown(raw_summary)
+                            st.markdown(
+                                safe_model_markdown(raw_summary),
+                                unsafe_allow_html=False,
+                            )
                     else:
                         st.info("Executive summary not available. Run daily analysis to generate.")
                 else:
@@ -278,7 +285,9 @@ def display_ask_ai_tab():
             insights = provide_tab_insights("general", {"query": user_question})
             if insights:
                 st.markdown("### Answer")
-                st.markdown(insights)
+                st.markdown(
+                    safe_model_markdown(insights), unsafe_allow_html=False
+                )
             else:
                 st.warning("Unable to generate insights. Please try again.")
 

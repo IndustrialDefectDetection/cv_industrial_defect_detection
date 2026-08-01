@@ -13,3 +13,10 @@ __pycache__/
 # a side effect to rely on rather than a rule.
 .venv/
 
+# Generated incident reports can contain operational and personnel details.
+sample-MES-ClosedLoop-Strands-Agent/reports/*.pdf
+sample-MES-ClosedLoop-Strands-Agent/reports/.private/
+
+# Agent-generated operational summaries and scheduler logs.
+industrial-data-store-simulation-chatbot/reports/daily_analysis/
+industrial-data-store-simulation-chatbot/logs/

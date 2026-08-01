@@ -2,14 +2,10 @@
 Amazon Bedrock utilities
 """
 
-import os
 import logging
-import boto3
 from typing import List, Dict, Any, Optional
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+from .aws_security import create_secure_aws_client
+from .display_security import safe_log_text
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,18 +14,12 @@ logger = logging.getLogger(__name__)
 
 def get_bedrock_client():
     """Create a bedrock-runtime client"""
-    return boto3.client(
-        service_name='bedrock-runtime',
-        region_name=os.getenv("AWS_REGION", "us-east-1")
-    )
+    return create_secure_aws_client("bedrock-runtime")
 
 
 def get_bedrock_management_client():
     """Create a bedrock management client for listing models"""
-    return boto3.client(
-        service_name='bedrock',
-        region_name=os.getenv("AWS_REGION", "us-east-1")
-    )
+    return create_secure_aws_client("bedrock")
 
 
 def get_supported_models():
@@ -158,7 +148,7 @@ def get_available_models(client=None, use_cache=True):
                     "provider": info["provider"], 
                     "tier": info["tier"]
                 })
-                logger.debug(f"Added available model: {model_id}")
+                logger.debug("Added available model: %s", safe_log_text(model_id))
                 
         # Sort by provider and tier for consistent ordering
         available_models.sort(key=lambda x: (x['provider'], x['tier'], x['name']))
@@ -177,7 +167,10 @@ def get_available_models(client=None, use_cache=True):
         return available_models
         
     except Exception as e:
-        logger.error(f"Error retrieving available models: {e}")
+        logger.error(
+            "Error retrieving available models: %s",
+            safe_log_text(e),
+        )
         return []
 
 
@@ -221,25 +214,35 @@ def debug_available_models():
             })
         
         for provider in sorted(models_by_provider.keys()):
-            print(f"\n{provider}:")
+            print(f"\n{safe_log_text(provider)}:")
             for model in sorted(models_by_provider[provider], key=lambda x: x['id']):
                 status = "✅" if model['on_demand'] else "❌"
                 types_str = ", ".join(model['inference_types']) if model['inference_types'] else "None"
-                print(f"  {status} {model['id']} - {model['name']} ({types_str})")
+                print(
+                    f"  {status} {safe_log_text(model['id'])} - "
+                    f"{safe_log_text(model['name'])} ({safe_log_text(types_str)})"
+                )
         
         print(f"\n=== SUPPORTED BY OUR APP ===")
         supported = get_supported_models()
         for model_id, info in supported.items():
-            print(f"  {info['provider']} - {info['name']}: {model_id}")
+            print(
+                f"  {safe_log_text(info['provider'])} - "
+                f"{safe_log_text(info['name'])}: {safe_log_text(model_id)}"
+            )
         
         print(f"\n=== MATCHES ===")
         available = get_available_models(client)
         for model in available:
-            print(f"  ✅ {model['provider']} - {model['name']} ({model['tier']}): {model['id']}")
+            print(
+                f"  ✅ {safe_log_text(model['provider'])} - "
+                f"{safe_log_text(model['name'])} "
+                f"({safe_log_text(model['tier'])}): {safe_log_text(model['id'])}"
+            )
             
     except Exception as e:
-        print(f"Error debugging models: {e}")
-        print(f"Check your AWS credentials and permissions")
+        print(f"Error debugging models: {safe_log_text(e)}")
+        print("Check your AWS credentials and permissions")
 
 
 def get_best_available_model(available_models=None, prefer_tier="fast", use_cache=True):

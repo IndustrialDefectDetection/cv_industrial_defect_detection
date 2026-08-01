@@ -4,6 +4,8 @@ from pathlib import Path
 import webbrowser
 import time
 import os
+import hashlib
+import secrets
 import signal
 import socket
 
@@ -14,6 +16,109 @@ FRONTEND_DIR = ROOT_DIR / "frontend"
 CHATBOT_DIR = ROOT_DIR / "industrial-data-store-simulation-chatbot"
 MLOPS_DIR = ROOT_DIR / "steel-defect-detection-mlops"
 MODEL_WEIGHTS = MLOPS_DIR / "runs/detect/steel_defect_colab_50_epochs/weights/best.pt"
+
+_BASE_CHILD_ENV_NAMES = frozenset({
+    "APPDATA",
+    "CI",
+    "COLORTERM",
+    "COMSPEC",
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LANG",
+    "LC_ALL",
+    "LOCALAPPDATA",
+    "LOGNAME",
+    "NO_COLOR",
+    "PATH",
+    "PATHEXT",
+    "SHELL",
+    "SYSTEMROOT",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "USER",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_CACHE_HOME",
+})
+_SERVICE_ENV_NAMES = {
+    "backend": frozenset({
+        "ANTHROPIC_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_DEFAULT_REGION",
+        "AWS_REGION",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    }),
+    "bridge": frozenset({
+        "MES_AGENT_TIMEOUT",
+        "MES_AGENT_URL",
+        "MES_ANALYZE_STUB",
+        "MES_INTERNAL_API_TOKEN",
+    }),
+    "frontend": frozenset({
+        "AUTH_ALLOW_EMAIL_SIGNUP",
+        "AUTH_ALLOW_GOOGLE_SIGNUP",
+        "AUTH_TRUSTED_PROXY_SECRET",
+        "BACKEND_URL",
+        "BETTER_AUTH_SECRET",
+        "BETTER_AUTH_URL",
+        "DATABASE_CA_CERT",
+        "DATABASE_URL",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "MES_INTERNAL_API_TOKEN",
+        "NEXT_TELEMETRY_DISABLED",
+        "NODE_ENV",
+    }),
+    "inference": frozenset({
+        "MES_INTERNAL_API_TOKEN",
+        "MES_INFERENCE_CONCURRENCY",
+        "MES_MAX_BATCH_BYTES",
+        "MES_MAX_BATCH_FILES",
+        "MES_MAX_IMAGE_BYTES",
+        "MES_MAX_IMAGE_PIXELS",
+        "MODEL_PATH",
+        "MODEL_SHA256",
+    }),
+    "viewer": frozenset({
+        "MES_AGENT_URL",
+        "MES_INTERNAL_API_TOKEN",
+        "MES_VIEWER_HEALTH_MAX_RETRIES",
+        "MES_VIEWER_HEALTH_RETRY",
+    }),
+}
+_SERVICE_ENV_PREFIXES = {
+    "backend": ("MES_",),
+    "bridge": ("MES_BRIDGE_", "MES_PG_"),
+    "frontend": ("NEXT_PUBLIC_",),
+    "inference": (),
+    "viewer": (),
+}
+
+
+def service_environment(
+    service: str,
+    source: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Give each child only its runtime settings, not every parent secret."""
+
+    if service not in _SERVICE_ENV_NAMES:
+        raise ValueError(f"Unknown service environment: {service}")
+    source_environment = dict(os.environ if source is None else source)
+    allowed_names = _BASE_CHILD_ENV_NAMES | _SERVICE_ENV_NAMES[service]
+    allowed_prefixes = _SERVICE_ENV_PREFIXES[service]
+    child_environment = {
+        name: value
+        for name, value in source_environment.items()
+        if name in allowed_names
+        or any(name.startswith(prefix) for prefix in allowed_prefixes)
+    }
+    child_environment.setdefault("PYTHONIOENCODING", "utf-8")
+    return child_environment
 
 
 def venv_python(project_dir: Path) -> Path:
@@ -73,10 +178,13 @@ def wait_for_backend(timeout: int = 90) -> bool:
     import urllib.request
 
     print("Waiting for the backend to finish starting", end="", flush=True)
+    # Never let ambient HTTP(S)_PROXY settings route a loopback readiness
+    # check through an external proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2):
+            with opener.open("http://127.0.0.1:8000/health", timeout=2):
                 print(" ready.")
                 return True
         except Exception:
@@ -105,23 +213,59 @@ def stop(process):
     process.wait()
 
 def manage_frontend_dependencies():
+    lockfile = FRONTEND_DIR / "package-lock.json"
+    dependency_marker = (
+        FRONTEND_DIR / "node_modules" / ".mes-package-lock.sha256"
+    )
     bin_dir = FRONTEND_DIR / "node_modules" / ".bin"
     next_installed = (
         (bin_dir / "next").exists()
         or (bin_dir / "next.cmd").exists()
     )
-    if next_installed:
+    if not lockfile.is_file():
+        print(f"Frontend lockfile is missing: {lockfile}")
+        return False
+
+    lockfile_hash = hashlib.sha256(lockfile.read_bytes()).hexdigest()
+    try:
+        installed_hash = dependency_marker.read_text(encoding="ascii").strip()
+    except (FileNotFoundError, OSError, UnicodeError):
+        installed_hash = ""
+
+    if next_installed and secrets.compare_digest(
+        installed_hash,
+        lockfile_hash,
+    ):
         return True
-    print("Installing frontend dependencies")
+
+    print("Installing locked frontend dependencies")
     try:
         subprocess.run(
-            ["npm", "ci"],
+            [
+                "npm",
+                "ci",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ],
             cwd=FRONTEND_DIR,
+            env={
+                name: value
+                for name, value in service_environment(
+                    "frontend",
+                ).items()
+                if name in _BASE_CHILD_ENV_NAMES
+                or name == "PYTHONIOENCODING"
+            },
             check=True,
             shell=(os.name == "nt"),
         )
+        dependency_marker.write_text(
+            lockfile_hash + "\n",
+            encoding="ascii",
+        )
         return True
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         print(f"Failed to install frontend dependencies: {e}")
     except FileNotFoundError:
         print("npm not found. Please install Node.js and npm.")
@@ -135,11 +279,19 @@ def main():
    # wrong place and report that no defects were found.
    if not manage_frontend_dependencies():
         sys.exit(1)
-   pipeline_env = dict(os.environ)
-   pipeline_env.setdefault("MES_DB_BACKEND", "postgres")
-   # Child stdout is a pipe here, so Python would otherwise pick the Windows
-   # locale encoding (cp1252) and die on the first emoji an agent streams.
-   pipeline_env.setdefault("PYTHONIOENCODING", "utf-8")
+   parent_env = dict(os.environ)
+   parent_env.setdefault("MES_DB_BACKEND", "postgres")
+   if len(parent_env.get("MES_INTERNAL_API_TOKEN", "")) < 32:
+       # One high-entropy secret authenticates every loopback-only service.
+       # startup.py persists the inherited value so manually started clients
+       # can use the same token after this launcher exits.
+       parent_env["MES_INTERNAL_API_TOKEN"] = secrets.token_urlsafe(32)
+
+   backend_env = service_environment("backend", parent_env)
+   bridge_env = service_environment("bridge", parent_env)
+   frontend_env = service_environment("frontend", parent_env)
+   inference_env = service_environment("inference", parent_env)
+   viewer_env = service_environment("viewer", parent_env)
 
    backend_process =  subprocess.Popen(
         [
@@ -148,7 +300,7 @@ def main():
         "--api"
     ],
     cwd = BACKEND_DIR,
-    env = pipeline_env,
+    env = backend_env,
     start_new_session=True
     )
    frontend_process = subprocess.Popen(
@@ -158,6 +310,7 @@ def main():
          "dev",
       ],
       cwd = FRONTEND_DIR,
+      env = frontend_env,
       start_new_session=True,
       shell = (os.name == "nt")
    )
@@ -182,10 +335,11 @@ def main():
              str(mlops_python),
              "-m", "uvicorn",
              "deployment.api:app",
+             "--host", "127.0.0.1",
              "--port", "8080",
           ],
           cwd = MLOPS_DIR,
-          env = pipeline_env,
+          env = inference_env,
           start_new_session=True
        )
        print("Inference API: http://localhost:8080  (docs at /docs)")
@@ -201,10 +355,11 @@ def main():
              str(backend_python),
              "-m", "uvicorn",
              "bridge.bridge:app",
+             "--host", "127.0.0.1",
              "--port", "8081",
           ],
           cwd = CHATBOT_DIR,
-          env = pipeline_env,
+          env = bridge_env,
           start_new_session=True
        )
        print("Detection bridge: http://localhost:8081")
@@ -220,9 +375,11 @@ def main():
              "run",
              "trace_viewer.py",
              "--server.port", "8502",
+             "--server.address", "127.0.0.1",
              "--server.headless", "true",
           ],
           cwd = BACKEND_DIR,
+          env = viewer_env,
           start_new_session=True
        )
        print("Under-the-hood trace viewer: http://localhost:8502")

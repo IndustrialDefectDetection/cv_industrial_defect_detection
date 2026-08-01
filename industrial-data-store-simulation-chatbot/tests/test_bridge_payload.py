@@ -10,8 +10,18 @@ healthy and the inference API happily returned detections.
 These tests are pure schema checks: no database, no network.
 """
 import pytest
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
-from bridge.bridge import BBox, DetectionItem, DetectionPayload
+from bridge.bridge import (
+    BBox,
+    DetectionItem,
+    DetectionPayload,
+    require_internal_api_token,
+    app,
+)
+from bridge import mes_lookups
 
 # Verbatim from CONTRACTS.md §2.
 CONTRACT_PAYLOAD = {
@@ -79,3 +89,131 @@ def test_every_yolo_class_name_round_trips():
             "bbox": {"x1": 0, "y1": 0, "x2": 1, "y2": 1},
         })
         assert detection.class_ == name
+
+
+def test_payload_rejects_paths_extra_fields_and_mismatched_classes():
+    bad_path = {**CONTRACT_PAYLOAD, "image_name": "../secret.jpg"}
+    with pytest.raises(ValidationError):
+        DetectionPayload.model_validate(bad_path)
+
+    extra = {**CONTRACT_PAYLOAD, "unexpected": True}
+    with pytest.raises(ValidationError):
+        DetectionPayload.model_validate(extra)
+
+    mismatch = {
+        **CONTRACT_PAYLOAD["detections"][0],
+        "class": "scratches",
+        "class_id": 0,
+    }
+    with pytest.raises(ValidationError):
+        DetectionItem.model_validate(mismatch)
+
+
+def test_payload_rejects_unbounded_or_invalid_geometry():
+    too_many = {
+        **CONTRACT_PAYLOAD,
+        "detections": CONTRACT_PAYLOAD["detections"] * 101,
+    }
+    with pytest.raises(ValidationError):
+        DetectionPayload.model_validate(too_many)
+
+    with pytest.raises(ValidationError):
+        BBox(x1=10.0, y1=0.0, x2=1.0, y2=1.0)
+
+
+def test_internal_service_auth_fails_closed(monkeypatch):
+    monkeypatch.delenv("MES_INTERNAL_API_TOKEN", raising=False)
+    with pytest.raises(HTTPException) as missing:
+        require_internal_api_token(None)
+    assert missing.value.status_code == 503
+
+    monkeypatch.setenv("MES_INTERNAL_API_TOKEN", "a" * 32)
+    with pytest.raises(HTTPException) as wrong:
+        require_internal_api_token("b" * 32)
+    assert wrong.value.status_code == 401
+    require_internal_api_token("a" * 32)
+
+
+def test_bridge_authenticates_before_json_parsing(monkeypatch):
+    monkeypatch.setenv("MES_INTERNAL_API_TOKEN", "a" * 32)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/detection", content=b"{not-json")
+
+    assert response.status_code == 401
+
+
+def test_bridge_counts_actual_body_bytes(monkeypatch):
+    token = "a" * 32
+    monkeypatch.setenv("MES_INTERNAL_API_TOKEN", token)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/detection",
+        content=b"x" * (1024 * 1024 + 1),
+        headers={
+            "Content-Length": "1",
+            "X-MES-Internal-Token": token,
+        },
+    )
+
+    assert response.status_code == 413
+
+
+def test_bridge_responses_disable_caching(monkeypatch):
+    token = "a" * 32
+    monkeypatch.setenv("MES_INTERNAL_API_TOKEN", token)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    health_response = client.get("/health")
+    assert health_response.headers["cache-control"] == "no-store"
+    assert health_response.headers["x-content-type-options"] == "nosniff"
+
+    protected_response = client.post(
+        "/detection",
+        content=b"{not-json",
+        headers={
+            "Content-Type": "application/json",
+            "X-MES-Internal-Token": token,
+        },
+    )
+    assert protected_response.status_code == 422
+    assert protected_response.headers["cache-control"] == "private, no-store"
+    assert protected_response.headers["x-content-type-options"] == "nosniff"
+    assert protected_response.headers["referrer-policy"] == "no-referrer"
+
+
+@pytest.mark.parametrize(
+    ("lookup", "arguments", "expected"),
+    [
+        (mes_lookups.get_frame_machines, (), []),
+        (mes_lookups.get_active_work_order, (12,), None),
+    ],
+)
+def test_lookup_failures_close_database_connections(
+    monkeypatch,
+    lookup,
+    arguments,
+    expected,
+):
+    class BrokenCursor:
+        def __enter__(self):
+            raise RuntimeError("query failed")
+
+        def __exit__(self, *_args):
+            return False
+
+    class Connection:
+        closed = False
+
+        def cursor(self, **_kwargs):
+            return BrokenCursor()
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    monkeypatch.setattr(mes_lookups, "_get_conn", lambda: connection)
+
+    assert lookup(*arguments) == expected
+    assert connection.closed

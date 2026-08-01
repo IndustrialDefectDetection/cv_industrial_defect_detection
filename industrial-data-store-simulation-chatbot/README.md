@@ -136,7 +136,7 @@ sequenceDiagram
 
 ### Prerequisites
 
-- Python 3.10 or higher
+- Python 3.11 or higher
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) - Modern Python package manager
 - [SQLite](https://www.sqlite.org/download.html)
 - [GNU Make](https://www.gnu.org/software/make/) - Build automation tool (usually pre-installed on macOS/Linux)
@@ -167,9 +167,21 @@ sequenceDiagram
    Configure AWS environment variables by creating a `.env` file:
 
    ```text
-   AWS_REGION="YourRegion" #example us-east-1
-   AWS_PROFILE="myprofile" #from ~/.aws/config
+   AWS_REGION="us-east-1"
+   AWS_ACCESS_KEY_ID="your-static-access-key-id"
+   AWS_SECRET_ACCESS_KEY="your-static-secret-access-key"
+   # Optional for temporary static credentials:
+   AWS_SESSION_TOKEN="your-session-token"
    ```
+
+   Copy `.env.example` as a starting point, run `chmod 600 .env`, and keep
+   `.env` out of Git. The application refuses to load a symlinked or
+   group/world-accessible `.env` file.
+   For transport security, the application intentionally does not use AWS
+   profiles, assume-role, web identity, SSO, `credential_process`, ECS task
+   credentials, or EC2 instance metadata. If the static variables above are
+   absent, AWS calls fail without consulting those outbound credential
+   providers.
 
 3. **Generate the MES Database**
 
@@ -390,7 +402,7 @@ The application uses **Claude Haiku 4.5** (`us.anthropic.claude-haiku-4-5-202510
 
 ### IAM Permissions
 
-Your AWS role needs these permissions:
+The IAM principal associated with the static access key needs these permissions:
 
 ```json
 {

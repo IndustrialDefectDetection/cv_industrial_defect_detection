@@ -300,9 +300,10 @@ def inventory_dashboard():
                             color = "green"
                             
                         st.markdown(f"""
-                        **{row['ItemName']}** ({row['ItemCategory']}) - <span style='color:{color}'>{urgency}</span>  
+                        **{row['ItemName']}** ({row['ItemCategory']}) — **{urgency}**
+
                         Current Quantity: {int(row['CurrentQuantity']):,} | Daily Usage: {row['AvgDailyConsumption']:.1f} | Days Remaining: {days:.1f}
-                        """, unsafe_allow_html=True)
+                        """)
                         
                         # Add progress bar to visualize days of supply
                         if days < 30:

@@ -13,6 +13,8 @@ Usage:
 
 import argparse
 import logging
+import mimetypes
+import os
 import random
 import sys
 import time
@@ -22,6 +24,14 @@ from pathlib import Path
 import requests
 
 from bridge.mes_lookups import get_frame_machines
+from app_factory.shared.display_security import safe_log_text
+from app_factory.shared.env_security import load_protected_env
+
+MONOREPO_ROOT = Path(__file__).resolve().parents[2]
+load_protected_env(
+    MONOREPO_ROOT / "sample-MES-ClosedLoop-Strands-Agent" / ".env",
+    allowed_names=frozenset({"MES_INTERNAL_API_TOKEN"}),
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +41,27 @@ logger = logging.getLogger("simulator")
 
 INFERENCE_URL = "http://localhost:8080/predict"
 BRIDGE_URL = "http://localhost:8081/detection"
+
+
+def direct_request(method: str, url: str, **kwargs):
+    """Call loopback without proxy inheritance or credential-bearing redirects."""
+    with requests.Session() as session:
+        session.trust_env = False
+        return session.request(
+            method,
+            url,
+            allow_redirects=False,
+            **kwargs,
+        )
+
+
+def service_headers() -> dict[str, str]:
+    token = os.getenv("MES_INTERNAL_API_TOKEN", "")
+    if len(token) < 32:
+        raise RuntimeError(
+            "MES_INTERNAL_API_TOKEN is missing or too short; run Launch.py first"
+        )
+    return {"X-MES-Internal-Token": token}
 
 
 def pick_machine():
@@ -48,12 +79,20 @@ def run_inference(image_path: str) -> dict | None:
     """POST an image to the inference API and return the parsed response."""
     try:
         with open(image_path, "rb") as f:
-            files = {"file": (Path(image_path).name, f, "image/jpeg")}
-            resp = requests.post(INFERENCE_URL, files=files, timeout=30)
+            media_type = mimetypes.guess_type(image_path)[0] or "application/octet-stream"
+            files = {"file": (Path(image_path).name, f, media_type)}
+            resp = direct_request(
+                "POST",
+                INFERENCE_URL, files=files, headers=service_headers(), timeout=30
+            )
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
-        logger.error("Inference call failed for %s: %s", image_path, exc)
+        logger.error(
+            "Inference call failed for %s: %s",
+            safe_log_text(image_path),
+            safe_log_text(exc),
+        )
         return None
 
 
@@ -82,7 +121,10 @@ def build_payload(inference_result: dict, machine_id: int) -> dict:
 def send_to_bridge(payload: dict) -> bool:
     """POST the §2 payload to the bridge's /detection endpoint."""
     try:
-        resp = requests.post(BRIDGE_URL, json=payload, timeout=10)
+        resp = direct_request(
+            "POST",
+            BRIDGE_URL, json=payload, headers=service_headers(), timeout=10
+        )
         resp.raise_for_status()
         logger.info(
             "Bridge accepted payload: %s",
@@ -90,7 +132,7 @@ def send_to_bridge(payload: dict) -> bool:
         )
         return True
     except Exception as exc:
-        logger.error("Bridge POST failed: %s", exc)
+        logger.error("Bridge POST failed: %s", safe_log_text(exc))
         return False
 
 
@@ -113,6 +155,8 @@ def main():
         help="Continuously loop through images",
     )
     args = parser.parse_args()
+    if not 0.05 <= args.interval <= 3600:
+        parser.error("--interval must be between 0.05 and 3600 seconds")
 
     image_dir = Path(args.image_dir)
     if not image_dir.is_dir():
@@ -120,7 +164,7 @@ def main():
         sys.exit(1)
 
     # Gather image files
-    extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+    extensions = {".jpg", ".jpeg", ".png"}
     image_files = sorted(
         p for p in image_dir.iterdir() if p.suffix.lower() in extensions
     )

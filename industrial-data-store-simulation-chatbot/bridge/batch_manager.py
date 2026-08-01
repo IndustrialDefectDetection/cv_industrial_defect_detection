@@ -7,14 +7,30 @@ one batch and trigger analyze_batch().
 """
 
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from typing import Any
 
 from bridge.db_config import BATCH_WINDOW_SECONDS
 from bridge.analyze_batch import analyze_batch
+from app_factory.shared.display_security import safe_log_text
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+MAX_ACTIVE_WINDOWS = _bounded_int_env("MES_MAX_BATCH_WINDOWS", 32, 1, 32)
+MAX_DETECTIONS_PER_WINDOW = _bounded_int_env(
+    "MES_MAX_DETECTIONS_PER_WINDOW", 500, 1, 500
+)
 
 
 class BatchManager:
@@ -25,7 +41,7 @@ class BatchManager:
         self._windows: dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-    def feed(self, detection: dict[str, Any]) -> None:
+    def feed(self, detection: dict[str, Any]) -> bool:
         """
         Feed a gated detection into the batching system.
 
@@ -38,6 +54,11 @@ class BatchManager:
         machine_id = detection["machine_id"]
         with self._lock:
             if machine_id not in self._windows:
+                if len(self._windows) >= MAX_ACTIVE_WINDOWS:
+                    logger.warning(
+                        "Ignoring gated detection: active-window limit reached"
+                    )
+                    return False
                 # Open a new window
                 now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 self._windows[machine_id] = {
@@ -51,6 +72,12 @@ class BatchManager:
                 )
 
             win = self._windows[machine_id]
+            if len(win["detections"]) >= MAX_DETECTIONS_PER_WINDOW:
+                logger.warning(
+                    "Ignoring gated detection for machine %s: window limit reached",
+                    machine_id,
+                )
+                return False
             win["detections"].append(detection)
 
             # Start the expiry timer on the first detection only
@@ -63,6 +90,7 @@ class BatchManager:
                 timer.daemon = True
                 win["timer"] = timer
                 timer.start()
+            return True
 
     def _close_window(self, machine_id: int) -> None:
         """Timer callback — close the window and call analyze_batch."""
@@ -106,4 +134,4 @@ class BatchManager:
             alert_id = analyze_batch(batch)
             logger.info("analyze_batch returned AlertID=%s", alert_id)
         except Exception as exc:
-            logger.error("analyze_batch raised: %s", exc, exc_info=True)
+            logger.error("analyze_batch raised: %s", safe_log_text(exc))

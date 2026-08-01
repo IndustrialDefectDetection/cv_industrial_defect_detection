@@ -1,18 +1,33 @@
-"""
-Steel Defect Detection - Streamlit Web Interface
-Modern, kullanıcı dostu web arayüzü
-"""
+"""Steel Defect Detection - bounded local Streamlit web interface."""
+
+import logging
+import os
+import threading
+import time
 
 import streamlit as st
-from ultralytics import YOLO
 from PIL import Image
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from io import BytesIO
-import time
-import os
+
+from streamlit_image_security import (
+    UploadValidationError,
+    decode_image_bytes,
+    read_uploaded_file,
+    safe_uploaded_filename,
+    validate_upload_batch,
+)
+from deployment.model_integrity import verify_model_integrity
+
+# Import Ultralytics only after streamlit_image_security has preserved
+# Pillow's original decoder.
+from ultralytics import YOLO
+
+
+LOGGER = logging.getLogger(__name__)
+_INFERENCE_SLOT = threading.BoundedSemaphore(value=1)
 
 # Page config
 st.set_page_config(
@@ -31,7 +46,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Model path
-MODEL_PATH = "runs/detect/steel_defect_colab_50_epochs/weights/best.pt"
+MODEL_PATH = os.getenv(
+    "MODEL_PATH",
+    "runs/detect/steel_defect_colab_50_epochs/weights/best.pt",
+)
 
 # Class names and colors
 CLASS_INFO = {
@@ -47,22 +65,29 @@ CLASS_INFO = {
 def load_model():
     """Load YOLOv8 model (cached)"""
     try:
-        model = YOLO(MODEL_PATH)
-        return model, None
-    except Exception as e:
-        return None, str(e)
+        verified_model_path = verify_model_integrity(MODEL_PATH)
+        model = YOLO(str(verified_model_path))
+        return model, False
+    except Exception:
+        LOGGER.exception("Failed to load the Streamlit inference model")
+        return None, True
 
 def predict_image(model, image, conf_threshold):
     """Run inference on image"""
-    start_time = time.time()
-    results = model.predict(
-        source=image,
-        conf=conf_threshold,
-        save=False,
-        verbose=False
-    )[0]
-    inference_time = (time.time() - start_time) * 1000
-    return results, inference_time
+    if not _INFERENCE_SLOT.acquire(blocking=False):
+        raise RuntimeError("Inference service is busy")
+    try:
+        start_time = time.time()
+        results = model.predict(
+            source=image,
+            conf=conf_threshold,
+            save=False,
+            verbose=False
+        )[0]
+        inference_time = (time.time() - start_time) * 1000
+        return results, inference_time
+    finally:
+        _INFERENCE_SLOT.release()
 
 def main():
     # Header
@@ -99,8 +124,7 @@ def main():
     model, error = load_model()
     
     if error:
-        st.error(f"Model loading failed: {error}")
-        st.info(f"Expected model path: {MODEL_PATH}")
+        st.error("The inference model is unavailable. Check the server logs.")
         return
     
     st.success("Model loaded successfully!")
@@ -120,19 +144,34 @@ def main():
                 help="Upload an image of steel surface for defect detection"
             )
             
+            image = None
             if uploaded_file:
-                image = Image.open(uploaded_file)
-                st.image(image, caption="Original Image", use_container_width=True)
-                
-                # Image info
-                st.info(f"Size: {image.size[0]}x{image.size[1]} px")
+                try:
+                    image = decode_image_bytes(read_uploaded_file(uploaded_file))
+                except UploadValidationError as exc:
+                    st.error(str(exc))
+                else:
+                    st.image(image, caption="Original Image", use_container_width=True)
+
+                    # Image info
+                    st.info(f"Size: {image.size[0]}x{image.size[1]} px")
         
         with col2:
-            if uploaded_file:
+            if image is not None:
                 st.subheader("Detection Results")
-                
-                with st.spinner("Analyzing..."):
-                    results, inference_time = predict_image(model, image, conf_threshold)
+
+                try:
+                    with st.spinner("Analyzing..."):
+                        results, inference_time = predict_image(
+                            model, image, conf_threshold
+                        )
+                except Exception:
+                    LOGGER.exception("Streamlit inference failed")
+                    st.error("Inference failed. Check the server logs and try again.")
+                    results = None
+
+                if results is None:
+                    st.stop()
                 
                 # Show annotated image
                 annotated_img = results.plot()
@@ -184,25 +223,54 @@ def main():
             st.info(f"{len(uploaded_files)} images uploaded")
             
             if st.button("Process All", type="primary"):
+                try:
+                    bounded_uploads = validate_upload_batch(uploaded_files)
+                except UploadValidationError as exc:
+                    st.error(str(exc))
+                    bounded_uploads = []
+
+                if not bounded_uploads:
+                    st.stop()
+
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
                 batch_results = []
                 
-                for idx, file in enumerate(uploaded_files):
-                    status_text.text(f"Processing {idx+1}/{len(uploaded_files)}: {file.name}")
+                for idx, (filename, image_bytes) in enumerate(bounded_uploads):
+                    status_text.text(
+                        f"Processing {idx+1}/{len(bounded_uploads)}: {filename}"
+                    )
+
+                    try:
+                        image = decode_image_bytes(image_bytes)
+                        results, inf_time = predict_image(
+                            model, image, conf_threshold
+                        )
+                    except UploadValidationError as exc:
+                        batch_results.append({
+                            "Filename": filename,
+                            "Detections": 0,
+                            "Status": str(exc),
+                            "Inference (ms)": "—",
+                        })
+                    except Exception:
+                        LOGGER.exception("Streamlit batch inference failed")
+                        batch_results.append({
+                            "Filename": filename,
+                            "Detections": 0,
+                            "Status": "ERROR",
+                            "Inference (ms)": "—",
+                        })
+                    else:
+                        batch_results.append({
+                            "Filename": safe_uploaded_filename(filename),
+                            "Detections": len(results.boxes),
+                            "Status": "PASS" if len(results.boxes) == 0 else "DEFECT",
+                            "Inference (ms)": f"{inf_time:.1f}"
+                        })
                     
-                    image = Image.open(file)
-                    results, inf_time = predict_image(model, image, conf_threshold)
-                    
-                    batch_results.append({
-                        "Filename": file.name,
-                        "Detections": len(results.boxes),
-                        "Status": "PASS" if len(results.boxes) == 0 else "DEFECT",
-                        "Inference (ms)": f"{inf_time:.1f}"
-                    })
-                    
-                    progress_bar.progress((idx + 1) / len(uploaded_files))
+                    progress_bar.progress((idx + 1) / len(bounded_uploads))
                 
                 status_text.text("Processing complete!")
                 

@@ -1,0 +1,168 @@
+name: Security and inference checks
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Start every job with a read-only token.
+permissions:
+  contents: read
+
+jobs:
+  frontend-security-tests:
+    name: Frontend security tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 24.13.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.13.0"
+          package-manager-cache: false
+
+      - name: Install lockfile dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run frontend security tests
+        run: npm run test:security
+
+      - name: Run frontend lint and type checks
+        run: |
+          npm run lint
+          npx next typegen
+          npx tsc --noEmit
+
+  inference-security-tests:
+    name: Inference security tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: steel-defect-detection-mlops
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: steel-defect-detection-mlops/deployment/requirements-api.txt
+
+      - name: Install pinned runtime and test dependencies
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          -r deployment/requirements-api.txt
+          pytest==9.1.1
+          httpx==0.28.1
+
+      - name: Run security regression tests
+        run: python -m pytest -q tests
+
+  sample-agent-security-tests:
+    name: Agent API security tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: sample-MES-ClosedLoop-Strands-Agent
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: sample-MES-ClosedLoop-Strands-Agent/requirements.txt
+
+      - name: Install pinned application dependencies
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --no-input
+          --only-binary=:all:
+          --requirement requirements.txt
+
+      - name: Run free agent security and regression tests
+        run: python -m pytest -q tests
+
+  industrial-security-tests:
+    name: MES and bridge security tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: industrial-data-store-simulation-chatbot
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Install the locked environment
+        env:
+          UV_NO_PROGRESS: "1"
+        run: |
+          python -m pip install --disable-pip-version-check uv==0.11.28
+          uv sync --locked
+
+      - name: Run MES, database, and bridge tests
+        run: uv run --locked python -m pytest -q tests
+
+  repository-security-scan:
+    name: Repository vulnerability, configuration, and secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Run Trivy scanner
+        # This must stay SHA-pinned. Mutable Trivy Action tags were
+        # compromised in March 2026 (GHSA-69fq-xp46-6x23).
+        # This private repository does not have GitHub Code Security enabled,
+        # so keep findings visible in the job log instead of uploading SARIF.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          version: v0.70.0
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          exit-code: "1"

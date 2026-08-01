@@ -28,10 +28,10 @@ setup-automation: ## Set up automated daily analysis (systemd)
 	uv run python scripts/setup_daily_analysis.py
 
 start-dashboard: ## Start the Streamlit dashboard
-	uv run streamlit run app_factory/main.py
+	uv run streamlit run app_factory/main.py --server.address 127.0.0.1
 
 start-chat: ## Start the MES Chat interface
-	uv run streamlit run app_factory/mes_chat/chat_interface.py
+	uv run streamlit run app_factory/mes_chat/chat_interface.py --server.address 127.0.0.1
 
 clean: ## Clean up cache and temporary files
 	find . -type d -name "__pycache__" -exec rm -rf {} +

@@ -6,18 +6,27 @@ This module handles loading cached daily analysis results and provides fallback 
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+
+from app_factory.shared.output_security import (
+    ensure_private_directory,
+    open_private_json,
+)
+from app_factory.shared.display_security import safe_log_text
 
 logger = logging.getLogger(__name__)
 
 class AnalysisCacheManager:
     """Manages cached analysis results for fast retrieval"""
-    
+
     def __init__(self, cache_dir: str = "reports/daily_analysis"):
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if self.cache_dir.parent.name == "reports":
+            ensure_private_directory(self.cache_dir.parent)
+        self.cache_dir = ensure_private_directory(self.cache_dir)
     
     def get_cache_filename(self, date: datetime = None) -> Path:
         """Get cache filename for a specific date"""
@@ -32,18 +41,28 @@ class AnalysisCacheManager:
         cache_file = self.get_cache_filename(date)
         
         if not cache_file.exists():
-            logger.warning(f"No cached analysis found for {date or 'today'}")
+            logger.warning(
+                "No cached analysis found for %s",
+                safe_log_text(date or "today"),
+            )
             return None
-        
+
         try:
-            with open(cache_file, 'r', encoding='utf-8') as f:
+            with open_private_json(cache_file) as f:
                 analysis_data = json.load(f)
             
-            logger.info(f"Loaded cached analysis from {cache_file}")
+            logger.info(
+                "Loaded cached analysis from %s",
+                safe_log_text(cache_file),
+            )
             return analysis_data
             
         except Exception as e:
-            logger.error(f"Failed to load cached analysis from {cache_file}: {e}")
+            logger.error(
+                "Failed to load cached analysis from %s: %s",
+                safe_log_text(cache_file),
+                safe_log_text(e),
+            )
             return None
     
     def get_latest_analysis(self, max_age_hours: int = 24) -> Optional[Dict[str, Any]]:
@@ -114,13 +133,15 @@ class AnalysisCacheManager:
             
             if cache_file.exists():
                 try:
-                    # Get file modification time and size
-                    stat = cache_file.stat()
-                    file_size = stat.st_size
-                    modified_time = datetime.fromtimestamp(stat.st_mtime)
-                    
-                    # Try to load basic info
-                    with open(cache_file, 'r', encoding='utf-8') as f:
+                    with open_private_json(cache_file) as f:
+                        # Read metadata from the same no-follow descriptor as
+                        # the JSON, avoiding a path substitution between stat
+                        # and load.
+                        file_stat = os.fstat(f.fileno())
+                        file_size = file_stat.st_size
+                        modified_time = datetime.fromtimestamp(
+                            file_stat.st_mtime
+                        )
                         data = json.load(f)
                     
                     available_dates.append({
@@ -134,7 +155,11 @@ class AnalysisCacheManager:
                     })
                     
                 except Exception as e:
-                    logger.warning(f"Error reading cache file {cache_file}: {e}")
+                    logger.warning(
+                        "Error reading cache file %s: %s",
+                        safe_log_text(cache_file),
+                        safe_log_text(e),
+                    )
         
         return sorted(available_dates, key=lambda x: x['date'], reverse=True)
     
@@ -171,9 +196,18 @@ class AnalysisCacheManager:
         
         # Calculate total cache size
         try:
-            total_size = sum(f.stat().st_size for f in self.cache_dir.glob("*.json"))
+            total_size = 0
+            for cache_file in self.cache_dir.glob("*.json"):
+                try:
+                    with open_private_json(cache_file) as cache_stream:
+                        total_size += os.fstat(cache_stream.fileno()).st_size
+                except Exception:
+                    logger.warning(
+                        "Ignoring unsafe cache file while calculating size: %s",
+                        cache_file,
+                    )
             status['cache_size_mb'] = round(total_size / (1024 * 1024), 2)
         except:
             pass
-        
+
         return status

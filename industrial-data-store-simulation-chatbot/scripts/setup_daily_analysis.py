@@ -10,6 +10,10 @@ import sys
 import subprocess
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app_factory.shared.display_security import safe_log_text
+
 def get_project_root():
     """Get the project root directory"""
     current_dir = Path(__file__).parent.parent
@@ -114,7 +118,7 @@ WantedBy=timers.target
             print("sudo systemctl start daily-mes-analysis.service")
             
         except Exception as e:
-            print(f"❌ Error creating service files: {e}")
+            print(f"❌ Error creating service files: {safe_log_text(e)}")
 
 def test_daily_analysis():
     """Test the daily analysis script"""
@@ -133,14 +137,14 @@ def test_daily_analysis():
         if result.returncode == 0:
             print("✅ Daily analysis completed successfully!")
             print("\nOutput:")
-            print(result.stdout)
+            print(safe_log_text(result.stdout))
         else:
             print("❌ Daily analysis failed!")
             print("\nError:")
-            print(result.stderr)
+            print(safe_log_text(result.stderr))
             
     except Exception as e:
-        print(f"❌ Error running daily analysis: {e}")
+        print(f"❌ Error running daily analysis: {safe_log_text(e)}")
 
 def check_systemd():
     """Check if systemd is available"""

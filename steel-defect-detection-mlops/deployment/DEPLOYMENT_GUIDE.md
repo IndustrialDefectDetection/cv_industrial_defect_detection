@@ -32,7 +32,10 @@ streamlit run streamlit_app.py
 ### SEÇENEK 2: Full Stack (Docker - TÜM SERVİSLER)
 
 ```powershell
-docker-compose -f deployment/docker-compose.full.yml up --build
+$env:MES_INTERNAL_API_TOKEN = "<en-az-32-karakterlik-rastgele-bir-deger>"
+$env:GRAFANA_ADMIN_PASSWORD = "<benzersiz-guclu-bir-parola>"
+$env:GRAFANA_SECRET_KEY = "<benzersiz-ve-kalici-32-karakterlik-bir-deger>"
+docker compose -f deployment/docker-compose.full.yml up --build
 ```
 
 **Erişim:**
@@ -41,14 +44,18 @@ docker-compose -f deployment/docker-compose.full.yml up --build
 - 🔌 FastAPI: http://localhost:8080/docs
 - 📊 MLflow: http://localhost:5000
 - 📈 Prometheus: http://localhost:9090
-- 📊 Grafana: http://localhost:3000 (admin/admin)
+- 📊 Grafana: http://localhost:3000 (`admin` / `$env:GRAFANA_ADMIN_PASSWORD`)
+
+Tüm yayınlanan portlar yalnızca `127.0.0.1` üzerinde dinler. API tahmin,
+model-bilgisi ve metrik uçları
+`X-MES-Internal-Token: $env:MES_INTERNAL_API_TOKEN` başlığını gerektirir.
 
 ---
 
 ## 📊 GRAFANA DASHBOARD KURULUMU
 
 1. Grafana aç: http://localhost:3000
-2. Login: `admin` / `admin`
+2. Login: `admin` / `$env:GRAFANA_ADMIN_PASSWORD`
 3. Add Data Source → Prometheus
    - URL: `http://prometheus:9090`
 4. Import Dashboard:
@@ -92,7 +99,8 @@ streamlit run streamlit_app.py
 
 ```powershell
 pip install prometheus-client
-uvicorn deployment.api:app --reload --port 8080
+$env:MES_INTERNAL_API_TOKEN = "<en-az-32-karakterlik-rastgele-bir-deger>"
+uvicorn deployment.api:app --host 127.0.0.1 --port 8080
 ```
 
 ---
@@ -103,7 +111,7 @@ uvicorn deployment.api:app --reload --port 8080
 
 ```bash
 # Docker ile deploy
-docker-compose -f deployment/docker-compose.full.yml up -d
+docker compose -f deployment/docker-compose.full.yml up -d
 
 # NGINX reverse proxy ekle
 # SSL certificate (Let's Encrypt)

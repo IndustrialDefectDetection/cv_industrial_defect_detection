@@ -1,38 +1,26 @@
-# Core dependencies
-streamlit>=1.42.0
-pandas>=2.2.0
-numpy>=1.24.0
-plotly>=6.0.0
-python-dotenv>=1.0.0
-reportlab>=4.0.0
-fastapi>=0.100.0
-requests>=2.31.0
+# Runtime and test dependencies are pinned so startup does not silently select
+# a different package graph. Refresh deliberately and rerun the full test suite.
+streamlit==1.59.1
+pandas==3.0.3
+numpy==2.5.1
+plotly==6.9.0
+python-dotenv==1.2.2
+reportlab==5.0.0
+fastapi==0.139.0
+httpx==0.28.1
+pydantic==2.13.4
+requests==2.34.2
 pyarrow==24.0.0
-uvicorn>=0.38.0
-
-# Database generator
-Faker>=22.0.0
-SQLAlchemy>=2.0.0
-
-# PostgreSQL driver — setupdatabase.py imports psycopg2 to build mescopy_v1,
-# and the pipeline's bridge/analyze_batch seam talks to the same database.
-# The -binary wheel avoids needing local Postgres build tooling.
-psycopg2-binary>=2.9.9
-
-# Agent framework with direct Anthropic/Claude support
-strands-agents[anthropic]
-strands-agents-tools
-anthropic
-
-# AWS support - keep because your email tool still uses boto3 / SES
-boto3[crt]>=1.41.0
-
-# Optional: keep only if you still use Bedrock AgentCore deployment
-bedrock-agentcore<=0.1.5
+uvicorn==0.51.0
+Faker==40.28.1
+SQLAlchemy==2.0.51
+psycopg2-binary==2.9.12
+strands-agents[anthropic]==1.47.0
+strands-agents-tools==0.8.3
+anthropic==0.116.0
+boto3[crt]==1.43.46
+botocore==1.43.46
+bedrock-agentcore==1.18.1
 bedrock-agentcore-starter-toolkit==0.1.14
-
-# Optional utility
-uv
-
-# Tests (tests/). pytest tests/ runs free; RUN_FULL=1 spends API credit.
-pytest
+uv==0.11.28
+pytest==9.1.1

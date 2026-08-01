@@ -25,9 +25,14 @@ from functools import lru_cache
 from strands import tool
 from ..error_handling import IntelligentErrorAnalyzer, ErrorContext
 from app_factory.shared.database import DatabaseManager
+from app_factory.shared.display_security import safe_log_text
 from app_factory.shared.db_utils import (
     days_ago, days_ahead, today,
     date_range_start, date_range_end
+)
+from app_factory.shared.sql_security import (
+    ReadOnlyQueryError,
+    validate_read_only_query,
 )
 
 # Module logger
@@ -57,32 +62,34 @@ def run_sqlite_query(query: str) -> Dict[str, Any]:
     start_time = datetime.now()
     
     # Log query for performance monitoring
-    logger.info(f"Executing production meeting query: {query[:100]}{'...' if len(query) > 100 else ''}")
+    logger.info(
+        "Executing production meeting query: %s",
+        safe_log_text(query, max_chars=100),
+    )
 
     try:
-        # Validate query BEFORE adding LIMIT clause
+        # Validate the model-generated SQL before it reaches SQLite.
         validation_result = _validate_production_query(query)
         if not validation_result['valid']:
             return _create_production_validation_error_response(query, validation_result)
 
-        # Performance optimization: Limit result size for meeting efficiency
-        MAX_ROWS_FOR_MEETINGS = 1000
-        if 'LIMIT' not in query.upper():
-            query = f"{query.rstrip(';')} LIMIT {MAX_ROWS_FOR_MEETINGS}"
-            logger.debug(f"Added LIMIT clause for meeting efficiency: {MAX_ROWS_FOR_MEETINGS} rows")
-        
-        # Use the shared database manager for consistency
+        safe_query = validation_result['query']
+
+        # The shared executor enforces read-only mode, a 1,000-row bound, and
+        # a query deadline without rewriting the model's SQL.
         db_manager = DatabaseManager()
-        result = db_manager.execute_query(query)
-        
+        result = db_manager.execute_read_only_query(safe_query)
+
         if result['success']:
             # Enhance results with production meeting context
-            enhanced_result = _enhance_with_production_context(result, query)
-            enhanced_result['meeting_insights'] = _generate_meeting_insights(result, query)
+            enhanced_result = _enhance_with_production_context(result, safe_query)
+            enhanced_result['meeting_insights'] = _generate_meeting_insights(
+                result, safe_query
+            )
             return enhanced_result
         else:
             # Handle errors with production meeting specific analysis
-            return _handle_production_query_error(result, query, start_time)
+            return _handle_production_query_error(result, safe_query, start_time)
             
     except Exception as e:
         return _handle_general_production_error(e, query, start_time)
@@ -219,7 +226,7 @@ def get_production_context(meeting_type: str = 'daily', days_back: int = 1) -> D
         
     except Exception as e:
         logger = logging.getLogger(__name__)
-        logger.error(f"Error getting production context: {e}")
+        logger.error("Error getting production context: %s", safe_log_text(e))
         
         return {
             'success': False,
@@ -245,29 +252,20 @@ def _validate_production_query(query: str) -> Dict[str, Any]:
         Dictionary with validation results and production-specific suggestions
     """
     validation_result = {'valid': True, 'warnings': [], 'suggestions': []}
-    
-    query_lower = query.lower().strip()
-    
-    # Basic validation
-    if not query_lower:
+
+    try:
+        safe_query = validate_read_only_query(query)
+    except ReadOnlyQueryError as exc:
         validation_result['valid'] = False
-        validation_result['error'] = 'Query cannot be empty'
-        return validation_result
-    
-    # Check for dangerous operations
-    dangerous_keywords = ['drop', 'delete', 'truncate', 'alter', 'create', 'insert', 'update']
-    if any(keyword in query_lower for keyword in dangerous_keywords):
-        validation_result['valid'] = False
-        validation_result['error'] = 'Modifying operations are not allowed in production meetings. Use SELECT queries only.'
+        validation_result['error'] = str(exc)
         validation_result['suggestions'] = [
-            'Use SELECT statements to analyze production data',
+            'Use one SELECT statement or a read-only CTE to analyze production data',
             'Focus on data retrieval for meeting insights'
         ]
         return validation_result
-    
-    # Production meeting specific validations
-    if not query_lower.startswith('select'):
-        validation_result['warnings'].append('Production meeting queries should use SELECT for data analysis')
+
+    validation_result['query'] = safe_query
+    query_lower = safe_query.lower()
     
     # Check for performance considerations in meeting context
     if 'select *' in query_lower and 'limit' not in query_lower:

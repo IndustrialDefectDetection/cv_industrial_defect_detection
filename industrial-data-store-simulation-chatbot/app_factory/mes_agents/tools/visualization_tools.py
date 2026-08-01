@@ -22,6 +22,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 from strands import tool
 from ..error_handling import IntelligentErrorAnalyzer, ErrorContext
+from app_factory.shared.display_security import safe_log_text
 
 
 @tool
@@ -327,7 +328,7 @@ def _handle_visualization_error(
     # Try to create a fallback visualization
     fallback_viz = _create_fallback_visualization(data)
     
-    logger.warning(f"Visualization error: {error_message}")
+    logger.warning("Visualization error: %s", safe_log_text(error_message))
     
     response = {
         'success': False,
@@ -484,7 +485,10 @@ def _create_fallback_visualization(data: List[Dict]) -> Optional[Dict[str, Any]]
         
     except Exception as e:
         logger = logging.getLogger(__name__)
-        logger.error(f"Failed to create fallback visualization: {e}")
+        logger.error(
+            "Failed to create fallback visualization: %s",
+            safe_log_text(e),
+        )
         return None
 
 

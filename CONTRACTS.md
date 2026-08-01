@@ -24,9 +24,63 @@ Database: **PostgreSQL `mescopy_v1`** on localhost:5432, shared by every service
 >
 > PostgreSQL folds unquoted identifiers to lower case, so `DefectType` comes back as `defecttype`. The agent restores the intended spelling from the query text (`_column_case_map`), because its output rules cite exact column names. Anything else reading these tables must expect lower case.
 
+### Internal-service security
+
+- `Launch.py` binds locally served UIs to `127.0.0.1` and supplies one
+  high-entropy `MES_INTERNAL_API_TOKEN` to the inference API, bridge, agent API,
+  server-side Next.js routes, and trace viewer.
+- Every operational inference, bridge, and agent endpoint requires
+  `X-MES-Internal-Token`. Public health endpoints expose readiness only.
+- The token is never sent to browser JavaScript. Next.js first validates the
+  Better Auth session and then adds the token while proxying server-side.
+- Next.js also adds `X-MES-User-ID` from the validated session to chat, trace,
+  and cancel calls. It must never accept this ID from the browser. The agent API
+  uses it to prevent one signed-in user from tracing or cancelling another
+  user's run.
+- Tokens must contain at least 32 characters. Missing or short tokens fail
+  closed; do not add an insecure fallback.
+
+### Authenticated chat context
+
+- Before inference, the browser appends exactly one pending user message
+  through `POST /api/chats` as
+  `{"conversationId":"<uuid, omitted for a new chat>","message":{"id":"<uuid>","role":"user","text":"..."}}`.
+  That authenticated route creates or locks the owner-scoped PostgreSQL
+  conversation, appends at the next position, and returns its server-issued
+  conversation UUID plus the authoritative ordered transcript. It is
+  idempotent by user-message ID and never accepts an assistant message or a
+  browser-supplied replacement transcript.
+- The browser then calls `POST /api/chat` with exactly
+  `{"conversationId":"<uuid>","messageId":"<uuid>","user_input":"..."}`.
+  It never sends prior messages or a user ID.
+- Next.js verifies `conversation.user_id` against the Better Auth session,
+  requires the newest stored message ID and text to match the current user
+  input, excludes that current message, and loads at most the 20 newest prior
+  messages that form complete user/assistant pairs, with at most 64 KiB of
+  UTF-8 content. Missing, non-owned, or changed conversations fail closed
+  instead of running without the intended context.
+- Next.js forwards the internal agent request as
+  `{"conversation_id":"<uuid>","user_input":"...","history":[{"role":"user|assistant","content":"..."}]}`.
+  The Python backend replaces its conversational and workflow-agent histories
+  from that bounded transcript before every turn. PostgreSQL, not process
+  memory, is the durable source of chat context.
+- When the Python stream returns an analysis, Next.js verifies that the same
+  pending user message is still newest, writes a server-generated assistant
+  message into that owned conversation, and only then forwards the terminal
+  result with the saved `messageId`. Cancelled and failed runs do not create an
+  assistant row. A browser can display assistant text but cannot author it.
+- A conversation stores at most 80 messages and 256,000 UTF-8 bytes. User
+  prompts are limited to 4,000 JavaScript string units, and one assistant slot
+  with up to 64,000 UTF-8 bytes is reserved before starting inference.
+  Historical rows created before this server-authored boundary are legacy data;
+  deployments that require verified provenance must migrate or clear those rows
+  separately.
+
 ## 2. Detection payload — simulator → bridge
 
 The simulator POSTs one JSON object to `http://localhost:8081/detection` per analyzed image. `detections` is passed through **unchanged** from the API's `/predict` response; the simulator adds the envelope fields.
+Both the simulator's `/predict` and `/detection` requests carry the internal
+service header described in §1.
 
 ```json
 {
@@ -44,6 +98,15 @@ The simulator POSTs one JSON object to `http://localhost:8081/detection` per ana
   ]
 }
 ```
+
+Validation limits: `/predict` accepts only decoded JPEG/PNG images, at most
+10 MiB and 16 megapixels; `/batch-predict` accepts at most 16 files and
+32 MiB total. The bridge accepts at most a 1 MiB JSON body and 100 detections
+per payload. Timestamps must be timezone-aware, `image_name` must be a plain
+filename, bounding boxes must be finite and ordered, and every `class_id` must
+match its six-class `class` value.
+The API and standalone Streamlit UI verify `best.pt` against the reviewed
+`MODEL_SHA256` before deserializing the executable PyTorch artifact.
 
 ## 3. Database tables (bridge creates with `CREATE TABLE IF NOT EXISTS` at startup)
 
@@ -104,6 +167,9 @@ The camera story: it watches the **Frame Welding** line (`Machines.Type = 'Frame
 - Save **every** incoming detection to `VisionDetections` immediately.
 - **Confidence gate:** only detections with `confidence >= 0.80` count toward batching.
 - **Batching:** first gated detection for a machine opens a 30-second window; when it closes, all gated detections collected in it form **one batch** and one call to `analyze_batch`. Constants: `CONF_GATE = 0.80`, `BATCH_WINDOW_SECONDS = 30`.
+- **Resource bounds:** at most 32 machine windows and 500 gated detections per
+  window are retained in memory. Extra gated detections remain persisted but
+  do not start additional timers or agent work.
 
 ## 6. The seam — `analyze_batch` (A implements, B calls)
 
@@ -136,6 +202,11 @@ def analyze_batch(batch: dict) -> int:
     ]
 }
 ```
+
+The agent API accepts only one cost-bearing run at a time and, by default, at
+most 10 starts per rolling hour (`MES_MAX_RUNS_PER_HOUR`, bounded to 1–100).
+Limit exhaustion returns `429` with `Retry-After`; concurrent starts return
+`409`; failures are recorded as `failed`.
 
 ## 7. Change protocol
 

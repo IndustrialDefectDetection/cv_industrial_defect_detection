@@ -1,47 +1,52 @@
-# Steel Defect Detection - Production Docker Image
-# Multi-stage build for optimized image size
+FROM python:3.10.20-slim-bookworm@sha256:9643927a6fc74bd81b0f1bbb5cce3cb4a491f46b4c5dbee770f28e575f180015
 
-FROM python:3.10-slim as base
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/home/app \
+    XDG_CACHE_HOME=/tmp/.cache \
+    XDG_CONFIG_HOME=/tmp/.config \
+    YOLO_CONFIG_DIR=/tmp/ultralytics \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    TORCH_HOME=/tmp/torch \
+    MODEL_PATH=/app/models/best.pt
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
-    libgomp1 \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY requirements.txt .
+COPY deployment/requirements-api.txt /tmp/requirements-api.txt
+RUN python -m pip install --no-compile --requirement /tmp/requirements-api.txt \
+    && rm /tmp/requirements-api.txt
 
-# Install Python dependencies
-RUN pip install --no-cache-dir \
-    ultralytics \
-    fastapi \
-    uvicorn \
-    python-multipart \
-    pillow \
-    numpy \
-    pydantic
+RUN groupadd --gid 10001 app \
+    && useradd \
+        --uid 10001 \
+        --gid app \
+        --create-home \
+        --shell /usr/sbin/nologin \
+        app \
+    && install -d -o app -g app /app/models
 
-# Copy application code
-COPY src/ /app/src/
-COPY configs/ /app/configs/
+COPY --chown=app:app deployment/api.py /app/api.py
+COPY --chown=app:app deployment/container_entrypoint.py /app/container_entrypoint.py
+COPY --chown=app:app deployment/model_integrity.py /app/deployment/model_integrity.py
+COPY --chown=app:app \
+    runs/detect/steel_defect_colab_50_epochs/weights/best.pt \
+    /app/models/best.pt
 
-# Copy trained model
-COPY runs/detect/steel_defect_colab_50_epochs/weights/best.pt /app/models/best.pt
+USER 10001:10001
 
-# Create API script
-COPY deployment/api.py /app/api.py
-
-# Expose port
 EXPOSE 8080
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()"]
 
-# Run the API server
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]
+ENTRYPOINT ["python", "/app/container_entrypoint.py"]
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080", "--limit-concurrency", "16", "--timeout-keep-alive", "5", "--no-proxy-headers", "--no-server-header"]
