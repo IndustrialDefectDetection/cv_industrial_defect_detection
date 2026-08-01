@@ -1,18 +1,15 @@
 # Evaluation — is the agent's report actually right?
 
-**Status: in progress. 1 of 3 planned runs complete.** The first run already
-invalidated one of the three metrics, so the design below needs a change before
-the remaining runs are worth paying for. Written up now so the reasoning is not
-lost.
-
-Producing a confident-sounding report is easy. This document is about whether
-the report is *true*.
+**Status: 1 of 3 planned runs complete, and re-scored after a bug was found in
+the scorer.** Producing a confident-sounding report is easy. This document is
+about whether the report is *true* — and, as it turned out, about whether the
+thing measuring the report is true.
 
 ## Ground truth
 
-The synthetic data is sabotaged on purpose. `sqlite-synthetic-mes-data.py`
-injects quality incidents and writes each one's name into
-`QualityControl.Comments`:
+The synthetic data is sabotaged on purpose.
+`sqlite-synthetic-mes-data.py` injects quality incidents and writes each one's
+name into `QualityControl.Comments`:
 
 | Injected incident | QC records |
 |---|---|
@@ -25,51 +22,77 @@ injects quality incidents and writes each one's name into
 The supplier incident is concentrated in a window 7–14 days before the data
 anchor, giving a visible spike. So the database records which runs were
 sabotaged, by what, and when — a real answer key rather than a judgement call.
+The agent is never shown that comment column in a form that names the incident.
 
-Ground truth per defect type is derived by joining
-`Defects → QualityControl → WorkOrders → Machines` and filtering on the
-incident comment. For `Sensor Malfunction`: **129 of 434** defects flagged,
-concentrated on `Machine Mot-50` (35), `Machine Mot-51` (32) and
-`Machine Bat-40` (23).
+Ground truth per defect type joins `Defects → QualityControl → WorkOrders →
+Machines` and filters on the incident comment. For `Sensor Malfunction`:
+**129 of 434** defects flagged, concentrated on `Machine Mot-50` (35),
+`Machine Mot-51` (32) and `Machine Bat-40` (23).
 
-## Method
+## The scorer was wrong before the agent was
 
-`docs/evaluate_agent.py` derives the ground truth, runs
-`run_defect_analysis(defect_type, days_back=30)` for real, and scores the
-report on three things:
+The first write-up of this run reported, as its headline finding, that the agent
+**named no machine at all**. That was false, and the mistake was mine.
 
-1. **Machine** — does it name the machines that actually carry the incident?
-2. **Window** — does it cite dates inside the true incident window?
-3. **Cause** — does it identify the supplier/material cause?
+`Machines.Name` stores `Machine Mot-50`. The scorer asked:
 
-## Result: Sensor Malfunction
+```python
+named = [m for m in truth["top_machines"] if m.lower() in low]   # wrong
+```
+
+The report writes the machine as `Mot-50` — in a markdown table cell, and as
+"Motor Assembly (Mot-51 and Mot-50 combined)". The literal string
+`Machine Mot-50` appears in the report **zero** times; `Mot-50` appears **six**
+times and `Mot-51` **seven**. Substring-matching the stored name scored a
+correct answer as a total miss.
+
+The fix matches the identifier, bounded so `Mot-5` cannot match `Mot-50`:
+
+```python
+def machine_mentioned(machine_name, report_lower):
+    if machine_name.lower() in report_lower:
+        return True
+    identifier = machine_name.split()[-1].lower()          # 'mot-50'
+    return re.search(rf"(?<![\w-]){re.escape(identifier)}(?![\w-])",
+                     report_lower) is not None
+```
+
+Re-scoring the saved report costs nothing — the run was already paid for — so
+`evaluate_agent.py --rescore` exists to apply new scoring to old reports
+without buying them again. That flag is the actual lesson from this run.
+
+## Result: Sensor Malfunction (corrected)
 
 Run completed in **469 s**, producing a 23,052-character report.
 
 | Metric | Result |
 |---|---|
 | Window | ✅ Cited **2026-06-27 to 2026-06-28**, inside the true window |
-| Cause | ⚠️ Named "Supplier Quality" as the dominant cause, MEDIUM certainty — **but see the confound below** |
-| Machine | ❌ **Named no machine at all.** `Mot-50` and `Mot-51` never appear |
+| Machine | ✅ Named **all three** of the top-3 incident machines — `Mot-50`, `Mot-51`, `Bat-40` |
+| Cause | ⚠️ Named "Supplier Quality", MEDIUM certainty — **but the metric is confounded, see below** |
+| Localised the incident | ✅ cause **and** machines **and** an in-window date |
+
+One honest qualification on the machine metric: the agent ranked `Mot-51`
+(114 records) above `Mot-50` (112), while the incident-flagged ground truth
+ranks `Mot-50` first. That is not an error — the agent counted *all* Sensor
+Malfunction defects, since it cannot see which were injected. Both top machines
+are correct; only the tie-break differs. `top_machine_named` in the JSON means
+"the true top machine is named somewhere", not "ranked first".
 
 > **HYPOTHESIS 1: Supplier Quality (62 records, 73 units affected)** —
 > Certainty: MEDIUM. […] The peak defect window (2026-06-27 to 2026-06-28)
 > coincides with a potential supplier batch issue, as no maintenance or process
 > disruptions were detected during this period.
 
-Locating the window is a genuine result: dates carry no incident label, so it
-had to find the spike from defect counts over time. It also correctly ruled out
-maintenance and downtime as explanations, which is the kind of negative finding
-that makes a report useful.
-
-Not naming a machine is a real miss. The report reasons at the aggregate level
-throughout, and "which machine do I go and look at" is the first question an
-operator would ask.
+Locating the window is a genuine result: dates carry no incident label, so the
+spike had to be found from defect counts over time. The agent also ruled out
+maintenance and downtime explicitly, which is the kind of negative finding that
+makes a report useful.
 
 ## The confound this run exposed
 
-**`Defects.RootCause` already contains the string `Supplier Quality`** — and it
-is the single most common value in the column:
+**`Defects.RootCause` already contains the string `Supplier Quality`** — the
+single most common value in the column:
 
 | RootCause | rows |
 |---|---|
@@ -83,23 +106,13 @@ The agent can read that column directly. So "did it say supplier?" does not
 measure inference — an agent that blindly reported the modal `RootCause` would
 score correct on every defect type. Of the 939 supplier-attributed defects, 602
 are also incident-flagged, so the column correlates with the injected incident
-without being identical to it, which is precisely what makes the metric
-misleading rather than merely useless.
+without being identical to it, which is what makes the metric misleading rather
+than merely useless.
 
-The cause metric as written is therefore **not evidence of root-cause
-reasoning**, and the score above should not be quoted as if it were.
-
-## What to change before the remaining runs
-
-1. **Drop or rewrite the cause metric.** Either exclude `RootCause` from the
-   tools the agent may read for evaluation runs, or score only on findings not
-   present verbatim in any column.
-2. **Keep the window metric** — it is uncontaminated and the agent passed it.
-3. **Keep the machine metric** — also uncontaminated, and the agent failed it.
-   Worth testing whether asking the question more specifically fixes it, since
-   this may be a prompt problem rather than a reasoning one.
-4. Then run the remaining defect types (`Battery Cell Variance`,
-   `Motor Coil Problem`) and report all three.
+**The replacement metric is `localised_the_incident`**: the report must name the
+supplier cause **and** at least one genuinely affected machine **and** a date
+inside the injected window. Parroting a column value cannot satisfy all three;
+only querying the data can. The run passes it.
 
 ## A separate, cleaner failure worth keeping
 
@@ -112,18 +125,29 @@ The observation is real and sharply argued. The conclusion is wrong: that was
 **model warm-up on the first inference request**, an artifact of how the demo
 was started, not a fact about the production line.
 
-This is the honest headline of the evaluation so far. The failure mode is not
+This remains the honest headline of the evaluation. The failure mode is not
 hallucination — every number cited was true. It is a confident causal story
-built on a correlation with a mundane technical explanation the agent had no
-way to know about.
+built on a correlation with a mundane technical explanation the agent had no way
+to know about. The fix is not a better prompt but better evidence: the agent
+should be told which latency samples are cold-start.
+
+## What is left
+
+1. Run the remaining defect types (`Battery Cell Variance`, `Motor Coil
+   Problem`) and report all three against `localised_the_incident`.
+2. Feed the agent a cold-start marker so warm-up latency stops reading as a
+   process anomaly.
 
 ## Reproducing
 
 ```bash
-cd sample-MES-ClosedLoop-Strands-Agent
-.venv/Scripts/python.exe ../docs/evaluate_agent.py
+# Score reports already collected - free.
+python docs/evaluate_agent.py --rescore docs/evaluation-run1.json
+
+# Run the agent for real - one multi-agent run per defect type, ~470 s each.
+python docs/evaluate_agent.py
 ```
 
-Costs one real multi-agent run per defect type (~470 s each) and writes results
-incrementally, so a stopped run keeps what it has. Raw output of the completed
-run is in `docs/evaluation-run1.json`, including the full report text.
+Connection settings come from `MES_PG_*`, like every other service. Results are
+written incrementally, so a stopped run keeps what it has. Raw output of the
+completed run is in `docs/evaluation-run1.json`, including the full report text.
