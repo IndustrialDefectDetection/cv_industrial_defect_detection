@@ -70,13 +70,16 @@ DETECTION_COUNT = Counter(
     "detections_total", "Total defects detected", ["class"]
 )
 
-MODEL_PATH = os.getenv(
-    "MODEL_PATH",
-    str(
-        Path(__file__).parent.parent
-        / "runs/detect/steel_defect_colab_50_epochs/weights/best.pt"
-    ),
+_DEFAULT_MODEL_PATH = str(
+    Path(__file__).parent.parent
+    / "runs/detect/steel_defect_colab_50_epochs/weights/best.pt"
 )
+# A blank MODEL_PATH means "not configured", not "load the file at ''".
+# os.getenv's default only applies when the name is absent, so an empty
+# assignment in .env - which is how an unused optional setting is usually
+# written - would otherwise beat the default and fail startup with "the
+# configured model file does not exist" while best.pt sits where it belongs.
+MODEL_PATH = os.getenv("MODEL_PATH", "").strip() or _DEFAULT_MODEL_PATH
 model = None
 
 CLASS_NAMES = {
