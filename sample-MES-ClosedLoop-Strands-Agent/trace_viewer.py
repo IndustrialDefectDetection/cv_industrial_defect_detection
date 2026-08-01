@@ -335,8 +335,8 @@ chat = st.session_state.setdefault("chat", {"status": "idle"})
 qa_history = st.session_state.setdefault("qa_history", [])
 chat_running = chat["status"] == "running"
 
-# The supervisor Agent keeps conversation state across /chat/ calls, so past
-# turns matter for reading a run. Record each finished turn exactly once.
+# This viewer records finished turns for observability only. The authenticated
+# Next.js/PostgreSQL chat history is the durable conversation source.
 if chat["status"] in ("completed", "failed") and not chat.get("recorded"):
     chat["recorded"] = True
     qa_history.append(

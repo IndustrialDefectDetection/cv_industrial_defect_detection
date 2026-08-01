@@ -1,6 +1,7 @@
 """Security-boundary tests for the internal agent API."""
 
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -83,9 +84,17 @@ def test_only_health_is_public_and_protected_responses_are_not_cacheable(
 
 def test_chat_input_is_bounded_and_cannot_be_blank():
     with pytest.raises(ValidationError):
-        api.ChatRequest(user_input="x" * 4_001)
+        api.ChatRequest(
+            conversation_id=uuid4(),
+            user_input="x" * 4_001,
+            history=[],
+        )
 
-    request = api.ChatRequest(user_input="   ")
+    request = api.ChatRequest(
+        conversation_id=uuid4(),
+        user_input="   ",
+        history=[],
+    )
     previous = api._manager
     api._manager = object()
     try:
@@ -94,6 +103,78 @@ def test_chat_input_is_bounded_and_cannot_be_blank():
         assert exc.value.status_code == 400
     finally:
         api._manager = previous
+
+
+def test_chat_history_contract_is_strict_and_bounded():
+    conversation_id = uuid4()
+    valid = api.ChatRequest(
+        conversation_id=conversation_id,
+        user_input="continue",
+        history=[
+            {"role": "user", "content": "maintenance correlation"},
+            {"role": "assistant", "content": "Which machines?"},
+        ],
+    )
+    assert valid.conversation_id == conversation_id
+
+    with pytest.raises(ValidationError):
+        api.ChatRequest(
+            conversation_id=conversation_id,
+            user_input="continue",
+            history=[{"role": "assistant", "content": "orphaned answer"}],
+        )
+
+    with pytest.raises(ValidationError):
+        api.ChatRequest(
+            conversation_id=conversation_id,
+            user_input="continue",
+            history=[{"role": "user", "content": "dangling question"}],
+        )
+
+    with pytest.raises(ValidationError):
+        api.ChatRequest(
+            conversation_id=conversation_id,
+            user_input="continue",
+            history=[
+                {"role": "user", "content": "first question"},
+                {"role": "user", "content": "second question"},
+            ],
+        )
+
+    with pytest.raises(ValidationError):
+        api.ChatRequest(
+            conversation_id=conversation_id,
+            user_input="continue",
+            history=[
+                {"role": "user", "content": f"message {index}"}
+                for index in range(api._MAX_CHAT_CONTEXT_MESSAGES + 1)
+            ],
+        )
+
+    with pytest.raises(ValidationError):
+        api.ChatRequest(
+            conversation_id=conversation_id,
+            user_input="continue",
+            history=[
+                {
+                    "role": "user",
+                    "content": "x" * (api._MAX_CHAT_CONTEXT_BYTES + 1),
+                },
+            ],
+        )
+
+    with pytest.raises(ValidationError):
+        api.ChatRequest(
+            conversation_id=conversation_id,
+            user_input="continue",
+            history=[
+                {
+                    "role": "user",
+                    "content": "question",
+                    "unexpected": "field",
+                },
+            ],
+        )
 
 
 def test_burst_payload_has_strict_counts_and_ranges():

@@ -35,6 +35,11 @@ from botocore.credentials import CredentialResolver
 from botocore.exceptions import ClientError
 from botocore.session import get_session as get_botocore_session
 from strands import Agent, tool
+from strands.hooks import (
+    AfterInvocationEvent,
+    BeforeInvocationEvent,
+    HookOrder,
+)
 from strands.models.anthropic import AnthropicModel
 from strands.types.exceptions import MaxTokensReachedException
 from chat_agent import build_conversational_agent
@@ -587,6 +592,9 @@ class MESAgentManager:
         # it at the start of each run rather than relying on a fresh object.
         self._cancelled = threading.Event()
         self._chat_running = threading.Event()
+        self._active_chat_agent = None
+        self._active_agents_lock = threading.RLock()
+        self._active_agent_invocations = {}
         
         # Get parameters from environment variables with fallbacks
         if db_path is None:
@@ -665,8 +673,9 @@ class MESAgentManager:
         self._agent_max_attempts = max(1, min(
             int(os.getenv("MES_AGENT_MAX_ATTEMPTS", "3")), 5))
 
-        # Chat is multi-turn, so the conversational agent keeps its history -
-        # but unbounded it re-sends every earlier report on every turn.
+        # Chat is rehydrated from PostgreSQL on every turn. Keep a second
+        # backend-side bound so a misconfigured proxy still cannot make the
+        # conversational agent re-send an unbounded transcript.
         self._chat_history_limit = max(2, int(
             os.getenv("MES_CHAT_HISTORY_MESSAGES", "12")))
 
@@ -717,27 +726,83 @@ class MESAgentManager:
         self._init_verifier_tools()
         self._init_agents()
         self._init_supervisor_agent()
-        self.conversational_agent = build_conversational_agent(
+        self.conversational_agent = self._new_conversational_agent()
+
+    def _new_conversational_agent(self):
+        """Build a request-isolated chat agent over the shared MES workflow."""
+        chat_agent = build_conversational_agent(
             self.model,
             self.supervisor_agent,
             self.tracer,
             call_supervisor=self._call_supervisor_for_chat,
         )
+        self._track_cancellable_agent(chat_agent)
+        return chat_agent
 
     def get_conversational_agent(self):
         """Return the conversational agent for external use"""
         return self.conversational_agent
 
-    def run_chat(self, query: str):
-        """Run one conversational turn with cooperative cancellation enabled."""
-        self.prepare_chat_turn()
+    def load_chat_history(
+        self,
+        history: list[dict[str, str]],
+        chat_agent=None,
+    ):
+        """Replace process memory with one authenticated conversation.
+
+        PostgreSQL is the durable source of truth. The Next.js server loads
+        an owner-scoped, bounded transcript and sends it with every turn, so
+        this manager must never carry an earlier request's chat or workflow
+        state into the next one.
+        """
+        self._reset_conversations()
+        target_agent = (
+            chat_agent
+            if chat_agent is not None
+            else self.conversational_agent
+        )
+        messages = getattr(target_agent, "messages", None)
+        if messages is None:
+            raise RuntimeError("Conversational agent has no message history")
+
+        messages[:] = []
+        loaded_messages = []
+        for index, message in enumerate(history):
+            role = message.get("role")
+            content = message.get("content")
+            expected_role = "user" if index % 2 == 0 else "assistant"
+            if (
+                role != expected_role
+                or not isinstance(content, str)
+                or not content.strip()
+            ):
+                raise ValueError("Invalid persisted chat history")
+            loaded_messages.append({
+                "role": role,
+                "content": [{"text": content}],
+            })
+
+        if len(loaded_messages) % 2 != 0:
+            raise ValueError("Invalid persisted chat history")
+
+        messages[:] = loaded_messages
+
+    def run_chat(self, query: str, history: list[dict[str, str]]):
+        """Run one hydrated conversational turn with cancellation enabled."""
+        chat_agent = self._new_conversational_agent()
+        self._active_chat_agent = chat_agent
         self._chat_running.set()
         try:
-            response = self.conversational_agent(query)
+            self.load_chat_history(history, chat_agent)
+            self.prepare_chat_turn(chat_agent, reset_turn_state=False)
+            self._check_cancelled()
+            response = chat_agent(query)
             if response.stop_reason == "cancelled" or self._cancelled.is_set():
                 raise RunCancelled("Chat response cancelled by the user")
             return response
         finally:
+            self._reset_conversations()
+            self._active_chat_agent = None
             self._chat_running.clear()
     
     def get_db_connection(self):
@@ -2269,18 +2334,81 @@ Always focus on clear and concise email body with actionable recommendations, ow
         attach_tracer(self.planner_agent, "Planner", self.tracer)
         attach_tracer(self.verifier_agent, "Verifier", self.tracer)
         attach_tracer(self.executor_agent, "Executor", self.tracer)
+        self._track_cancellable_agent(self.monitor_agent)
+        self._track_cancellable_agent(self.analyzer_agent)
+        self._track_cancellable_agent(self.planner_agent)
+        self._track_cancellable_agent(self.verifier_agent)
+        self._track_cancellable_agent(self.executor_agent)
+
+    def _track_cancellable_agent(self, agent):
+        """Track only this agent's live invocations for safe cancellation.
+
+        Calling ``Agent.cancel()`` while an agent is idle poisons its next
+        invocation because Strands clears that signal only after an invocation
+        exits. Invocation hooks let cancel() target the chat, supervisor, and
+        subagents that are actually running without touching idle agents.
+        """
+        agent.hooks.add_callback(
+            BeforeInvocationEvent,
+            self._register_active_agent,
+            order=HookOrder.SDK_FIRST,
+        )
+        agent.hooks.add_callback(
+            AfterInvocationEvent,
+            self._unregister_active_agent,
+            order=HookOrder.SDK_LAST,
+        )
+
+    def _register_active_agent(self, event: BeforeInvocationEvent):
+        """Register an invocation and reject starts after cancellation."""
+        agent_key = id(event.agent)
+        with self._active_agents_lock:
+            tracked = self._active_agent_invocations.get(agent_key)
+            if tracked is None:
+                self._active_agent_invocations[agent_key] = [event.agent, 1]
+            else:
+                tracked[1] += 1
+
+            # A nested agent may start in the narrow window after /cancel but
+            # before its caller observes the shared cancellation event. Deny
+            # that invocation through the hook instead of leaving a persistent
+            # Agent.cancel() signal on a just-starting agent.
+            if self._cancelled.is_set():
+                event.cancel = "Investigation cancelled by the user"
+
+    def _unregister_active_agent(self, event: AfterInvocationEvent):
+        """Remove one completed invocation from the cancellation target set."""
+        agent_key = id(event.agent)
+        with self._active_agents_lock:
+            tracked = self._active_agent_invocations.get(agent_key)
+            if tracked is None:
+                return
+            if tracked[1] <= 1:
+                self._active_agent_invocations.pop(agent_key, None)
+            else:
+                tracked[1] -= 1
 
     def cancel(self):
         """Ask an in-flight run on this manager to stop as soon as it can.
 
-        The conversational agent stops during model streaming or before its
-        next tool. Structured analysis stops at its next delegation or query
-        checkpoint.
+        Every currently active Strands agent receives its own cancellation
+        signal. This matters when the conversational agent is waiting inside
+        the Supervisor tool: cancelling only the outer agent cannot interrupt
+        the Supervisor or whichever specialist it is currently running.
+
+        Strands cancellation is cooperative. An active model stops during
+        streaming or before its next tool, and manager checkpoints prevent any
+        later phase or retry from starting.
         Safe to call from another thread, and safe when nothing is running.
         """
         self._cancelled.set()
-        if self._chat_running.is_set():
-            self.conversational_agent.cancel()
+        with self._active_agents_lock:
+            active_agents = [
+                tracked[0]
+                for tracked in self._active_agent_invocations.values()
+            ]
+            for agent in active_agents:
+                agent.cancel()
         logger.info("Cancellation requested for the current run")
 
     def _check_cancelled(self):
@@ -2345,12 +2473,18 @@ Always focus on clear and concise email body with actionable recommendations, ow
         max_attempts = self._agent_max_attempts
         last_error_type = "UnknownError"
         for attempt in range(1, max_attempts + 1):
+            self._check_cancelled()
             final = attempt == max_attempts
             try:
-                return agent_obj(prompt)
+                result = agent_obj(prompt)
+                self._check_cancelled()
+                if getattr(result, "stop_reason", None) == "cancelled":
+                    raise RunCancelled("Investigation cancelled by the user")
+                return result
             except RunCancelled:
                 raise  # a cancelled run is not a failure to retry - unwind
             except MaxTokensReachedException as e:
+                self._check_cancelled()
                 # Not a failure: the model filled max_tokens mid-reply and the
                 # partial message is already in history, so calling again
                 # continues it (the SDK's documented recovery). Say so plainly
@@ -2369,6 +2503,7 @@ Always focus on clear and concise email body with actionable recommendations, ow
                     + " (raise MES_MAX_TOKENS, or MES_AGENT_MAX_ATTEMPTS to keep"
                       " continuing, if this recurs)")
             except Exception as e:
+                self._check_cancelled()
                 last_error_type = type(e).__name__
                 logger.warning(
                     "%s agent attempt %d/%d failed (%s)%s",
@@ -2436,16 +2571,26 @@ Always focus on clear and concise email body with actionable recommendations, ow
             return ("[supervisor returned no readable text. Report this as a gap "
                     "rather than answering from memory.]")
 
-    def prepare_chat_turn(self):
+    def prepare_chat_request(self):
+        """Reset chat-turn state before its run owner becomes cancellable."""
+        self._cancelled.clear()
+        self._chat_supervisor_calls = 0
+
+    def prepare_chat_turn(self, chat_agent=None, reset_turn_state=True):
         """Get the conversational agent ready for one more turn.
 
         Trims its history so a long session does not re-send every earlier
         report, refreshes the per-question delegation budget, and clears any
         cancel flag left over from a previous run.
         """
-        self._cancelled.clear()
-        self._chat_supervisor_calls = 0
-        messages = getattr(self.conversational_agent, "messages", None)
+        if reset_turn_state:
+            self.prepare_chat_request()
+        target_agent = (
+            chat_agent
+            if chat_agent is not None
+            else self.conversational_agent
+        )
+        messages = getattr(target_agent, "messages", None)
         if not messages or len(messages) <= self._chat_history_limit:
             return
         # Cut from the front, then walk forward to the first message that can
@@ -2465,10 +2610,12 @@ Always focus on clear and concise email body with actionable recommendations, ow
             del messages[:start]
 
     def reset_chat_history(self):
-        """Clear chat context when a different authenticated user takes over."""
-        messages = getattr(self.conversational_agent, "messages", None)
-        if messages is not None:
-            del messages[:]
+        """Clear the conversational agent's in-memory context."""
+        chat_agents = [self.conversational_agent, self._active_chat_agent]
+        for chat_agent in chat_agents:
+            messages = getattr(chat_agent, "messages", None)
+            if messages is not None:
+                del messages[:]
 
     def _init_supervisor_agent(self):
         """Initialize the Supervisor Agent that orchestrates the workflow"""
@@ -2599,6 +2746,7 @@ Focus on ensuring each agent receives appropriate context and scope parameters, 
         )
 
         attach_tracer(self.supervisor_agent, "Supervisor", self.tracer)
+        self._track_cancellable_agent(self.supervisor_agent)
 
     def investigate_detection_burst(self, machine_id: int, defect_type: str,
                                     detection_count: int, window_start: str,

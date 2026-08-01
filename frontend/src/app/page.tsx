@@ -5,6 +5,16 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { authClient } from "@/lib/auth-client";
 import AppSidebar from "@/components/app-sidebar";
+import {
+  buildChatTurnPayload,
+  getCancelAcknowledgementState,
+  getChatComposerControlState,
+  getChatSidebarDisabledState,
+  mergeSavedChatPreservingPin,
+  runPersistedChatTurn,
+  shouldApplyAnalysisToActiveChat,
+} from "@/lib/chat-interactions";
+import { MAXIMUM_USER_INPUT_CHARACTERS } from "@/lib/chat-history";
 
 type Message = {
   id: string;
@@ -22,6 +32,7 @@ type Chat = {
 
 type ChatResponse = {
   analysis?: string;
+  messageId?: string;
   status?: "cancelled";
 };
 
@@ -110,13 +121,18 @@ export default function Home() {
   const [input, setInput] = useState("");
   const hasMessages = messages.length > 0;
   const [isWaiting, setIsWaiting] = useState(false);
+  const [isStartingTurn, setIsStartingTurn] = useState(false);
+  const [runningChatId, setRunningChatId] = useState<string | null>(null);
   const [isCancelling, setIsCancelling] = useState(false);
   const [traceProgress, setTraceProgress] = useState("Starting the analysis…");
   const [cancelledMessageIds, setCancelledMessageIds] = useState<string[]>([]);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>("system")
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const activeChatIdRef = useRef<string | null>(null);
   const cancelRequestedRef = useRef(false);
+  const cancelAcceptedRef = useRef(false);
+  const chatStartedRef = useRef(false);
   const { data: session, isPending: isSessionPending } = authClient.useSession();
   const shouldGateChat = !session;
 
@@ -138,13 +154,47 @@ export default function Home() {
     };
   },
     [themeMode])
-    // Scroll to end of messages
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  const disabledSidebarActions = getChatSidebarDisabledState({
+    isHistoryLoading,
+    isStartingTurn,
+    isAnalysisRunning: isWaiting,
+    deletingChatId,
+    pinningChatId,
+  });
+  const isViewingRunningChat = isWaiting
+    && activeChatId === runningChatId;
+  const composerControl = getChatComposerControlState({
+    isHistoryLoading,
+    isAnalysisRunning: isWaiting,
+    isViewingRunningChat,
+    isCancelling,
+    deletingChatId,
+    pinningChatId,
+  });
+
+  // Scroll to the end when the visible conversation changes.
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({
       behavior: "smooth",
       block: "end",
     });
-  }, [messages, isWaiting, traceProgress]);
+  }, [messages]);
+
+  // Progress updates belong only to the conversation that started the run.
+  useEffect(() => {
+    if (!isViewingRunningChat) {
+      return;
+    }
+
+    messagesEndRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "end",
+    });
+  }, [isViewingRunningChat, traceProgress]);
 
   useEffect(() => {
     if (!session || !isWaiting || isCancelling) {
@@ -274,6 +324,23 @@ export default function Home() {
     );
   }
 
+  function updateChatMessages(
+    chatId: string | null,
+    nextMessages: Message[],
+  ) {
+    if (chatId === null) {
+      return;
+    }
+
+    setChats((currentChats) =>
+      currentChats.map((chat) =>
+        chat.id === chatId
+          ? { ...chat, messages: nextMessages }
+          : chat
+      )
+    );
+  }
+
   async function handleSend() {
     if (
       !isHistoryLoading
@@ -282,38 +349,89 @@ export default function Home() {
       && !pinningChatId
       && input.trim() !== ""
     ) {
-      const newMessage: Message = {
+      const newMessage: Message & { role: "user" } = {
         id: crypto.randomUUID(),
         text: input,
         role: "user"
       };
+      const sourceChatId = activeChatIdRef.current;
       const pendingMessages = [...messages, newMessage];
+      let persistedMessages = pendingMessages;
       setMessages(pendingMessages);
+      updateChatMessages(sourceChatId, pendingMessages);
       setInput("");
       setHistoryError(null);
       cancelRequestedRef.current = false;
+      cancelAcceptedRef.current = false;
+      chatStartedRef.current = false;
       setTraceProgress("Starting the analysis…");
+      setRunningChatId(sourceChatId);
+      setIsStartingTurn(true);
       setIsWaiting(true);
       try {
-        const response = await getResponse(newMessage.text);
+        const turn = await runPersistedChatTurn({
+          savePending: async () => {
+            const savedChat = await savePendingMessage(
+              newMessage,
+              sourceChatId,
+            );
+            if (savedChat) {
+              persistedMessages = savedChat.messages;
+            }
+            return savedChat;
+          },
+          onPersisted: (persistedChatId) => {
+            setIsStartingTurn(false);
+            setRunningChatId(persistedChatId);
+            updateChatMessages(persistedChatId, persistedMessages);
+          },
+          isCancelled: () => cancelRequestedRef.current,
+          requestAnalysis: (persistedChatId) => getResponse(
+            newMessage.text,
+            persistedChatId,
+            newMessage.id,
+          ),
+        });
+        if (turn.status === "save_failed") {
+          setMessages(messages);
+          updateChatMessages(sourceChatId, messages);
+          setInput(newMessage.text);
+          return;
+        }
 
-        if (cancelRequestedRef.current || response.status === "cancelled") {
+        if (turn.status === "cancelled") {
           markMessageCancelled(newMessage.id);
           return;
         }
 
-        if (typeof response.analysis !== "string") {
+        const persistedChatId = turn.conversationId;
+        const response = turn.response;
+
+        if (response.status === "cancelled") {
+          markMessageCancelled(newMessage.id);
+          return;
+        }
+
+        if (
+          typeof response.analysis !== "string"
+          || typeof response.messageId !== "string"
+        ) {
           throw new Error("Assistant response did not include analysis");
         }
 
         const chatResponse: Message = {
-          id: crypto.randomUUID(),
+          id: response.messageId,
           text: response.analysis,
           role: "assistant"
         }
-        const completedMessages = [...pendingMessages, chatResponse];
-        setMessages(completedMessages);
-        await saveChat(completedMessages);
+        const completedMessages = [...persistedMessages, chatResponse];
+        updateChatMessages(persistedChatId, completedMessages);
+        if (shouldApplyAnalysisToActiveChat(
+          activeChatIdRef.current,
+          persistedChatId,
+        )) {
+          setMessages(completedMessages);
+        }
       } catch {
         if (cancelRequestedRef.current) {
           markMessageCancelled(newMessage.id);
@@ -322,7 +440,11 @@ export default function Home() {
         }
       } finally {
         cancelRequestedRef.current = false;
+        cancelAcceptedRef.current = false;
+        chatStartedRef.current = false;
         setIsCancelling(false);
+        setIsStartingTurn(false);
+        setRunningChatId(null);
         setIsWaiting(false);
       }
     }
@@ -345,6 +467,17 @@ export default function Home() {
       if (!response.ok) {
         throw new Error("Unable to cancel prompt");
       }
+      const data = await response.json() as { cancelling?: boolean };
+      const acknowledgement = getCancelAcknowledgementState(
+        data.cancelling === true,
+        chatStartedRef.current,
+      );
+      cancelAcceptedRef.current = acknowledgement === "accepted";
+      if (acknowledgement === "rejected") {
+        cancelRequestedRef.current = false;
+        setIsCancelling(false);
+        setHistoryError("The current response could not be cancelled.");
+      }
     } catch {
       if (cancelRequestedRef.current) {
         cancelRequestedRef.current = false;
@@ -354,12 +487,10 @@ export default function Home() {
     }
   }
 
-  async function saveChat(nextMessages: Message[]) {
-    if (nextMessages.length === 0) {
-      return;
-    }
-
-    const conversationId = activeChatId;
+  async function savePendingMessage(
+    message: Message & { role: "user" },
+    conversationId: string | null,
+  ): Promise<Chat | null> {
     setHistoryError(null);
 
     try {
@@ -370,7 +501,7 @@ export default function Home() {
         },
         body: JSON.stringify({
           conversationId: conversationId ?? undefined,
-          messages: nextMessages,
+          message,
         }),
       });
 
@@ -382,21 +513,32 @@ export default function Home() {
       if (conversationId === null) {
         setEnteringChatId(data.chat.id);
       }
-      setActiveChatId(data.chat.id);
-      setChats((currentChats) => retainRecentChats([
-        data.chat,
-        ...currentChats.filter((chat) => chat.id !== data.chat.id),
-      ]));
+      if (shouldApplyAnalysisToActiveChat(
+        activeChatIdRef.current,
+        conversationId,
+      )) {
+        if (conversationId === null) {
+          activeChatIdRef.current = data.chat.id;
+          setActiveChatId(data.chat.id);
+        }
+        setMessages(data.chat.messages);
+      }
+      setChats((currentChats) => retainRecentChats(
+        mergeSavedChatPreservingPin(currentChats, data.chat),
+      ));
+      return data.chat;
     } catch {
       setHistoryError("This chat could not be saved.");
+      return null;
     }
   }
 
   function startNewChat() {
-    if (isHistoryLoading || isWaiting || deletingChatId || pinningChatId) {
+    if (disabledSidebarActions.newChat) {
       return;
     }
 
+    activeChatIdRef.current = null;
     setActiveChatId(null);
     setEnteringChatId(null);
     setCancelledMessageIds([]);
@@ -408,10 +550,7 @@ export default function Home() {
   function selectChat(chatId: string) {
     if (
       chatId === activeChatId
-      || isHistoryLoading
-      || isWaiting
-      || deletingChatId
-      || pinningChatId
+      || disabledSidebarActions.selectChat
     ) {
       return;
     }
@@ -419,6 +558,7 @@ export default function Home() {
     const selectedChat = chats.find((chat) => chat.id === chatId);
 
     if (selectedChat) {
+      activeChatIdRef.current = selectedChat.id;
       setActiveChatId(selectedChat.id);
       setCancelledMessageIds([]);
       setMessages(selectedChat.messages);
@@ -428,12 +568,7 @@ export default function Home() {
   }
 
   async function setChatPinned(chatId: string, isPinned: boolean) {
-    if (
-      isHistoryLoading
-      || isWaiting
-      || deletingChatId
-      || pinningChatId
-    ) {
+    if (disabledSidebarActions.pinChat) {
       return;
     }
 
@@ -471,12 +606,7 @@ export default function Home() {
   }
 
   async function deleteChat(chatId: string) {
-    if (
-      isHistoryLoading
-      || deletingChatId
-      || isWaiting
-      || pinningChatId
-    ) {
+    if (disabledSidebarActions.deleteChat) {
       return;
     }
 
@@ -500,7 +630,8 @@ export default function Home() {
         currentChats.filter((chat) => chat.id !== chatId)
       );
 
-      if (activeChatId === chatId) {
+      if (activeChatIdRef.current === chatId) {
+        activeChatIdRef.current = null;
         setActiveChatId(null);
         setCancelledMessageIds([]);
         setMessages([]);
@@ -531,7 +662,11 @@ export default function Home() {
     }
   }
 
-  async function getResponse(userInput: string): Promise<ChatResponse> {
+  async function getResponse(
+    userInput: string,
+    conversationId: string,
+    messageId: string,
+  ): Promise<ChatResponse> {
     const response = await fetch(
       "/api/chat",
       {
@@ -539,9 +674,11 @@ export default function Home() {
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          "user_input": userInput
-        })
+        body: JSON.stringify(buildChatTurnPayload(
+          conversationId,
+          messageId,
+          userInput,
+        )),
       }
     )
 
@@ -572,6 +709,39 @@ export default function Home() {
         }
 
         const event = JSON.parse(line) as ChatStreamEvent;
+        if (event.type === "started") {
+          chatStartedRef.current = true;
+        }
+        if (
+          event.type === "started"
+          && cancelRequestedRef.current
+          && !cancelAcceptedRef.current
+        ) {
+          // A click can race the brief gap between saving the pending user
+          // message and the backend acquiring its run slot. Once "started"
+          // arrives, retry cancellation against the run we now know exists.
+          let cancellationAccepted = false;
+          try {
+            const cancellationResponse = await fetch("/api/chat/cancel", {
+              method: "POST",
+            });
+            if (cancellationResponse.ok) {
+              const cancellation = await cancellationResponse.json() as {
+                cancelling?: boolean;
+              };
+              cancellationAccepted = cancellation.cancelling === true;
+              cancelAcceptedRef.current = cancellationAccepted;
+            }
+          } catch {
+            // Keep reading the original stream. Its terminal event remains
+            // the source of truth for when the run guard has been released.
+          }
+          if (!cancellationAccepted && cancelRequestedRef.current) {
+            cancelRequestedRef.current = false;
+            setIsCancelling(false);
+            setHistoryError("The current response could not be cancelled.");
+          }
+        }
         if (event.type === "result") {
           return event.data;
         }
@@ -731,12 +901,7 @@ export default function Home() {
           isLoading={isHistoryLoading}
           deletingChatId={deletingChatId}
           pinningChatId={pinningChatId}
-          isChatActionBusy={
-            isHistoryLoading
-            || isWaiting
-            || deletingChatId !== null
-            || pinningChatId !== null
-          }
+          disabledActions={disabledSidebarActions}
           error={historyError}
           onNewChat={startNewChat}
           onSetChatPinned={setChatPinned}
@@ -820,7 +985,7 @@ export default function Home() {
                 )}
             </Fragment>
           ))}
-          {isWaiting && (
+          {isViewingRunningChat && (
             <div
               role="status"
               aria-label={isCancelling
@@ -864,6 +1029,7 @@ export default function Home() {
               className="flex-1 bg-transparent px-4
              placeholder:text-slate-600 outline-0 dark:placeholder:text-zinc-500"
               type="text"
+              maxLength={MAXIMUM_USER_INPUT_CHARACTERS}
               placeholder="Type here...."
               disabled={deletingChatId !== null || pinningChatId !== null}
               value={input ?? ""}
@@ -876,25 +1042,21 @@ export default function Home() {
             />
             <button
               type="button"
-              aria-label={isCancelling
-                ? "Cancelling response"
-                : isWaiting
-                  ? "Stop generating"
-                  : "Send message"}
-              disabled={
-                isWaiting
-                  ? isCancelling
-                  : isHistoryLoading
-                    || deletingChatId !== null
-                    || pinningChatId !== null
-              }
-              className={`rounded-full p-2 transition-colors disabled:cursor-not-allowed disabled:bg-slate-400 disabled:text-white/70 dark:disabled:bg-zinc-700 dark:disabled:text-zinc-400 ${isWaiting
+              aria-label={composerControl.action === "cancel"
+                ? isCancelling
+                  ? "Cancelling response"
+                  : "Stop generating"
+                : "Send message"}
+              disabled={composerControl.disabled}
+              className={`rounded-full p-2 transition-colors disabled:cursor-not-allowed disabled:bg-slate-400 disabled:text-white/70 dark:disabled:bg-zinc-700 dark:disabled:text-zinc-400 ${composerControl.action === "cancel"
                 ? "bg-slate-700 text-white hover:bg-red-600 dark:bg-zinc-200 dark:text-zinc-950 dark:hover:bg-red-500 dark:hover:text-white"
                 : "bg-black/95 text-white/90 dark:bg-zinc-100 dark:text-zinc-950"
                 }`}
-              onClick={isWaiting ? cancelPrompt : handleSend}
+              onClick={composerControl.action === "cancel"
+                ? cancelPrompt
+                : handleSend}
             >
-              {isWaiting ? (
+              {composerControl.action === "cancel" ? (
                 <svg
                   aria-hidden="true"
                   viewBox="0 0 24 24"

@@ -23,6 +23,10 @@ observing or cancelling another user's run. The browser cannot choose the
 header value. Trusted loopback clients such as `trace_viewer.py` omit the user
 header and act as operator clients.
 
+For chat, Next.js also verifies that `conversation_id` belongs to the
+authenticated user and loads the saved transcript from PostgreSQL. The
+browser cannot supply chat history directly to this service.
+
 ## Endpoints
 
 ### `GET /health`
@@ -164,8 +168,28 @@ from today, so a "last 7 days" run always overlaps the data.
 
 ## `POST /chat/`
 
-Request: `{"user_input": "..."}` (nonblank, at most 4,000 characters). A
-successful call returns an NDJSON stream
+Request:
+
+```json
+{
+  "conversation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_input": "Do it on some random machines",
+  "history": [
+    {"role": "user", "content": "maintenance correlation"},
+    {"role": "assistant", "content": "Which machines should I analyze?"}
+  ]
+}
+```
+
+`conversation_id` is a UUID. `user_input` is nonblank and at most 4,000
+characters. `history` is required, contains at most 20 messages as complete,
+alternating user/assistant pairs, and is limited to 64 KiB of UTF-8 text. The
+authenticated Next.js proxy constructs this bounded history from the
+owner-scoped PostgreSQL conversation. The backend replaces all in-process
+chat and workflow history from it on every request, so chat switches and
+backend restarts do not lose or leak context.
+
+A successful call returns an NDJSON stream
 (`application/x-ndjson`) so long reports do not look like an idle HTTP
 connection:
 
@@ -175,12 +199,22 @@ connection:
 {"type":"result","data":{"analysis":"..."}}
 ```
 
+That is the internal Python response. The authenticated Next.js proxy saves the
+assistant text to the same owner-scoped PostgreSQL conversation before exposing
+success to the browser, then adds the server-generated saved-message ID:
+`{"type":"result","data":{"analysis":"...","messageId":"<uuid>"}}`. The browser
+cannot submit that assistant row itself.
+
 Heartbeats arrive every 10 seconds until the terminal `result` or `error`
 event. Cancellation ends with
 `{"type":"result","data":{"status":"cancelled"}}`. The run guard is released
 before the terminal event is emitted, so completion also means the API is
 ready for the next prompt. Poll `/trace` in parallel for detailed live
-progress. Errors detected before streaming starts remain FastAPI-standard
+progress. `POST /cancel` signals the chat agent, Supervisor, and any active
+specialist, then prevents later phases and retries from starting. Cancellation
+is cooperative: Python already executing inside a tool, or a model request
+that has not started streaming, may still wait for its configured timeout.
+Errors detected before streaming starts remain FastAPI-standard
 `{"detail": "..."}`:
 
 | status | meaning |

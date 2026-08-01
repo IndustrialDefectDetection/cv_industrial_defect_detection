@@ -1,33 +1,25 @@
 import { randomUUID } from "node:crypto";
 import { auth, db, trustedAppOrigin } from "@/lib/auth";
+// Chat history mutations append one authenticated user message at a time.
+import {
+  MAXIMUM_STORED_MESSAGE_BYTES,
+  canAppendStoredMessage,
+  parseAppendUserMessageBody,
+  type StoredMessage,
+} from "@/lib/chat-history";
 import {
   hasExactKeys,
   isRecord,
   isUuid,
   readBoundedJson,
   requestProblemResponse,
-  utf8Length,
   validateJsonRequest,
   validateSameOrigin,
 } from "@/lib/request-security";
 
 const MAXIMUM_CHAT_HISTORY_REQUEST_BYTES = 320_000;
-const MAXIMUM_MESSAGES_PER_CHAT = 80;
-const MAXIMUM_MESSAGE_BYTES = 64_000;
-const MAXIMUM_TOTAL_MESSAGE_BYTES = 256_000;
 const MAXIMUM_METADATA_REQUEST_BYTES = 2_048;
 const MAXIMUM_PINNED_CHATS = 20;
-
-type StoredMessage = {
-  id: string;
-  text: string;
-  role: "user" | "assistant";
-};
-
-type SaveChatBody = {
-  conversationId?: string;
-  messages: StoredMessage[];
-};
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   const headers = new Headers(init.headers);
@@ -51,77 +43,6 @@ function validateMutationHeaders(request: Request): Response | null {
   }
 
   return null;
-}
-
-function parseStoredMessage(value: unknown): StoredMessage | null {
-  if (
-    !isRecord(value)
-    || !hasExactKeys(value, ["id", "role", "text"])
-    || typeof value.id !== "string"
-    || !isUuid(value.id)
-    || typeof value.text !== "string"
-    || value.text.trim().length === 0
-    || utf8Length(value.text) > MAXIMUM_MESSAGE_BYTES
-    || !["user", "assistant"].includes(
-      typeof value.role === "string" ? value.role : "",
-    )
-  ) {
-    return null;
-  }
-
-  return {
-    id: value.id,
-    text: value.text,
-    role: value.role as StoredMessage["role"],
-  };
-}
-
-function parseSaveChatBody(value: unknown): SaveChatBody | null {
-  if (
-    !isRecord(value)
-    || !Array.isArray(value.messages)
-    || value.messages.length === 0
-    || value.messages.length > MAXIMUM_MESSAGES_PER_CHAT
-  ) {
-    return null;
-  }
-
-  const expectedKeys = value.conversationId === undefined
-    ? ["messages"]
-    : ["conversationId", "messages"];
-  if (!hasExactKeys(value, expectedKeys)) {
-    return null;
-  }
-
-  const conversationId = value.conversationId;
-  if (
-    conversationId !== undefined
-    && (typeof conversationId !== "string" || !isUuid(conversationId))
-  ) {
-    return null;
-  }
-
-  const messages: StoredMessage[] = [];
-  let totalMessageBytes = 0;
-
-  for (const candidate of value.messages) {
-    const message = parseStoredMessage(candidate);
-    if (!message) {
-      return null;
-    }
-
-    totalMessageBytes += utf8Length(message.text);
-    if (totalMessageBytes > MAXIMUM_TOTAL_MESSAGE_BYTES) {
-      return null;
-    }
-
-    messages.push(message);
-  }
-
-  return {
-    conversationId,
-    messages,
-  };
 }
 
 async function getUserId(request: Request) {
@@ -247,89 +168,276 @@ export async function POST(request: Request) {
     return requestProblemResponse(parsedBody.problem);
   }
 
-  const body = parseSaveChatBody(parsedBody.value);
+  const body = parseAppendUserMessageBody(parsedBody.value);
   if (!body) {
-    return jsonResponse({ error: "Invalid chat messages" }, { status: 400 });
+    return jsonResponse(
+      { error: "Request must append exactly one user message" },
+      { status: 400 },
+    );
   }
 
-  const messages = body.messages;
-
-  const conversationId = body.conversationId ?? randomUUID();
-  const firstUserMessage = messages.find((message) => message.role === "user");
-  const title = firstUserMessage?.text.trim().slice(0, 60) || "New chat";
   const client = await db.connect();
-  let isPinned = false;
 
   try {
     await client.query("BEGIN");
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtext($1))",
+      [userId],
+    );
 
-    if (body.conversationId) {
-      const updatedConversation = await client.query<{ is_pinned: boolean }>(
+    const existingMessage = await client.query<{
+      conversation_id: string;
+      role: "user" | "assistant";
+      content: string;
+      user_id: string;
+    }>(
+      `
+        SELECT m.conversation_id, m.role, m.content, c.user_id
+        FROM message AS m
+        INNER JOIN conversation AS c ON c.id = m.conversation_id
+        WHERE m.id = $1
+      `,
+      [body.message.id],
+    );
+
+    let conversationId = body.conversationId;
+    if (!conversationId && existingMessage.rowCount) {
+      const existing = existingMessage.rows[0];
+      if (
+        existing.user_id !== userId
+        || existing.role !== "user"
+        || existing.content !== body.message.text
+      ) {
+        await client.query("ROLLBACK");
+        return jsonResponse(
+          { error: "Message conflicts with saved chat history" },
+          { status: 409 },
+        );
+      }
+      conversationId = existing.conversation_id;
+    }
+
+    const title = body.message.text.trim().slice(0, 60) || "New chat";
+    let conversation: {
+      id: string;
+      title: string;
+      is_pinned: boolean;
+      updated_at: Date;
+    };
+
+    if (conversationId) {
+      const currentConversation = await client.query<{
+        id: string;
+        title: string;
+        is_pinned: boolean;
+        updated_at: Date;
+      }>(
         `
-          UPDATE conversation
-          SET title = $1, updated_at = now()
-          WHERE id = $2 AND user_id = $3
-          RETURNING is_pinned
+          SELECT id, title, is_pinned, updated_at
+          FROM conversation
+          WHERE id = $1 AND user_id = $2
+          FOR UPDATE
         `,
-        [title, conversationId, userId],
+        [conversationId, userId],
       );
 
-      if (updatedConversation.rowCount === 0) {
+      if (currentConversation.rowCount === 0) {
         await client.query("ROLLBACK");
         return jsonResponse({ error: "Chat not found" }, { status: 404 });
       }
 
-      isPinned = updatedConversation.rows[0].is_pinned;
+      conversation = currentConversation.rows[0];
     } else {
-      await client.query(
+      conversationId = randomUUID();
+      const createdConversation = await client.query<{
+        id: string;
+        title: string;
+        is_pinned: boolean;
+        updated_at: Date;
+      }>(
         `
           INSERT INTO conversation (id, user_id, title)
           VALUES ($1, $2, $3)
+          RETURNING id, title, is_pinned, updated_at
         `,
         [conversationId, userId, title],
       );
+      conversation = createdConversation.rows[0];
     }
 
-    await client.query(
-      "DELETE FROM message WHERE conversation_id = $1",
-      [conversationId],
-    );
-
-    for (const [position, message] of messages.entries()) {
-      await client.query(
-        `
-          INSERT INTO message (id, conversation_id, role, content, position)
-          VALUES ($1, $2, $3, $4, $5)
-        `,
-        [message.id, conversationId, message.role, message.text, position],
+    const existing = existingMessage.rows[0];
+    if (
+      existing
+      && (
+        existing.user_id !== userId
+        || existing.conversation_id !== conversationId
+        || existing.role !== "user"
+        || existing.content !== body.message.text
+      )
+    ) {
+      await client.query("ROLLBACK");
+      return jsonResponse(
+        { error: "Message conflicts with saved chat history" },
+        { status: 409 },
       );
     }
 
+    if (!existing) {
+      const totals = await client.query<{
+        message_count: number;
+        total_bytes: number;
+      }>(
+        `
+          SELECT
+            COUNT(*)::integer AS message_count,
+            COALESCE(SUM(octet_length(content)), 0)::integer AS total_bytes
+          FROM message
+          WHERE conversation_id = $1
+        `,
+        [conversationId],
+      );
+
+      if (!canAppendStoredMessage(
+        totals.rows[0].message_count,
+        totals.rows[0].total_bytes,
+        body.message.text,
+        1,
+        MAXIMUM_STORED_MESSAGE_BYTES,
+      )) {
+        await client.query("ROLLBACK");
+        return jsonResponse(
+          { error: "Chat history limit reached; start a new chat" },
+          { status: 409 },
+        );
+      }
+
+      const nextPosition = await client.query<{ position: number }>(
+        `
+          SELECT COALESCE(MAX(position), -1)::integer + 1 AS position
+          FROM message
+          WHERE conversation_id = $1
+        `,
+        [conversationId],
+      );
+      const insertedMessage = await client.query<{ id: string }>(
+        `
+          INSERT INTO message (id, conversation_id, role, content, position)
+          VALUES ($1, $2, 'user', $3, $4)
+          ON CONFLICT (id) DO NOTHING
+          RETURNING id
+        `,
+        [
+          body.message.id,
+          conversationId,
+          body.message.text,
+          nextPosition.rows[0].position,
+        ],
+      );
+
+      if (insertedMessage.rowCount === 0) {
+        const conflict = await client.query<{
+          conversation_id: string;
+          role: "user" | "assistant";
+          content: string;
+          user_id: string;
+        }>(
+          `
+            SELECT m.conversation_id, m.role, m.content, c.user_id
+            FROM message AS m
+            INNER JOIN conversation AS c ON c.id = m.conversation_id
+            WHERE m.id = $1
+          `,
+          [body.message.id],
+        );
+        const matching = conflict.rows[0];
+        if (
+          !matching
+          || matching.user_id !== userId
+          || matching.conversation_id !== conversationId
+          || matching.role !== "user"
+          || matching.content !== body.message.text
+        ) {
+          await client.query("ROLLBACK");
+          return jsonResponse(
+            { error: "Message conflicts with saved chat history" },
+            { status: 409 },
+          );
+        }
+      }
+    }
+
+    const updatedConversation = await client.query<{
+      updated_at: Date;
+    }>(
+      `
+        UPDATE conversation
+        SET updated_at = now()
+        WHERE id = $1 AND user_id = $2
+        RETURNING updated_at
+      `,
+      [conversationId, userId],
+    );
+    conversation = {
+      ...conversation,
+      updated_at: updatedConversation.rows[0].updated_at,
+    };
+
     await client.query(
       `
-        DELETE FROM conversation
-        WHERE user_id = $1
-          AND is_pinned = false
-          AND id NOT IN (
+        DELETE FROM conversation AS stale
+        WHERE stale.user_id = $1
+          AND stale.is_pinned = false
+          AND stale.id NOT IN (
             SELECT id
             FROM conversation
             WHERE user_id = $1 AND is_pinned = false
             ORDER BY updated_at DESC
             LIMIT 10
           )
+          AND (
+            COALESCE(
+              (
+                SELECT role
+                FROM message
+                WHERE conversation_id = stale.id
+                ORDER BY position DESC
+                LIMIT 1
+              ),
+              'assistant'
+            ) <> 'user'
+            OR stale.updated_at < now() - interval '15 minutes'
+          )
       `,
       [userId],
+    );
+
+    const savedMessages = await client.query<{
+      id: string;
+      role: "user" | "assistant";
+      content: string;
+    }>(
+      `
+        SELECT id, role, content
+        FROM message
+        WHERE conversation_id = $1
+        ORDER BY position
+      `,
+      [conversationId],
     );
 
     await client.query("COMMIT");
 
     return jsonResponse({
       chat: {
-        id: conversationId,
-        title,
-        isPinned,
-        updatedAt: new Date().toISOString(),
-        messages,
+        id: conversation.id,
+        title: conversation.title,
+        isPinned: conversation.is_pinned,
+        updatedAt: conversation.updated_at.toISOString(),
+        messages: savedMessages.rows.map((message) => ({
+          id: message.id,
+          role: message.role,
+          text: message.content,
+        })),
       },
     });
   } catch (error) {

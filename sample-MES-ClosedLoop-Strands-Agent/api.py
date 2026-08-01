@@ -3,7 +3,7 @@
 Endpoints (full contract with examples: TRACE_API.md):
   POST /analysis       run the structured, traced defect-analysis workflow
   POST /investigate    root-cause a camera-flagged defect burst (the bridge)
-  POST /cancel         stop the in-flight run at its next checkpoint
+  POST /cancel         stop all active agents in the in-flight run
   POST /chat/          run a traced supervisor-agent chat turn
   GET  /trace?since=N  live "under the hood" event stream (poll this)
   GET  /health         config/readiness report — first stop when debugging
@@ -28,7 +28,8 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Callable, Literal
+from uuid import UUID
 
 # Windows: use selector-based event loops, not the default proactor.
 #
@@ -85,11 +86,12 @@ _run_guard = threading.Lock()
 _RUN_OWNER_LOCK = threading.Lock()
 _active_run_owner: str | None = None
 _trace_owner: str | None = None
-_conversation_owner: str | None = None
 _CHAT_HEARTBEAT_SECONDS = 10
 _RUN_BUDGET_LOCK = threading.Lock()
 _RUN_STARTS: deque[float] = deque()
 _RUN_BUDGET_WINDOW_SECONDS = 60 * 60
+_MAX_CHAT_CONTEXT_MESSAGES = 20
+_MAX_CHAT_CONTEXT_BYTES = 64 * 1024
 
 
 def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -312,7 +314,10 @@ def _reserve_run_budget() -> None:
         _RUN_STARTS.append(now)
 
 
-def _acquire_run_slot(owner: str = "service") -> None:
+def _acquire_run_slot(
+    owner: str = "service",
+    on_acquired: Callable[[], None] | None = None,
+) -> None:
     global _active_run_owner, _trace_owner
     with _RUN_OWNER_LOCK:
         if not _run_guard.acquire(blocking=False):
@@ -327,8 +332,11 @@ def _acquire_run_slot(owner: str = "service") -> None:
             tracer.reset()
             _active_run_owner = owner
             _trace_owner = owner
+            if on_acquired is not None:
+                on_acquired()
         except BaseException:
             _active_run_owner = None
+            _trace_owner = None
             _run_guard.release()
             raise
 
@@ -397,10 +405,50 @@ app = FastAPI(
 app.add_middleware(InternalBoundaryMiddleware, max_body_bytes=1024 * 1024)
 
 
+class ChatHistoryMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=_MAX_CHAT_CONTEXT_BYTES)
+
+    @field_validator("content")
+    @classmethod
+    def content_cannot_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("history content cannot be blank")
+        return value
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    conversation_id: UUID
     user_input: str = Field(min_length=1, max_length=4_000)
+    history: list[ChatHistoryMessage] = Field(
+        max_length=_MAX_CHAT_CONTEXT_MESSAGES,
+    )
+
+    @field_validator("history")
+    @classmethod
+    def history_is_bounded_and_complete(
+        cls,
+        value: list[ChatHistoryMessage],
+    ) -> list[ChatHistoryMessage]:
+        for index, message in enumerate(value):
+            expected_role = "user" if index % 2 == 0 else "assistant"
+            if message.role != expected_role:
+                raise ValueError(
+                    "history must contain complete user/assistant turns"
+                )
+        if len(value) % 2 != 0:
+            raise ValueError(
+                "history must contain complete user/assistant turns"
+            )
+        if sum(len(message.content.encode("utf-8")) for message in value) > (
+            _MAX_CHAT_CONTEXT_BYTES
+        ):
+            raise ValueError("history is too large")
+        return value
 
 
 class AnalysisRequest(BaseModel):
@@ -610,9 +658,11 @@ def investigate(request: BurstRequest):
 def cancel_run(user_id: UserIdHeader = None):
     """Ask the in-flight run to stop at its next checkpoint.
 
-    Returns immediately; cancellation is cooperative, so the run unwinds
-    within seconds (at its next subagent delegation or database query) and
-    the original /analysis call returns with status 'cancelled'.
+    Returns immediately. The manager signals every active nested agent and
+    prevents later phases or retries from starting. Strands cancellation is
+    cooperative, so an already-running Python tool or a model request that has
+    not started streaming may still wait for its configured timeout. The
+    original streaming request ends with status 'cancelled' after it unwinds.
     """
     if _manager is None:
         raise _manager_not_ready()
@@ -665,7 +715,6 @@ def run_analysis(request: AnalysisRequest):
 
 @app.post("/chat/", dependencies=INTERNAL_API_AUTH)
 def send_message(message: ChatRequest, user_id: UserIdHeader = None):
-    global _conversation_owner
     if _manager is None:
         raise _manager_not_ready()
     if user_id is None:
@@ -680,19 +729,21 @@ def send_message(message: ChatRequest, user_id: UserIdHeader = None):
             detail="user_input cannot be blank",
         )
     owner = _user_owner(user_id)
-    _acquire_run_slot(owner)
-    if _conversation_owner != owner:
-        try:
-            _manager.reset_chat_history()
-            _conversation_owner = owner
-        except Exception:
-            _release_run_slot()
-            raise
+    _acquire_run_slot(
+        owner,
+        on_acquired=_manager.prepare_chat_request,
+    )
 
     terminal_events: queue.Queue[dict] = queue.Queue(maxsize=1)
     worker = threading.Thread(
         target=_run_chat_worker,
-        args=(_manager, query, terminal_events),
+        args=(
+            _manager,
+            query,
+            str(message.conversation_id),
+            [history.model_dump() for history in message.history],
+            terminal_events,
+        ),
         name="mes-chat-run",
         daemon=True,
     )
@@ -712,12 +763,24 @@ def send_message(message: ChatRequest, user_id: UserIdHeader = None):
     )
 
 
-def _run_chat_worker(manager, query: str, terminal_events: queue.Queue[dict]):
+def _run_chat_worker(
+    manager,
+    query: str,
+    conversation_id: str,
+    history: list[dict[str, str]],
+    terminal_events: queue.Queue[dict],
+):
     """Run the blocking agent stack while the response stream stays alive."""
     terminal_event: dict
     try:
-        tracer.run_start(f"Chat: {query[:80]}", params={"user_input": query[:200]})
-        response = manager.run_chat(query)
+        tracer.run_start(
+            f"Chat: {query[:80]}",
+            params={
+                "conversation_id": conversation_id,
+                "user_input": query[:200],
+            },
+        )
+        response = manager.run_chat(query, history)
         if response.stop_reason == "cancelled":
             tracer.run_end("cancelled")
             terminal_event = {

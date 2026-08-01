@@ -1,3 +1,5 @@
+import type { ChatSidebarDisabledState } from "@/lib/chat-interactions";
+
 type AppSidebarProps = {
   hasMessages?: boolean;
   chats: {
@@ -10,7 +12,7 @@ type AppSidebarProps = {
   isLoading: boolean;
   deletingChatId: string | null;
   pinningChatId: string | null;
-  isChatActionBusy: boolean;
+  disabledActions: ChatSidebarDisabledState;
   error: string | null;
   onNewChat: () => void;
   onSetChatPinned: (chatId: string, isPinned: boolean) => void;
@@ -27,7 +29,7 @@ export default function AppSidebar({
   isLoading,
   deletingChatId,
   pinningChatId,
-  isChatActionBusy,
+  disabledActions,
   error,
   onNewChat,
   onSetChatPinned,
@@ -54,7 +56,7 @@ export default function AppSidebar({
       <button
         type="button"
         onClick={onNewChat}
-        disabled={isChatActionBusy}
+        disabled={disabledActions.newChat}
         className="relative w-fit rounded-md border border-slate-300/80 bg-white/65 px-3 py-2 text-left text-sm font-normal text-slate-700 shadow-sm transition hover:border-blue-400 hover:bg-white disabled:cursor-not-allowed disabled:opacity-55 dark:border-[#303238] dark:bg-[#17181c] dark:text-zinc-200 dark:hover:border-zinc-500 dark:hover:bg-[#202126]"
       >
         + New chat
@@ -79,7 +81,6 @@ export default function AppSidebar({
               const isActive = activeChatId === chat.id;
               const isDeleting = deletingChatId === chat.id;
               const isPinning = pinningChatId === chat.id;
-              const isDeleteDisabled = isChatActionBusy;
               const isEntering = enteringChatId === chat.id;
 
               return (
@@ -96,7 +97,7 @@ export default function AppSidebar({
                     <button
                       type="button"
                       onClick={() => onSelectChat(chat.id)}
-                      disabled={isChatActionBusy}
+                      disabled={disabledActions.selectChat}
                       className={`block min-w-0 w-full truncate rounded-md border py-2.5 pl-4 pr-[5rem] text-left text-sm font-normal shadow-[0_3px_10px_rgba(71,85,105,0.04)] transition disabled:cursor-not-allowed disabled:opacity-55 dark:shadow-[0_4px_12px_rgba(0,0,0,0.12)] ${isActive
                         ? "border-blue-200/80 bg-blue-100/90 text-blue-950 dark:border-[#383b44] dark:bg-[#25272d] dark:text-zinc-100"
                         : "border-slate-200/70 bg-white/45 text-slate-700 hover:border-slate-300/80 hover:bg-white/75 hover:text-slate-950 dark:border-[#23252a] dark:bg-[#131418]/85 dark:text-zinc-300 dark:hover:border-[#303238] dark:hover:bg-[#191a1f] dark:hover:text-zinc-100"
@@ -110,7 +111,7 @@ export default function AppSidebar({
                       <button
                         type="button"
                         onClick={() => onSetChatPinned(chat.id, !chat.isPinned)}
-                        disabled={isChatActionBusy}
+                        disabled={disabledActions.pinChat}
                         aria-label={isPinning
                           ? `Updating pin for ${chat.title}`
                           : chat.isPinned
@@ -142,7 +143,7 @@ export default function AppSidebar({
                       <button
                         type="button"
                         onClick={() => onDeleteChat(chat.id)}
-                        disabled={isDeleteDisabled}
+                        disabled={disabledActions.deleteChat}
                         aria-label={isDeleting
                           ? `Deleting ${chat.title}`
                           : `Delete ${chat.title}`}

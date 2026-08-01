@@ -6,6 +6,7 @@ import queue
 import threading
 
 import api
+import pytest
 from strands_agent import RunCancelled
 
 
@@ -21,8 +22,15 @@ class FakeManager:
         self.error = error
         self.cancelled = False
         self.reset_calls = 0
+        self.chat_calls = []
+        self.prepare_calls = 0
 
-    def run_chat(self, query):
+    def prepare_chat_request(self):
+        self.cancelled = False
+        self.prepare_calls += 1
+
+    def run_chat(self, query, history):
+        self.chat_calls.append((query, history))
         if self.error:
             raise self.error
         return self.result
@@ -32,6 +40,18 @@ class FakeManager:
 
     def reset_chat_history(self):
         self.reset_calls += 1
+
+
+def chat_request(
+    user_input="run it",
+    conversation_id="550e8400-e29b-41d4-a716-446655440000",
+    history=None,
+):
+    return api.ChatRequest(
+        conversation_id=conversation_id,
+        user_input=user_input,
+        history=[] if history is None else history,
+    )
 
 
 async def response_lines(response):
@@ -49,7 +69,7 @@ def test_chat_stream_starts_immediately_and_finishes_after_unlock(monkeypatch):
     manager = FakeManager(FakeResult("the report"))
     monkeypatch.setattr(api, "_manager", manager)
 
-    response = api.send_message(api.ChatRequest(user_input="run it"), user_id="user-1")
+    response = api.send_message(chat_request(), user_id="user-1")
     events = asyncio.run(response_lines(response))
 
     assert response.media_type == "application/x-ndjson"
@@ -57,14 +77,54 @@ def test_chat_stream_starts_immediately_and_finishes_after_unlock(monkeypatch):
         {"type": "started"},
         {"type": "result", "data": {"analysis": "the report"}},
     ]
+    assert manager.prepare_calls == 1
     assert not api._run_guard.locked()
+
+
+def test_chat_request_preparation_runs_inside_owner_transition(monkeypatch):
+    prepared = []
+
+    def prepare():
+        assert api._run_guard.locked()
+        assert api._active_run_owner == "user:alice"
+        assert not api._RUN_OWNER_LOCK.acquire(blocking=False)
+        prepared.append(True)
+
+    with api._RUN_BUDGET_LOCK:
+        api._RUN_STARTS.clear()
+    api._acquire_run_slot("user:alice", on_acquired=prepare)
+    try:
+        assert prepared == [True]
+    finally:
+        api._release_run_slot()
+
+
+def test_failed_chat_request_preparation_releases_run_slot():
+    def fail_preparation():
+        raise RuntimeError("preparation failed")
+
+    with api._RUN_BUDGET_LOCK:
+        api._RUN_STARTS.clear()
+    try:
+        with pytest.raises(RuntimeError, match="preparation failed"):
+            api._acquire_run_slot(
+                "user:alice",
+                on_acquired=fail_preparation,
+            )
+
+        assert api._active_run_owner is None
+        assert api._trace_owner is None
+        assert not api._run_guard.locked()
+    finally:
+        if api._run_guard.locked():
+            api._release_run_slot()
 
 
 def test_cancelled_run_is_a_terminal_result(monkeypatch):
     manager = FakeManager(error=RunCancelled("stop"))
     monkeypatch.setattr(api, "_manager", manager)
 
-    response = api.send_message(api.ChatRequest(user_input="run it"), user_id="user-1")
+    response = api.send_message(chat_request(), user_id="user-1")
     events = asyncio.run(response_lines(response))
 
     assert events[-1] == {
@@ -78,7 +138,7 @@ def test_failed_run_is_streamed_after_unlock(monkeypatch):
     manager = FakeManager(error=ValueError("bad result"))
     monkeypatch.setattr(api, "_manager", manager)
 
-    response = api.send_message(api.ChatRequest(user_input="run it"), user_id="user-1")
+    response = api.send_message(chat_request(), user_id="user-1")
     events = asyncio.run(response_lines(response))
 
     assert events[-1] == {
@@ -90,19 +150,37 @@ def test_failed_run_is_streamed_after_unlock(monkeypatch):
     assert not api._run_guard.locked()
 
 
-def test_a_different_user_gets_a_fresh_conversation(monkeypatch):
+def test_each_conversation_supplies_its_own_saved_history(monkeypatch):
     manager = FakeManager(FakeResult("private-safe"))
     monkeypatch.setattr(api, "_manager", manager)
-    monkeypatch.setattr(api, "_conversation_owner", "user:alice")
 
-    response = api.send_message(
-        api.ChatRequest(user_input="my first question"),
-        user_id="bob",
+    first_history = [
+        {"role": "user", "content": "maintenance correlation"},
+        {"role": "assistant", "content": "Which machines?"},
+    ]
+    first_response = api.send_message(
+        chat_request(
+            user_input="choose random machines",
+            history=first_history,
+        ),
+        user_id="same-user",
     )
-    asyncio.run(response_lines(response))
+    asyncio.run(response_lines(first_response))
 
-    assert manager.reset_calls == 1
-    assert api._conversation_owner == "user:bob"
+    second_response = api.send_message(
+        chat_request(
+            user_input="start fresh",
+            conversation_id="6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            history=[],
+        ),
+        user_id="same-user",
+    )
+    asyncio.run(response_lines(second_response))
+
+    assert manager.chat_calls == [
+        ("choose random machines", first_history),
+        ("start fresh", []),
+    ]
 
 
 def test_stream_sends_heartbeats_until_the_terminal_event():
@@ -170,6 +248,60 @@ def test_disconnect_requests_backend_cancellation():
         assert manager.cancelled
         assert not worker.is_alive()
     finally:
+        if api._run_guard.locked():
+            api._release_run_slot()
+
+
+def test_cancel_endpoint_finishes_the_original_stream_and_releases_guard(
+    monkeypatch,
+):
+    class BlockingManager(FakeManager):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.stop_requested = threading.Event()
+
+        def run_chat(self, query, history):
+            self.started.set()
+            if not self.stop_requested.wait(timeout=1):
+                raise AssertionError("cancel did not reach the chat worker")
+            raise RunCancelled("cancelled")
+
+        def cancel(self):
+            super().cancel()
+            self.stop_requested.set()
+
+    manager = BlockingManager()
+    monkeypatch.setattr(api, "_manager", manager)
+    with api._RUN_BUDGET_LOCK:
+        api._RUN_STARTS.clear()
+
+    response = api.send_message(chat_request(), user_id="same-user")
+    events = []
+
+    def consume_stream():
+        events.extend(asyncio.run(response_lines(response)))
+
+    stream_thread = threading.Thread(target=consume_stream, daemon=True)
+    stream_thread.start()
+    try:
+        assert manager.started.wait(timeout=1)
+        cancellation = api.cancel_run(user_id="same-user")
+        stream_thread.join(timeout=1)
+
+        assert cancellation == {
+            "cancelling": True,
+            "detail": "Cancelling the run",
+        }
+        assert not stream_thread.is_alive()
+        assert events == [
+            {"type": "started"},
+            {"type": "result", "data": {"status": "cancelled"}},
+        ]
+        assert not api._run_guard.locked()
+    finally:
+        manager.stop_requested.set()
+        stream_thread.join(timeout=1)
         if api._run_guard.locked():
             api._release_run_slot()
 

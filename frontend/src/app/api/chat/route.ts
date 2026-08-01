@@ -1,22 +1,137 @@
-import { auth, trustedAppOrigin } from "@/lib/auth";
+import { randomUUID } from "node:crypto";
+import { auth, db, trustedAppOrigin } from "@/lib/auth";
+import {
+  buildBackendChatRequest,
+  loadOwnedChatContext,
+  parseChatTurnBody,
+} from "@/lib/chat-context";
+import {
+  MAXIMUM_STORED_MESSAGE_BYTES,
+  canAppendStoredMessage,
+} from "@/lib/chat-history";
 import { chatQuota } from "@/lib/chat-quota";
+import { createPersistingChatStream } from "@/lib/chat-stream";
 import {
   fetchMesBackend,
   isBackendContentType,
   sanitizedBackendErrorResponse,
 } from "@/lib/mes-backend";
 import {
-  hasExactKeys,
-  isRecord,
   readBoundedJson,
   requestProblemResponse,
+  utf8Length,
   validateJsonRequest,
   validateSameOrigin,
 } from "@/lib/request-security";
 
-const MAXIMUM_CHAT_REQUEST_BYTES = 8_192;
-const MAXIMUM_USER_INPUT_CHARACTERS = 4_000;
+const MAXIMUM_CHAT_REQUEST_BYTES = 32_000;
 const BACKEND_CHAT_TIMEOUT_MILLISECONDS = 10 * 60 * 1_000;
+
+async function persistAssistantMessage(
+  userId: string,
+  conversationId: string,
+  currentMessageId: string,
+  analysis: string,
+): Promise<string> {
+  if (
+    analysis.trim().length === 0
+    || utf8Length(analysis) > MAXIMUM_STORED_MESSAGE_BYTES
+  ) {
+    throw new Error("Assistant response exceeded the saved-message limit");
+  }
+
+  const client = await db.connect();
+  const assistantMessageId = randomUUID();
+
+  try {
+    await client.query("BEGIN");
+    const conversation = await client.query<{ id: string }>(
+      `
+        SELECT id
+        FROM conversation
+        WHERE id = $1 AND user_id = $2
+        FOR UPDATE
+      `,
+      [conversationId, userId],
+    );
+    if (conversation.rowCount === 0) {
+      throw new Error("Conversation is no longer available");
+    }
+
+    const latestMessage = await client.query<{
+      id: string;
+      role: "user" | "assistant";
+      position: number;
+    }>(
+      `
+        SELECT id, role, position
+        FROM message
+        WHERE conversation_id = $1
+        ORDER BY position DESC
+        LIMIT 1
+      `,
+      [conversationId],
+    );
+    const currentMessage = latestMessage.rows[0];
+    if (
+      !currentMessage
+      || currentMessage.id !== currentMessageId
+      || currentMessage.role !== "user"
+    ) {
+      throw new Error("Conversation changed before the response was saved");
+    }
+
+    const totals = await client.query<{
+      message_count: number;
+      total_bytes: number;
+    }>(
+      `
+        SELECT
+          COUNT(*)::integer AS message_count,
+          COALESCE(SUM(octet_length(content)), 0)::integer AS total_bytes
+        FROM message
+        WHERE conversation_id = $1
+      `,
+      [conversationId],
+    );
+    if (!canAppendStoredMessage(
+      totals.rows[0].message_count,
+      totals.rows[0].total_bytes,
+      analysis,
+    )) {
+      throw new Error("Conversation reached the saved-history limit");
+    }
+
+    await client.query(
+      `
+        INSERT INTO message (id, conversation_id, role, content, position)
+        VALUES ($1, $2, 'assistant', $3, $4)
+      `,
+      [
+        assistantMessageId,
+        conversationId,
+        analysis,
+        currentMessage.position + 1,
+      ],
+    );
+    await client.query(
+      `
+        UPDATE conversation
+        SET updated_at = now()
+        WHERE id = $1 AND user_id = $2
+      `,
+      [conversationId, userId],
+    );
+    await client.query("COMMIT");
+    return assistantMessageId;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Failed to persist assistant response:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 export async function POST(request: Request) {
   const session = await auth.api.getSession({
@@ -45,13 +160,12 @@ export async function POST(request: Request) {
     return requestProblemResponse(parsedBody.problem);
   }
 
-  if (
-    !isRecord(parsedBody.value)
-    || !hasExactKeys(parsedBody.value, ["user_input"])
-    || typeof parsedBody.value.user_input !== "string"
-  ) {
+  const chatTurn = parseChatTurnBody(parsedBody.value);
+  if (!chatTurn) {
     return Response.json(
-      { error: "Request body must contain only a user_input string" },
+      {
+        error: "Request body must contain conversationId, messageId, and user_input",
+      },
       {
         status: 400,
         headers: {
@@ -61,17 +175,45 @@ export async function POST(request: Request) {
     );
   }
 
-  const userInput = parsedBody.value.user_input.trim();
-  if (
-    userInput.length === 0
-    || userInput.length > MAXIMUM_USER_INPUT_CHARACTERS
-  ) {
+  let context: Awaited<ReturnType<typeof loadOwnedChatContext>>;
+  try {
+    context = await loadOwnedChatContext(
+      (sql, parameters) => db.query(sql, parameters),
+      session.user.id,
+      chatTurn.conversationId,
+      chatTurn.messageId,
+      chatTurn.userInput,
+    );
+  } catch (error) {
+    console.error("Failed to load chat context:", error);
     return Response.json(
+      { error: "Unable to load chat context" },
       {
-        error: `user_input must be between 1 and ${MAXIMUM_USER_INPUT_CHARACTERS} characters`,
+        status: 500,
+        headers: {
+          "Cache-Control": "no-store",
+        },
       },
+    );
+  }
+
+  if (context.status === "not_found") {
+    return Response.json(
+      { error: "Chat not found" },
       {
-        status: 400,
+        status: 404,
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      },
+    );
+  }
+
+  if (context.status === "conflict") {
+    return Response.json(
+      { error: "Chat changed before the analysis started" },
+      {
+        status: 409,
         headers: {
           "Cache-Control": "no-store",
         },
@@ -101,11 +243,16 @@ export async function POST(request: Request) {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        user_input: userInput,
-      }),
+      body: JSON.stringify(buildBackendChatRequest(
+        chatTurn.conversationId,
+        chatTurn.userInput,
+        context.history,
+      )),
       cache: "no-store",
-      signal: AbortSignal.timeout(BACKEND_CHAT_TIMEOUT_MILLISECONDS),
+      signal: AbortSignal.any([
+        request.signal,
+        AbortSignal.timeout(BACKEND_CHAT_TIMEOUT_MILLISECONDS),
+      ]),
     });
   } catch {
     return Response.json(
@@ -148,7 +295,17 @@ export async function POST(request: Request) {
     );
   }
 
-  return new Response(response.body, {
+  const persistedStream = createPersistingChatStream(
+    response.body,
+    (analysis) => persistAssistantMessage(
+      session.user.id,
+      chatTurn.conversationId,
+      chatTurn.messageId,
+      analysis,
+    ),
+  );
+
+  return new Response(persistedStream, {
     status: response.status,
     headers: {
       "Content-Type": "application/x-ndjson",

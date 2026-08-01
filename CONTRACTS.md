@@ -30,6 +30,42 @@ Database: `mes.db` at the **root of industrial-data-store-simulation-chatbot** (
 - Tokens must contain at least 32 characters. Missing or short tokens fail
   closed; do not add an insecure fallback.
 
+### Authenticated chat context
+
+- Before inference, the browser appends exactly one pending user message
+  through `POST /api/chats` as
+  `{"conversationId":"<uuid, omitted for a new chat>","message":{"id":"<uuid>","role":"user","text":"..."}}`.
+  That authenticated route creates or locks the owner-scoped PostgreSQL
+  conversation, appends at the next position, and returns its server-issued
+  conversation UUID plus the authoritative ordered transcript. It is
+  idempotent by user-message ID and never accepts an assistant message or a
+  browser-supplied replacement transcript.
+- The browser then calls `POST /api/chat` with exactly
+  `{"conversationId":"<uuid>","messageId":"<uuid>","user_input":"..."}`.
+  It never sends prior messages or a user ID.
+- Next.js verifies `conversation.user_id` against the Better Auth session,
+  requires the newest stored message ID and text to match the current user
+  input, excludes that current message, and loads at most the 20 newest prior
+  messages that form complete user/assistant pairs, with at most 64 KiB of
+  UTF-8 content. Missing, non-owned, or changed conversations fail closed
+  instead of running without the intended context.
+- Next.js forwards the internal agent request as
+  `{"conversation_id":"<uuid>","user_input":"...","history":[{"role":"user|assistant","content":"..."}]}`.
+  The Python backend replaces its conversational and workflow-agent histories
+  from that bounded transcript before every turn. PostgreSQL, not process
+  memory, is the durable source of chat context.
+- When the Python stream returns an analysis, Next.js verifies that the same
+  pending user message is still newest, writes a server-generated assistant
+  message into that owned conversation, and only then forwards the terminal
+  result with the saved `messageId`. Cancelled and failed runs do not create an
+  assistant row. A browser can display assistant text but cannot author it.
+- A conversation stores at most 80 messages and 256,000 UTF-8 bytes. User
+  prompts are limited to 4,000 JavaScript string units, and one assistant slot
+  with up to 64,000 UTF-8 bytes is reserved before starting inference.
+  Historical rows created before this server-authored boundary are legacy data;
+  deployments that require verified provenance must migrate or clear those rows
+  separately.
+
 ## 2. Detection payload — simulator → bridge
 
 The simulator POSTs one JSON object to `http://localhost:8081/detection` per analyzed image. `detections` is passed through **unchanged** from the API's `/predict` response; the simulator adds the envelope fields.
