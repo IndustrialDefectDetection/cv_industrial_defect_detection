@@ -1,4 +1,122 @@
-# MES Agentic AI 
+# CV → MES Agentic Defect Detection
+
+A YOLOv8 camera watching a steel production line, wired into a synthetic
+Manufacturing Execution System, where a supervisor-orchestrated team of Claude
+agents investigates each defect burst and writes an evidence-backed root-cause
+report.
+
+The camera only ever sees pixels. Everything else in the report — which machine,
+which work order, which product, which operator, which shift — the agents find
+for themselves by querying the MES.
+
+```
+camera image
+   ↓  POST /predict            YOLOv8n, 6 NEU-DET defect classes      ~50 ms
+inference API (8080)
+   ↓  POST /detection          every detection stored
+bridge (8081)                  confidence gate ≥ 0.80, 30-second batch window
+   ↓  analyze_batch()          returns an AlertID in under a second
+   ↓  POST /investigate
+agent backend (8000)           Supervisor → Monitor → Analyzer, over PostgreSQL
+   ↓
+AgentAlerts row               pending → analyzing → done, report attached
+   ↓
+trace dashboard (8502)         live view of every agent, tool call and query
+```
+
+## Quickstart
+
+```bash
+python Launch.py     # starts all five services; refuses to start if a port is taken
+```
+
+Opens the chat at `localhost:3000`; the trace dashboard is at `localhost:8502`.
+Then fire a camera burst from a second terminal:
+
+```bash
+cd industrial-data-store-simulation-chatbot
+../sample-MES-ClosedLoop-Strands-Agent/.venv/Scripts/python.exe -m bridge.simulator \
+    --image-dir ../steel-defect-detection-mlops/data/demo_burst --interval 0.5
+```
+
+Within about a minute a new alert appears on the dashboard and moves from
+`analyzing` to `done` with a full report.
+
+Prerequisites: PostgreSQL with `mescopy_v1`, the three per-project virtualenvs,
+and a `.env` at the repo root — copy `.env.example`, fill in `ANTHROPIC_API_KEY`
+and the frontend's auth values, and on Linux or macOS run `chmod 600 .env`.
+`Launch.py` reads that file and passes each service only the names it is
+allowed to see. It is also the only way the Next.js app can be configured on
+Windows, where its startup script refuses to read an `.env` inside `frontend/`
+because it cannot verify the file's permissions there.
+
+## Measured performance
+
+Real numbers from this machine — Claude Haiku 4.5, CPU-only inference,
+PostgreSQL on localhost. Not estimates.
+
+| Stage | Time |
+|---|---|
+| YOLO inference, warm | **~50 ms** per image (first request 1.3 s, model warm-up) |
+| Detection → stored in PostgreSQL | under 1 s |
+| `analyze_batch()` → returns AlertID | **under 1 s** (contract requires it; the agent runs in a background thread) |
+| Batch window | 30 s, fixed |
+| **Burst investigation** (Monitor + Analyzer) | **37 s** |
+| **Camera image → finished report** | **73 s** end to end |
+| Full five-agent analysis from the dashboard | 144–260 s |
+| Chat greeting (no MES query) | instant, no agent run spent |
+
+One measured burst: 5 images → 24 detections stored → 6 cleared the 0.80 gate →
+one batch → a 4,733-character report naming machine Fra-10, work order 4901, the
+eBike T101 frame, the operator and the night shift.
+
+On accuracy rather than speed, see [docs/evaluation.md](docs/evaluation.md),
+which scores the agent's reports against faults deliberately injected into the
+data. It is still in progress — 1 of 3 runs — and already documents a case where
+the agent was confidently wrong, and a confound that invalidated one of the
+three metrics.
+
+## What is in this repository
+
+| Directory | What it is |
+|---|---|
+| `steel-defect-detection-mlops/` | YOLOv8 training and the inference API. The camera. |
+| `industrial-data-store-simulation-chatbot/` | Synthetic MES data generator, plus `bridge/` — the gate, the batching, the simulator and the seam. |
+| `sample-MES-ClosedLoop-Strands-Agent/` | The agent backend, the tools, and the trace dashboard. |
+| `frontend/` | Next.js chat UI. |
+| `CONTRACTS.md` | The binding interface between the three: ports, payload, table shapes, and the `analyze_batch` seam. |
+
+## Tests
+
+```bash
+cd sample-MES-ClosedLoop-Strands-Agent && .venv/Scripts/python.exe -m pytest tests/ -q
+```
+
+133 tests, about 4 seconds, **no API cost** — the model is faked at the retry
+boundary. They cover the guardrails that bound spend (the retry budget, the
+hourly run budget, one supervisor delegation per chat question, chat-history
+trimming that never orphans a `toolResult`) and the security surface: internal
+token auth, burst payload validation, and report paths a model cannot escape.
+`RUN_FULL=1` additionally runs three real chat turns (~10 minutes, real credit).
+
+```bash
+cd industrial-data-store-simulation-chatbot && uv run pytest tests/ -q
+cd steel-defect-detection-mlops && .venv/Scripts/python.exe -m pytest tests/ -q
+cd frontend && npm run test:security
+```
+
+129, 16 and 45 more, all green on both Windows and Linux.
+
+```bash
+cd industrial-data-store-simulation-chatbot && python -m pytest tests/test_bridge_payload.py -q
+```
+
+Guards the payload shape between camera and bridge — a mismatch there once made
+the entire pipeline a silent no-op while every service reported healthy.
+
+---
+
+# The agent layer in detail
 
 A supervisor-orchestrated, multi-agent application for investigating manufacturing defects using synthetic Manufacturing Execution System data.
 
@@ -16,7 +134,7 @@ Manufacturing defect investigations often require information from several opera
 * Maintenance history
 * Employees and shifts
 
-This application allows a user to select an analysis scope through a Streamlit interface. A supervisor agent then coordinates specialized agents that query a synthetic SQLite MES database through controlled, read-only tools.
+This application allows a user to select an analysis scope through a Streamlit interface. A supervisor agent then coordinates specialized agents that query a synthetic PostgreSQL MES database (`mescopy_v1`) through controlled, read-only tools.
 
 The final output includes:
 
@@ -49,7 +167,7 @@ flowchart LR
     B --> C[Supervisor Agent]
     C --> D[Specialized Analysis Agents]
     D --> E[Read-Only Tool Layer]
-    E --> F[(Synthetic MES SQLite Database)]
+    E --> F[(Synthetic MES PostgreSQL Database)]
     F --> E
     E --> D
     D --> C
@@ -156,7 +274,7 @@ A custom Markdown-to-ReportLab renderer converts supported report elements into 
 
 Several predefined queries attempted to join using `WorkOrders.ShiftID`, but that column did not exist in the generated database.
 
-The actual relationship was verified using SQLite schema inspection:
+The actual relationship was verified using database schema inspection:
 
 ```text
 WorkOrders
@@ -230,7 +348,7 @@ A Markdown-to-ReportLab renderer now handles supported formatting and escapes re
 * Streamlit
 * Strands Agents
 * Amazon Bedrock
-* SQLite
+* PostgreSQL (migrated from SQLite so the camera and the agent share one database)
 * Pandas
 * Plotly
 * SQLAlchemy
