@@ -156,10 +156,20 @@ python docs/evaluate_agent.py --rescore docs/evaluation-run1.json
 
 ## Running it
 
-**You do not need an Anthropic API key to see this work.** The trained weights
-and a full snapshot of the MES database are both committed, and the free mode
-runs the entire pipeline — camera, confidence gate, batching, alert lifecycle —
-with only the model call stubbed out. Start there.
+There is more than one way in, so pick the row that matches you and ignore the
+rest of this section.
+
+| You are… | Do this | Costs |
+|---|---|---|
+| **Just looking** | Nothing. Read this page — the image, the report and the numbers above are the real output. | — |
+| **Willing to run one thing** | Set up (below), then double-click **`Start Demo.bat`** → **Developer mode** → **Free demo** → **Fire a camera burst**. | nothing |
+| **Want to talk to the agents** | Same launcher, type in the chat box. Needs an Anthropic API key. | a few cents |
+| **Want the whole system** | `python Launch.py`, then open `localhost:3000`. Next.js chat, trace dashboard, all five services. | a few cents |
+
+**You do not need an Anthropic API key to see the pipeline work.** The trained
+weights and a full snapshot of the MES database are both committed, and free
+mode runs every stage — camera, confidence gate, batching, alert lifecycle —
+with only the model call stubbed out.
 
 ### The short way: double-click `Start Demo.bat`
 
