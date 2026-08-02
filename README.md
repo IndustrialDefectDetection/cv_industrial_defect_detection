@@ -45,6 +45,37 @@ because an agent run takes 40–260 seconds and costs real money:
 `analyze_batch(batch) -> int` signature — because three sub-projects with three
 separate toolchains meet there.
 
+## What the camera actually contributes — and what it does not
+
+Worth being precise about, because "CV feeds an agent" can mean much more than
+it does here.
+
+**Connected.** The bridge sends the agent every gated detection — timestamp,
+class, confidence, image name — plus the machine and the work order it resolved
+live from the MES. Those land in the supervisor's prompt, and both the Monitor
+and Analyzer carry a `get_recent_detections(machine_id, hours)` tool so they can
+query the camera's own record rather than trust the summary. The report comes
+back over HTTP and is written to `AgentAlerts.Report`. Set
+`MES_ANALYZE_STUB=1` and you opt out of that; leave it unset and it runs.
+
+**Not connected, by construction — the two halves speak different vocabularies.**
+The camera is a steel-surface model: `crazing`, `inclusion`, `patches`,
+`pitted_surface`, `rolled-in_scale`, `scratches`. The MES is a synthetic
+*e-bike* factory, whose defect taxonomy is `Sensor Malfunction`, `Battery Cell
+Variance`, `Motor Coil Problem` and so on. **A camera class never maps onto an
+MES defect type**, and nothing in the pipeline pretends otherwise.
+
+What the camera therefore supplies is **an event, not a diagnosis**: *this
+machine, this moment, this many high-confidence detections*. Every causal claim
+in the report comes from MES data the agent queried after being pointed at that
+machine and that time window. That is the honest description of the
+architecture — a vision trigger for an MES investigation.
+
+It is a real limitation and it comes from gluing two separate upstream projects
+together. It is also the part most worth understanding: the interesting engineering
+is the *seam* — the gate, the batch window, the sub-second handoff, the alert
+lifecycle — not a pretence that a steel-surface model diagnoses e-bike faults.
+
 ## What the agent actually wrote
 
 Not a mock. This is from `docs/evaluation-run1.json`:

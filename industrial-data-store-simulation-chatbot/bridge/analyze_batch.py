@@ -20,11 +20,20 @@ The three rules this file exists to honour:
   * Carry status, not just a report, so the dashboard can show
     "analyzing..." while the agent is still thinking.
 
-STAGE 1 (plan task 9): the lifecycle is wired end to end with NO LLM call -
-the background worker writes a clearly-labelled placeholder report. This
-proves camera → API → bridge → gate → batching → seam → database at zero
-API cost. Task 10 replaces the body of `_run_agent` with the real agent run;
-nothing else in this file needs to change.
+The real agent run is wired and is the default. `_run_agent` builds a payload
+carrying every gated detection - timestamp, class, confidence, image name -
+and POSTs it to the agent backend's `/investigate`, which embeds that evidence
+in the supervisor prompt and tells the Monitor and Analyzer to call
+`get_recent_detections` for the camera's own record. The report that comes
+back is written into AgentAlerts.Report.
+
+Setting MES_ANALYZE_STUB=1 opts *out* of that, substituting a labelled
+placeholder so the whole lifecycle can be demonstrated at zero API cost.
+
+(This docstring used to describe the stub as the current stage, left over from
+when it was. It outlived the truth by several tasks and had readers concluding
+the camera and the agent were never connected. If you change which path is the
+default, change this paragraph in the same commit.)
 """
 
 import logging
@@ -193,9 +202,9 @@ def _set_status(alert_id: int, status: str, report: str | None = None) -> None:
 def _run_agent(alert_id: int, batch: dict) -> None:
     """Background worker: the slow half of the seam.
 
-    TASK 10 REPLACES THE BODY BELOW. Keep the contract: set 'analyzing'
-    first, write the markdown into Report, finish 'done' or 'failed', and
-    swallow every exception.
+    Contract for anything editing this: set 'analyzing' first, write the
+    markdown into Report, finish 'done' or 'failed', and swallow every
+    exception - a raise here strands the alert in 'pending' forever.
     """
     try:
         _set_status(alert_id, "analyzing")
