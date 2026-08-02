@@ -61,6 +61,12 @@ type TraceProgressResponse = {
   events: TraceProgressEvent[];
 };
 
+// The Streamlit trace dashboard (TRACE_API.md) runs beside this app and shows
+// the run this chat only summarises: every agent, tool call and SQL query.
+// Overridable because the port is only fixed on a local machine.
+const traceDashboardUrl =
+  process.env.NEXT_PUBLIC_TRACE_DASHBOARD_URL ?? "http://localhost:8502";
+
 const agentProgressLabels: Record<string, string> = {
   Chat: "Understanding your request…",
   Supervisor: "Coordinating the analysis…",
@@ -791,6 +797,32 @@ export default function Home() {
         </span>
       </div>
 
+      {/* Sits below the composer on the landing screen only. The chat can
+          answer questions about the factory, but it cannot show the agents
+          working - that is the trace dashboard, and nothing here previously
+          told anyone it existed. */}
+      <div
+        aria-hidden={hasMessages}
+        className={`absolute top-[calc(50%+4rem)] z-20 text-center text-sm text-slate-500 transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none dark:text-zinc-500 ${session
+          ? "left-[calc(50%+var(--app-sidebar-half-width))]"
+          : "left-1/2"
+          } ${hasMessages
+            ? "pointer-events-none -translate-x-1/2 -translate-y-2 opacity-0"
+            : "-translate-x-1/2 translate-y-0 opacity-100 delay-200"
+          }`}
+      >
+        Ask about defects, machines, work orders or downtime — or open{" "}
+        <a
+          href={traceDashboardUrl}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="font-medium text-blue-600 underline-offset-4 hover:underline dark:text-blue-400"
+        >
+          developer mode
+        </a>{" "}
+        to watch the agents work.
+      </div>
+
       <header
         aria-hidden={!hasMessages}
         className={`absolute left-8 top-0 z-20 flex h-16 items-center whitespace-nowrap text-xl font-semibold tracking-tight text-slate-800 transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none dark:text-slate-100 ${hasMessages
@@ -880,6 +912,15 @@ export default function Home() {
             <span>Auto</span>
           </label>
         </fieldset>
+        <a
+          href={traceDashboardUrl}
+          target="_blank"
+          rel="noreferrer noopener"
+          title="Watch every agent, tool call and SQL query behind an answer"
+          className="rounded-full border border-slate-300/80 px-3 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:border-slate-400 hover:text-slate-900 dark:border-[#2f3238] dark:text-zinc-400 dark:hover:border-zinc-600 dark:hover:text-zinc-100"
+        >
+          Developer mode
+        </a>
         {session && (
           <button
             type="button"

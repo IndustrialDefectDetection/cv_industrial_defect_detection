@@ -118,6 +118,33 @@ test("authentication defaults to open registration and supports explicit closure
   });
 });
 
+
+test("Google credentials are required only when Google sign-in is on", () => {
+  const withoutGoogleCredentials = {
+    BETTER_AUTH_SECRET: "a".repeat(32),
+    BETTER_AUTH_URL: "http://localhost:3000",
+  };
+
+  // Disabled: a checkout with no OAuth client must still start. Requiring
+  // these unconditionally once made the frontend impossible to build.
+  const disabled = readAuthRuntimeConfig({
+    ...withoutGoogleCredentials,
+    AUTH_ALLOW_GOOGLE_SIGNUP: "false",
+  });
+  assert.equal(disabled.allowGoogleSignup, false);
+  assert.equal(disabled.googleClientId, "");
+  assert.equal(disabled.googleClientSecret, "");
+
+  // Enabled: still demanded, exactly as before.
+  assert.throws(
+    () => readAuthRuntimeConfig({
+      ...withoutGoogleCredentials,
+      AUTH_ALLOW_GOOGLE_SIGNUP: "true",
+    }),
+    /GOOGLE_CLIENT_ID/,
+  );
+});
+
 test("authentication rejects weak secrets and insecure remote origins", () => {
   assert.throws(
     () =>

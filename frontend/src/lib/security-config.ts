@@ -210,27 +210,32 @@ export function readAuthRuntimeConfig(
 
   const remoteOrigin = !isLoopbackHost(new URL(baseURL).hostname);
 
+  // Google credentials are required only when Google sign-in is switched on.
+  // They used to be required unconditionally, which meant a checkout with no
+  // OAuth client could not build at all - the failure was "GOOGLE_CLIENT_ID is
+  // required" during page-data collection, with nothing to say the feature was
+  // optional. Turning the provider off must be enough to stop needing its
+  // secrets; when it is on, they are still demanded exactly as before.
+  const allowGoogleSignup = parseStrictBoolean(
+    environment,
+    "AUTH_ALLOW_GOOGLE_SIGNUP",
+    true,
+  );
+
   return {
     allowEmailSignup: parseStrictBoolean(
       environment,
       "AUTH_ALLOW_EMAIL_SIGNUP",
       true,
     ),
-    allowGoogleSignup: parseStrictBoolean(
-      environment,
-      "AUTH_ALLOW_GOOGLE_SIGNUP",
-      true,
-    ),
+    allowGoogleSignup,
     baseURL,
-    googleClientId: requireEnvironmentValue(
-      environment,
-      "GOOGLE_CLIENT_ID",
-    ),
-    googleClientSecret: requireSecret(
-      environment,
-      "GOOGLE_CLIENT_SECRET",
-      16,
-    ),
+    googleClientId: allowGoogleSignup
+      ? requireEnvironmentValue(environment, "GOOGLE_CLIENT_ID")
+      : "",
+    googleClientSecret: allowGoogleSignup
+      ? requireSecret(environment, "GOOGLE_CLIENT_SECRET", 16)
+      : "",
     secret: requireSecret(environment, "BETTER_AUTH_SECRET"),
     trustedProxySecret: remoteOrigin
       ? requireSecret(environment, "AUTH_TRUSTED_PROXY_SECRET")

@@ -54,13 +54,17 @@ export const auth = betterAuth({
       },
     },
   },
-  socialProviders: {
-    google: {
-      clientId: authConfig.googleClientId,
-      clientSecret: authConfig.googleClientSecret,
-      ...googleSignupPolicy(authConfig.allowGoogleSignup),
-    },
-  },
+  // Registering Google with blank credentials would advertise a provider that
+  // cannot complete a sign-in, so leave it out entirely when it is disabled.
+  socialProviders: googleSignupEnabled
+    ? {
+      google: {
+        clientId: authConfig.googleClientId,
+        clientSecret: authConfig.googleClientSecret,
+        ...googleSignupPolicy(authConfig.allowGoogleSignup),
+      },
+    }
+    : {},
   emailAndPassword: {
     enabled: true,
     disableSignUp: !authConfig.allowEmailSignup,
