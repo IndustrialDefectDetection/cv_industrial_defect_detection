@@ -68,6 +68,7 @@ _SERVICE_ENV_NAMES = {
         "BACKEND_URL",
         "BETTER_AUTH_SECRET",
         "BETTER_AUTH_URL",
+        "BRIDGE_URL",
         "DATABASE_CA_CERT",
         "DATABASE_URL",
         "GOOGLE_CLIENT_ID",

@@ -133,6 +133,13 @@ export default function Home() {
   const [traceProgress, setTraceProgress] = useState("Starting the analysis…");
   const [cancelledMessageIds, setCancelledMessageIds] = useState<string[]>([]);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
+  // The camera burst is a simulation the user triggers, so its outcome is
+  // transient UI state rather than a stored chat message — it describes the
+  // pipeline, not the conversation, and should not survive a reload.
+  const [burstNotice, setBurstNotice] = useState<
+    { tone: "ok" | "error"; text: string } | null
+  >(null);
+  const [isFiringBurst, setIsFiringBurst] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>("system")
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const activeChatIdRef = useRef<string | null>(null);
@@ -650,6 +657,43 @@ export default function Home() {
     }
   }
 
+  // Replays the committed demo images through the real camera path: inference,
+  // the 0.80 confidence gate, the 30-second batch window, then an agent
+  // investigation. Nothing about the pipeline is faked; only the trigger is,
+  // because there is no steel moving under a camera on a laptop.
+  async function handleSimulateBurst() {
+    setIsFiringBurst(true);
+    setBurstNotice(null);
+
+    try {
+      const response = await fetch("/api/simulate", { method: "POST" });
+      const result = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        setBurstNotice({
+          tone: "error",
+          text: result?.error ?? "The camera burst could not be started.",
+        });
+        return;
+      }
+
+      setBurstNotice({
+        tone: "ok",
+        text: `Sent ${result.imagesSent} frames to ${result.machineName}. `
+          + `${result.savedCount} detections stored, ${result.batchedCount} cleared `
+          + "the 0.80 confidence gate. The batch closes 30 seconds after the first "
+          + "one, then an agent investigates — watch it in the agent trace.",
+      });
+    } catch {
+      setBurstNotice({
+        tone: "error",
+        text: "The camera burst could not be started.",
+      });
+    } finally {
+      setIsFiringBurst(false);
+    }
+  }
+
   async function handleLogout() {
     setIsLoggingOut(true);
     setHistoryError(null);
@@ -811,17 +855,70 @@ export default function Home() {
             : "-translate-x-1/2 translate-y-0 opacity-100 delay-200"
           }`}
       >
-        Ask about defects, machines, work orders or downtime — or open the{" "}
-        <a
-          href={traceDashboardUrl}
-          target="_blank"
-          rel="noreferrer noopener"
-          className="font-medium text-blue-600 underline-offset-4 hover:underline dark:text-blue-400"
-        >
-          agent trace
-        </a>{" "}
-        to fire a camera burst and watch the agents work.
+        <p>
+          Ask about defects, machines, work orders or downtime.
+        </p>
+        <p className="mt-2">
+          No defects to talk about yet?{" "}
+          <button
+            type="button"
+            onClick={handleSimulateBurst}
+            disabled={isFiringBurst || !session}
+            className="font-medium text-blue-600 underline-offset-4 hover:underline disabled:cursor-not-allowed disabled:no-underline disabled:opacity-60 dark:text-blue-400"
+          >
+            {isFiringBurst ? "Sending frames…" : "Simulate a camera burst"}
+          </button>{" "}
+          to push steel through the vision model, then follow it in the{" "}
+          <a
+            href={traceDashboardUrl}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="font-medium text-blue-600 underline-offset-4 hover:underline dark:text-blue-400"
+          >
+            agent trace
+          </a>.
+        </p>
       </div>
+
+      {/* The outcome of a burst. Deliberately not a chat message: it reports on
+          the pipeline rather than the conversation, and persisting it would put
+          words in the assistant's mouth that it never said. */}
+      {burstNotice && (
+        <div
+          role="status"
+          className={`absolute top-6 z-30 max-w-lg -translate-x-1/2 rounded-xl border px-4 py-3 text-sm shadow-lg ${session
+            ? "left-[calc(50%+var(--app-sidebar-half-width))]"
+            : "left-1/2"
+            } ${burstNotice.tone === "ok"
+              ? "border-blue-200 bg-blue-50 text-slate-700 dark:border-blue-900/60 dark:bg-blue-950/40 dark:text-zinc-200"
+              : "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
+            }`}
+        >
+          <div className="flex items-start gap-3">
+            <p className="flex-1">
+              {burstNotice.text}{" "}
+              {burstNotice.tone === "ok" && (
+                <a
+                  href={traceDashboardUrl}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  className="font-medium text-blue-600 underline-offset-4 hover:underline dark:text-blue-400"
+                >
+                  Open it →
+                </a>
+              )}
+            </p>
+            <button
+              type="button"
+              onClick={() => setBurstNotice(null)}
+              aria-label="Dismiss"
+              className="text-slate-400 transition-colors hover:text-slate-700 dark:text-zinc-500 dark:hover:text-zinc-200"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
 
       <header
         aria-hidden={!hasMessages}
@@ -912,6 +1009,17 @@ export default function Home() {
             <span>Auto</span>
           </label>
         </fieldset>
+        {session && (
+          <button
+            type="button"
+            onClick={handleSimulateBurst}
+            disabled={isFiringBurst}
+            title="Replay the demo images through the vision model, the confidence gate and the batch window"
+            className="rounded-full border border-slate-300/80 px-3 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:border-slate-400 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60 dark:border-[#2f3238] dark:text-zinc-400 dark:hover:border-zinc-600 dark:hover:text-zinc-100"
+          >
+            {isFiringBurst ? "Sending frames…" : "Simulate camera burst"}
+          </button>
+        )}
         <a
           href={traceDashboardUrl}
           target="_blank"

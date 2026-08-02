@@ -259,6 +259,25 @@ export function readMesBackendRuntimeConfig(
   };
 }
 
+// The bridge owns the camera side, so the demo burst is its endpoint rather
+// than the agent backend's. Unlike BACKEND_URL this has a default: the burst is
+// a demo convenience, and requiring one more mandatory variable would stop the
+// whole frontend from starting over a button.
+export function readBridgeRuntimeConfig(
+  environment: Environment,
+): MesBackendRuntimeConfig {
+  return {
+    baseURL: parseHttpServiceOrigin(
+      "BRIDGE_URL",
+      environment.BRIDGE_URL?.trim() || "http://127.0.0.1:8081",
+    ),
+    internalApiToken: requireSecret(
+      environment,
+      "MES_INTERNAL_API_TOKEN",
+    ),
+  };
+}
+
 export function isValidMesUserId(value: string): boolean {
   return MES_USER_ID_PATTERN.test(value);
 }

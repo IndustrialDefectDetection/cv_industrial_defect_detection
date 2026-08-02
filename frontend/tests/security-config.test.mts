@@ -4,6 +4,7 @@ import {
   googleSignupPolicy,
   isValidMesUserId,
   readAuthRuntimeConfig,
+  readBridgeRuntimeConfig,
   readDatabaseRuntimeConfig,
   readMesBackendRuntimeConfig,
 } from "../src/lib/security-config.ts";
@@ -209,6 +210,32 @@ test("backend configuration requires an authenticated HTTPS service", () => {
       baseURL: "http://127.0.0.1:8000",
       internalApiToken: "t".repeat(32),
     },
+  );
+});
+
+test("the camera bridge defaults to loopback but still demands a token", () => {
+  assert.deepEqual(
+    readBridgeRuntimeConfig({ MES_INTERNAL_API_TOKEN: "t".repeat(32) }),
+    {
+      baseURL: "http://127.0.0.1:8081",
+      internalApiToken: "t".repeat(32),
+    },
+  );
+
+  // A demo button must never become a way to make the server POST somewhere
+  // off this machine.
+  assert.throws(
+    () =>
+      readBridgeRuntimeConfig({
+        BRIDGE_URL: "http://bridge.example.com",
+        MES_INTERNAL_API_TOKEN: "t".repeat(32),
+      }),
+    /must use https/,
+  );
+
+  assert.throws(
+    () => readBridgeRuntimeConfig({ MES_INTERNAL_API_TOKEN: "short" }),
+    /at least 32 characters/,
   );
 });
 

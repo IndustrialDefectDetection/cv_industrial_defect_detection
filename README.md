@@ -256,11 +256,17 @@ python Launch.py     # all five services; refuses to start if a port is taken
 Two surfaces, and they are deliberately not the same thing:
 
 - **`localhost:3000`** is the chat — ask the agents about defects, machines,
-  work orders or downtime. It is the operator's view, so it has no button that
-  fabricates a camera event; a real line does not work that way.
-- **`localhost:8502`** is the trace dashboard: **Fire a camera burst**, then
-  watch every agent, tool call and SQL query behind the answer. This is the
-  demo harness, and the chat links to it as *Agent trace*.
+  work orders or downtime. It also has **Simulate camera burst**, which is
+  named for what it is: there is no steel moving under a camera on a laptop, so
+  the trigger is faked and nothing after it is. The result appears as a notice,
+  not as words the assistant never said.
+- **`localhost:8502`** is the trace dashboard: the same burst button, plus every
+  agent, tool call and SQL query behind an answer. The chat links to it as
+  *Agent trace*.
+
+Both buttons post to the bridge's `POST /simulate`. The chat's route requires a
+signed-in session and a same-origin request, and never forwards the bridge's
+own error text to the browser.
 
 The burst posts to the bridge's `POST /simulate`, which replays the five
 committed images through the same inference API, confidence gate and batching
