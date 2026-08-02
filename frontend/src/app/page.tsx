@@ -811,16 +811,16 @@ export default function Home() {
             : "-translate-x-1/2 translate-y-0 opacity-100 delay-200"
           }`}
       >
-        Ask about defects, machines, work orders or downtime — or open{" "}
+        Ask about defects, machines, work orders or downtime — or open the{" "}
         <a
           href={traceDashboardUrl}
           target="_blank"
           rel="noreferrer noopener"
           className="font-medium text-blue-600 underline-offset-4 hover:underline dark:text-blue-400"
         >
-          developer mode
+          agent trace
         </a>{" "}
-        to watch the agents work.
+        to fire a camera burst and watch the agents work.
       </div>
 
       <header
@@ -916,10 +916,10 @@ export default function Home() {
           href={traceDashboardUrl}
           target="_blank"
           rel="noreferrer noopener"
-          title="Watch every agent, tool call and SQL query behind an answer"
+          title="Watch every agent, tool call and SQL query behind an answer — and fire a camera burst"
           className="rounded-full border border-slate-300/80 px-3 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:border-slate-400 hover:text-slate-900 dark:border-[#2f3238] dark:text-zinc-400 dark:hover:border-zinc-600 dark:hover:text-zinc-100"
         >
-          Developer mode
+          Agent trace
         </a>
         {session && (
           <button

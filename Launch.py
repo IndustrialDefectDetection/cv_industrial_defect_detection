@@ -88,6 +88,7 @@ _SERVICE_ENV_NAMES = {
     }),
     "viewer": frozenset({
         "MES_AGENT_URL",
+        "MES_BRIDGE_URL",
         "MES_INTERNAL_API_TOKEN",
         "MES_VIEWER_HEALTH_MAX_RETRIES",
         "MES_VIEWER_HEALTH_RETRY",

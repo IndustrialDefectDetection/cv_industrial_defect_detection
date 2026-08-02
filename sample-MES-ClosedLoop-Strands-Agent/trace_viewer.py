@@ -39,6 +39,7 @@ load_protected_env(
     Path(__file__).resolve().parent / ".env",
     allowed_names=frozenset({
         "MES_AGENT_URL",
+        "MES_BRIDGE_URL",
         "MES_INTERNAL_API_TOKEN",
         "MES_VIEWER_HEALTH_MAX_RETRIES",
         "MES_VIEWER_HEALTH_RETRY",
@@ -49,9 +50,9 @@ remove_cross_service_secrets()
 logger = logging.getLogger(__name__)
 
 
-def loopback_backend_url() -> str:
+def loopback_origin(name: str, default: str) -> str:
     """Accept a trusted environment override, never a browser-supplied URL."""
-    value = os.getenv("MES_AGENT_URL", "http://127.0.0.1:8000").rstrip("/")
+    value = os.getenv(name, default).rstrip("/")
     parsed = urlsplit(value)
     if (
         parsed.scheme != "http"
@@ -62,11 +63,14 @@ def loopback_backend_url() -> str:
         or parsed.fragment
         or parsed.path not in {"", "/"}
     ):
-        raise RuntimeError("MES_AGENT_URL must be a plain loopback HTTP origin")
+        raise RuntimeError(f"{name} must be a plain loopback HTTP origin")
     return value
 
 
-DEFAULT_BASE = loopback_backend_url()
+DEFAULT_BASE = loopback_origin("MES_AGENT_URL", "http://127.0.0.1:8000")
+# The bridge owns the camera side, so the demo burst is its endpoint, not the
+# agent API's. This dashboard stays a pure HTTP client either way.
+BRIDGE_BASE = loopback_origin("MES_BRIDGE_URL", "http://127.0.0.1:8081")
 POLL_RUNNING = 0.8  # trace poll cadence while a run is active
 POLL_IDLE = 2.5  # keep polling when idle so runs from other clients appear
 POLL_ALERTS = 4.0  # alerts arrive on the pipeline's schedule, not the trace's
@@ -489,6 +493,42 @@ STATUS_STYLE = {
 }
 
 
+def fire_demo_burst() -> None:
+    """Ask the bridge to replay the committed demo images through the camera path.
+
+    The button lives here because this is the only screen in the browser half of
+    the project that can start a demo. The desktop launcher has its own; without
+    this one, `python Launch.py` gives you five running services and no way to
+    make anything happen.
+    """
+    try:
+        response = api_request(
+            "POST",
+            f"{BRIDGE_BASE}/simulate",
+            headers=api_headers(),
+            timeout=120,
+        )
+        if response.status_code == 429:
+            st.warning("A burst is already running — give it a moment.")
+            return
+        response.raise_for_status()
+        result = response.json()
+    except requests.exceptions.ConnectionError:
+        st.error(f"Bridge unreachable at {BRIDGE_BASE} — is it running?")
+        return
+    except Exception as exc:
+        st.error(f"Burst failed — {type(exc).__name__}: {exc}")
+        return
+
+    st.success(
+        f"Sent {result['images_sent']} image(s) to "
+        f"{result.get('machine_name') or 'machine ' + str(result['machine_id'])}: "
+        f"{result['saved_count']} detection(s) saved, "
+        f"{result['batched_count']} cleared the 0.80 gate. "
+        "The batch window closes 30 seconds after the first gated detection."
+    )
+
+
 @st.fragment(run_every=(POLL_ALERTS if live else None))
 def alerts_section() -> None:
     data, err = fetch_json(f"{base_url}/alerts?limit=20", timeout=5)
@@ -499,9 +539,18 @@ def alerts_section() -> None:
     alerts = (data or {}).get("alerts") or []
     note = (data or {}).get("note")
     st.subheader(f"Camera alerts ({len(alerts)})")
+
+    if st.button(
+        "📷  Fire a camera burst",
+        help="Replays the committed demo images through the real inference API, "
+             "confidence gate and batching window. Ends in a paid agent run "
+             "unless MES_ANALYZE_STUB=1.",
+    ):
+        fire_demo_burst()
+
     if not alerts:
-        st.info(note or "No alerts yet. Run the simulator to fire a defect "
-                        "burst and one will appear here within about a minute.")
+        st.info(note or "No alerts yet. Fire a camera burst above and one will "
+                        "appear here within about a minute.")
         return
 
     live_now = sum(1 for a in alerts if a["Status"] in ("pending", "analyzing"))

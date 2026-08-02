@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import mimetypes
 import os
+import random
 import re
 import secrets
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 
 import psycopg2
+import requests
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import (
@@ -61,11 +65,25 @@ DEFECT_CLASSES = (
 CLASS_IDS = {name: class_id for class_id, name in enumerate(DEFECT_CLASSES)}
 SAFE_IMAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 
-app = FastAPI(title="Defect Detection Bridge", version="1.1.0")
+# The demo burst replays a fixed, committed folder through the real camera
+# path. The directory is resolved here and never taken from the caller: a
+# request-supplied path would turn this into an arbitrary-file reader that
+# posts whatever it finds to the inference API.
+DEMO_BURST_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "steel-defect-detection-mlops" / "data" / "demo_burst"
+)
+DEMO_BURST_SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
+INFERENCE_URL = "http://127.0.0.1:8080/predict"
+
+app = FastAPI(title="Defect Detection Bridge", version="1.2.0")
 batch_manager = BatchManager()
 _DB_SLOTS = threading.BoundedSemaphore(
     _bounded_int_env("MES_BRIDGE_DB_CONCURRENCY", 4, 1, 4)
 )
+# One burst at a time. A burst can end in a paid agent run, and two overlapping
+# bursts would land in the same batch window and be indistinguishable anyway.
+_BURST_LOCK = threading.Lock()
 
 
 def require_internal_api_token(
@@ -83,6 +101,21 @@ def require_internal_api_token(
 
 
 INTERNAL_AUTH = [Depends(require_internal_api_token)]
+
+
+@contextlib.contextmanager
+def _held_database_slot():
+    """The body of `database_slot`, for callers that are not route dependencies."""
+    if not _DB_SLOTS.acquire(timeout=2):
+        raise HTTPException(
+            status_code=429,
+            detail="Bridge is busy",
+            headers={"Retry-After": "2"},
+        )
+    try:
+        yield
+    finally:
+        _DB_SLOTS.release()
 
 
 def database_slot():
@@ -415,3 +448,103 @@ def handle_detection(payload: DetectionPayload):
         "order_id": order_id,
         "batched_count": accepted_for_batch,
     }
+
+
+def _internal_headers() -> dict[str, str]:
+    return {"X-MES-Internal-Token": os.getenv("MES_INTERNAL_API_TOKEN", "")}
+
+
+def _infer(image_path: Path) -> dict | None:
+    """POST one image to the inference API, exactly as the simulator does."""
+    try:
+        media_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
+        with open(image_path, "rb") as handle:
+            with requests.Session() as session:
+                # Loopback only: never inherit a proxy, never follow a redirect
+                # that could carry the internal token off this machine.
+                session.trust_env = False
+                response = session.post(
+                    INFERENCE_URL,
+                    files={"file": (image_path.name, handle, media_type)},
+                    headers=_internal_headers(),
+                    allow_redirects=False,
+                    timeout=30,
+                )
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:
+        logger.error("Demo burst inference failed: %s", safe_log_text(exc))
+        return None
+
+
+@app.post("/simulate", dependencies=[*INTERNAL_AUTH])
+def simulate_burst():
+    """Replay the committed demo images through the real camera path.
+
+    This exists so the trace dashboard can start a demo without a terminal.
+    It is a thin driver, not a second pipeline: each image goes to the same
+    inference API and then through `handle_detection`, so the confidence gate,
+    the batching window and the alert lifecycle are the real ones. Nothing here
+    is reachable without the internal token, and the image folder is fixed at
+    import time rather than taken from the caller.
+    """
+    if not _BURST_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="A demo burst is already running",
+            headers={"Retry-After": "15"},
+        )
+    try:
+        if not DEMO_BURST_DIR.is_dir():
+            raise HTTPException(
+                status_code=503,
+                detail="Demo images are not installed on this machine",
+            )
+        images = sorted(
+            path for path in DEMO_BURST_DIR.iterdir()
+            if path.suffix.lower() in DEMO_BURST_SUFFIXES and path.is_file()
+        )
+        if not images:
+            raise HTTPException(status_code=503, detail="No demo images to send")
+
+        machines = get_frame_machines()
+        if not machines:
+            raise HTTPException(
+                status_code=503,
+                detail="MES machine lookup is unavailable",
+            )
+        machine = random.choice(machines)
+
+        saved = 0
+        batched = 0
+        for image in images:
+            result = _infer(image)
+            if not result or not result.get("success"):
+                continue
+            payload = DetectionPayload(
+                timestamp=datetime.now(timezone.utc),
+                machine_id=machine["machineid"],
+                image_name=result.get("image_name", image.name),
+                inference_time_ms=float(result.get("inference_time_ms", 0.0)),
+                detections=result.get("detections", []),
+            )
+            with _held_database_slot():
+                outcome = handle_detection(payload)
+            saved += outcome["saved_count"]
+            batched += outcome["batched_count"]
+
+        logger.info(
+            "Demo burst: %s image(s), %s detection(s) saved, %s gated",
+            len(images),
+            saved,
+            batched,
+        )
+        return {
+            "images_sent": len(images),
+            "saved_count": saved,
+            "batched_count": batched,
+            "machine_id": machine["machineid"],
+            "machine_name": machine.get("name", ""),
+        }
+    finally:
+        _BURST_LOCK.release()

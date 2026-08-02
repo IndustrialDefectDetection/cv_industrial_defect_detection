@@ -9,7 +9,7 @@ All field and column names below are taken from the real code (`deployment/api.p
 | Port | Process | Repo | Endpoint(s) |
 |------|---------|------|-------------|
 | 8080 | Inference API (`deployment/api.py`) | steel-defect-detection-mlops | `POST /predict`, `GET /health` |
-| 8081 | Bridge (`bridge/bridge.py`) | industrial-data-store-simulation-chatbot | `POST /detection`, `GET /health` |
+| 8081 | Bridge (`bridge/bridge.py`) | industrial-data-store-simulation-chatbot | `POST /detection`, `POST /simulate`, `GET /health` |
 | 8000 | Agent backend (`api.py`) | sample-MES-ClosedLoop-Strands-Agent | `POST /investigate`, `/analysis`, `/chat/`, `/cancel`; `GET /trace`, `/alerts`, `/health` |
 | 8502 | Trace dashboard (`trace_viewer.py`) | sample-MES-ClosedLoop-Strands-Agent | — (HTTP client of 8000; contract in `TRACE_API.md`) |
 | 3000 | Chat UI (Next.js) | frontend | — (posts to `/chat/`) |
@@ -170,6 +170,15 @@ The camera story: it watches the **Frame Welding** line (`Machines.Type = 'Frame
 - **Resource bounds:** at most 32 machine windows and 500 gated detections per
   window are retained in memory. Extra gated detections remain persisted but
   do not start additional timers or agent work.
+
+### `POST /simulate` — demo burst
+
+Replays a fixed folder of committed images (`steel-defect-detection-mlops/data/demo_burst`) through the real path: each image goes to `8080/predict`, then through the same `/detection` handling, so the gate, the batch window and the alert lifecycle are not bypassed. It exists so the trace dashboard can start a demo without a terminal; `bridge/simulator.py` remains the command-line equivalent.
+
+- Takes **no request body**. The image directory is resolved at import time and is never caller-supplied — a request-supplied path would make this an arbitrary-file reader.
+- Requires the internal token like every other non-health endpoint.
+- One at a time: a second concurrent call gets `429` with `Retry-After`, because a burst can end in a paid agent run.
+- Returns `{images_sent, saved_count, batched_count, machine_id, machine_name}`.
 
 ## 6. The seam — `analyze_batch` (A implements, B calls)
 

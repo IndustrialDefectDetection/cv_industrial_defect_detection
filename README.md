@@ -164,7 +164,7 @@ rest of this section.
 | **Just looking** | Nothing. Read this page — the image, the report and the numbers above are the real output. | — |
 | **Willing to run one thing** | Set up (below), then double-click **`Start Demo.bat`** → **Developer mode** → **Free demo** → **Fire a camera burst**. | nothing |
 | **Want to talk to the agents** | Same launcher, type in the chat box. Needs an Anthropic API key. | a few cents |
-| **Want the whole system** | `python Launch.py`, then open `localhost:3000`. Next.js chat, trace dashboard, all five services. | a few cents |
+| **Want the whole system** | `python Launch.py`. Chat at `localhost:3000`; fire a burst and watch the agents at `localhost:8502`. | a few cents |
 
 **You do not need an Anthropic API key to see the pipeline work.** The trained
 weights and a full snapshot of the MES database are both committed, and free
@@ -253,9 +253,20 @@ cd industrial-data-store-simulation-chatbot
 python Launch.py     # all five services; refuses to start if a port is taken
 ```
 
-Then the same simulator command. The agent actually reasons this time; the alert
-appears on the dashboard at `localhost:8502` and moves `analyzing → done` with a
-full report in about 73 seconds. Needs `ANTHROPIC_API_KEY` in `.env`.
+Two surfaces, and they are deliberately not the same thing:
+
+- **`localhost:3000`** is the chat — ask the agents about defects, machines,
+  work orders or downtime. It is the operator's view, so it has no button that
+  fabricates a camera event; a real line does not work that way.
+- **`localhost:8502`** is the trace dashboard: **Fire a camera burst**, then
+  watch every agent, tool call and SQL query behind the answer. This is the
+  demo harness, and the chat links to it as *Agent trace*.
+
+The burst posts to the bridge's `POST /simulate`, which replays the five
+committed images through the same inference API, confidence gate and batching
+window the command-line simulator uses — 24 detections stored, 6 through the
+gate. The agent actually reasons this time; the alert moves `analyzing → done`
+with a full report in about 73 seconds. Needs `ANTHROPIC_API_KEY` in `.env`.
 
 `Launch.py` reads that one root `.env` and passes each service only the names it
 is allowed to see. It is also the only way the Next.js app can be configured on
