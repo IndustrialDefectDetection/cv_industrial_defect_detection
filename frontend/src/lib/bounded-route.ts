@@ -14,6 +14,29 @@ const UNTRUSTED_FORWARDING_HEADERS = [
   "x-real-ip",
 ];
 
+// A Request's headers are immutable, so replacing them means building a new
+// Request. The obvious `new Request(request, { headers })` does not work here:
+// Next.js hands a route its own Request subclass, and that copy constructor
+// reaches for a private `#state` field only undici's own class declares. It
+// threw "Cannot read private member #state from an object whose class did not
+// declare it" on every single authentication call - which surfaced in the
+// browser as a bare "Authentication failed", indistinguishable from a wrong
+// password. Rebuilding from the URL stays on the public surface instead.
+function withReplacedHeaders(request: Request, headers: Headers): Request {
+  const carriesBody = request.method !== "GET" && request.method !== "HEAD";
+
+  return new Request(request.url, {
+    body: carriesBody ? request.body : undefined,
+    headers,
+    method: request.method,
+    redirect: request.redirect,
+    signal: request.signal,
+    // Streaming a body through requires this, and it is absent from the DOM
+    // typings even though the runtime demands it.
+    ...(carriesBody ? { duplex: "half" } : {}),
+  } as RequestInit);
+}
+
 function secretsMatch(expected: string, supplied: string): boolean {
   const expectedDigest = createHash("sha256").update(expected).digest();
   const suppliedDigest = createHash("sha256").update(supplied).digest();
@@ -64,7 +87,7 @@ export function withTrustedAuthIngress(
     headers.delete(TRUSTED_AUTH_PROXY_SECRET_HEADER);
     headers.set(TRUSTED_AUTH_CLIENT_IP_HEADER, clientIp);
 
-    return handler(new Request(request, { headers }));
+    return handler(withReplacedHeaders(request, headers));
   };
 }
 

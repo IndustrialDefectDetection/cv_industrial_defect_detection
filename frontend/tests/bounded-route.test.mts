@@ -92,6 +92,68 @@ test("bounded route times out a slow request body", async () => {
 });
 
 
+// Every other test in this file builds a genuine undici Request, and that is
+// why they all passed while production 500ed on every single sign-in. Next.js
+// hands a route handler its own Request class, and the copy constructor
+// `new Request(request, { headers })` reaches for a private `#state` field
+// that only undici's class declares, throwing "Cannot read private member
+// #state from an object whose class did not declare it". The browser reported
+// a bare "Authentication failed", indistinguishable from a wrong password.
+//
+// This stands in for that foreign class: it offers the public Request surface
+// the wrapper is allowed to use and nothing else, so any reimplementation that
+// reaches for internals fails here instead of in front of a user.
+function foreignRequest(
+  url: string,
+  init: { body?: string; headers?: Record<string, string>; method?: string },
+): Request {
+  return {
+    body: init.body ?? null,
+    headers: new Headers(init.headers ?? {}),
+    method: init.method ?? "GET",
+    redirect: "follow",
+    signal: AbortSignal.timeout(30_000),
+    url,
+  } as unknown as Request;
+}
+
+
+test("auth ingress accepts a Request from another implementation", async () => {
+  const handler = withTrustedAuthIngress(async (request) => {
+    assert.equal(request.url, "http://localhost:3000/api/auth/sign-in/email");
+    assert.equal(request.headers.get("x-keep-me"), "kept");
+    assert.equal(request.headers.get("x-mes-client-ip"), "127.0.0.1");
+    return new Response("ok");
+  }, null);
+
+  const response = await handler(
+    foreignRequest("http://localhost:3000/api/auth/sign-in/email", {
+      headers: { "X-Keep-Me": "kept" },
+    }),
+  );
+
+  assert.equal(response.status, 200);
+});
+
+
+test("auth ingress carries a foreign POST body through unchanged", async () => {
+  const handler = withTrustedAuthIngress(async (request) => {
+    assert.deepEqual(await request.json(), { email: "someone@example.com" });
+    return new Response("ok");
+  }, null);
+
+  const response = await handler(
+    foreignRequest("http://localhost:3000/api/auth/sign-in/email", {
+      body: JSON.stringify({ email: "someone@example.com" }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    }),
+  );
+
+  assert.equal(response.status, 200);
+});
+
+
 test("local auth ingress discards spoofed forwarding headers", async () => {
   const handler = withTrustedAuthIngress(async (request) => {
     assert.equal(request.headers.get("x-mes-client-ip"), "127.0.0.1");

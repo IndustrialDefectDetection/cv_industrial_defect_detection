@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "db:migrate": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/migrate-database.mjs",
     "dev": "node scripts/run-next-secure.mjs dev",
     "build": "node scripts/run-next-secure.mjs build",
     "start": "node scripts/run-next-secure.mjs start",

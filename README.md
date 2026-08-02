@@ -215,6 +215,14 @@ cd sample-MES-ClosedLoop-Strands-Agent && python startup.py    # bootstraps its 
 needs `npm` and its own auth values; skip it unless you want the chat UI —
 nothing in the pipeline below depends on it.
 
+The chat UI keeps a per-user conversation history, so it needs its own tables in
+the same database. `Launch.py` creates them before it starts anything, and the
+step is idempotent. Running the frontend on its own means doing it yourself:
+
+```bash
+cd frontend && npm ci && npm run db:migrate
+```
+
 ### The long way: see the pipeline run from a terminal — free
 
 Three terminals. This is what the launcher's **Free demo** button does:
@@ -337,8 +345,17 @@ neither fails closed.
 | Queries failed on `WorkOrders.ShiftID` | That column never existed; shift reaches work orders via `Employees` | Verified against the live schema and rewritten |
 | Duplicate concurrent agent runs | Streamlit reruns re-entered the run path | `analysis_running` + one-shot `work_pending` flags |
 | PDFs printed raw Markdown | No renderer | Markdown → ReportLab elements, content escaped |
+| Every sign-in and sign-up returned 500 | The auth route rebuilt the request with `new Request(request, {headers})`; Next.js passes its own Request class and that copy constructor reads a private field only `undici`'s class declares | Rebuild from the URL, on the public surface only |
+| …and the database had no auth tables at all | Better Auth derives its schema rather than shipping one, and nothing ever applied it | `npm run db:migrate`, run by `Launch.py` before any service starts |
 
-Two of those are worth stating as lessons. **Hallucination can be a
+The authentication pair is the sharpest lesson here. The unit tests covering
+that route all passed, because every one of them built a genuine `undici`
+`Request` — the exact object production never supplies. **A test that
+constructs its own input can only prove the code works on the input the test
+author imagined.** The regression test added with the fix uses a deliberately
+foreign Request implementation, and fails without it.
+
+Two more are worth stating as lessons. **Hallucination can be a
 tool-coverage problem** — an agent cannot reliably use information it has no
 approved way to fetch, and no amount of prompt warning fixes that. And
 **asking a model for numeric confidence instructs it to fabricate precision**;

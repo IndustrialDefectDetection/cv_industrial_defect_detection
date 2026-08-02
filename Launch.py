@@ -333,6 +333,36 @@ def manage_frontend_dependencies():
         print("npm not found. Please install Node.js and npm.")
     return False
 
+def migrate_frontend_database(frontend_env):
+    """Create the frontend's tables if they are not there yet.
+
+    Better Auth ships no schema file - it derives one from its options - so a
+    database that has never run this has no "user", "session", "account" or
+    "verification" table, and every sign-up fails on the first query. The
+    browser reports only "Authentication failed", which reads like a rejected
+    password rather than an empty database. The same applies to the chat
+    history tables, whose SQL previously had no runner at all.
+
+    Idempotent, so it costs a fraction of a second on every subsequent launch.
+    """
+    print("Checking frontend database tables")
+    try:
+        subprocess.run(
+            ["npm", "run", "db:migrate"],
+            cwd=FRONTEND_DIR,
+            env=frontend_env,
+            check=True,
+            shell=(os.name == "nt"),
+        )
+        return True
+    except subprocess.CalledProcessError:
+        # Starting Next.js anyway would produce the exact confusing failure
+        # this function exists to prevent.
+        print("Frontend database migration failed; check DATABASE_URL.")
+    except (OSError, FileNotFoundError) as e:
+        print(f"Frontend database migration could not run: {e}")
+    return False
+
 def main():
    if not check_ports():
        sys.exit(1)
@@ -355,6 +385,11 @@ def main():
    frontend_env = service_environment("frontend", parent_env)
    inference_env = service_environment("inference", parent_env)
    viewer_env = service_environment("viewer", parent_env)
+
+   # Before anything starts, so a failure here exits cleanly rather than
+   # leaving a backend running with no launcher to shut it down.
+   if not migrate_frontend_database(frontend_env):
+       sys.exit(1)
 
    backend_process =  subprocess.Popen(
         [
