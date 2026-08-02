@@ -1,14 +1,23 @@
 import "server-only";
 import { betterAuth } from "better-auth";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { Pool } from "pg";
 import {
   googleSignupPolicy,
   readAuthRuntimeConfig,
   readDatabaseRuntimeConfig,
+  withDatabaseCaFallback,
 } from "@/lib/security-config";
 import { TRUSTED_AUTH_CLIENT_IP_HEADER } from "@/lib/bounded-route";
 
-const databaseConfig = readDatabaseRuntimeConfig(process.env);
+const bundledDatabaseCa = readFileSync(
+  resolve(process.cwd(), "certs", "supabase-root-2021.crt"),
+  "utf8",
+);
+const databaseConfig = readDatabaseRuntimeConfig(
+  withDatabaseCaFallback(process.env, bundledDatabaseCa),
+);
 const authConfig = readAuthRuntimeConfig(process.env);
 
 export const trustedAppOrigin = authConfig.trustedOrigin;

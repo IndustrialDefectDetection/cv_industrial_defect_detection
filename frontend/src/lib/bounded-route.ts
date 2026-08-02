@@ -30,6 +30,28 @@ function ingressProblemResponse(): Response {
   );
 }
 
+function rebuildRequestWithHeaders(
+  request: Request,
+  headers: Headers,
+): Request {
+  const init: RequestInit & { duplex?: "half" } = {
+    headers,
+    method: request.method,
+    signal: request.signal,
+  };
+
+  if (
+    request.body !== null
+    && request.method !== "GET"
+    && request.method !== "HEAD"
+  ) {
+    init.body = request.body;
+    init.duplex = "half";
+  }
+
+  return new Request(request.url, init);
+}
+
 export function withTrustedAuthIngress(
   handler: RouteHandler,
   trustedProxySecret: string | null,
@@ -64,7 +86,7 @@ export function withTrustedAuthIngress(
     headers.delete(TRUSTED_AUTH_PROXY_SECRET_HEADER);
     headers.set(TRUSTED_AUTH_CLIENT_IP_HEADER, clientIp);
 
-    return handler(new Request(request, { headers }));
+    return handler(rebuildRequestWithHeaders(request, headers));
   };
 }
 
