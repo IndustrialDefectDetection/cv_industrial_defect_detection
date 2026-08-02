@@ -21,10 +21,13 @@ import queue
 import socket
 import subprocess
 import sys
+import secrets
 import threading
 import time
 import tkinter as tk
+import urllib.error
 import urllib.request
+import uuid
 import webbrowser
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -38,7 +41,11 @@ BURST_IMAGES = MLOPS_DIR / "data/demo_burst"
 
 INFERENCE_PORT = 8080
 BRIDGE_PORT = 8081
+AGENT_PORT = 8000
 DASHBOARD_PORT = 8502
+
+# The chat endpoint scopes a run to a caller; the launcher is one caller.
+CHAT_USER_ID = "local-demo-launcher"
 
 # Keep child consoles from flashing up; the whole point is to avoid terminals.
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -208,6 +215,12 @@ class DemoLauncher(tk.Tk):
         self.values = dict(launch.load_launch_env_file())
         self.values.update({k: v for k, v in os.environ.items() if k.startswith("MES_")})
 
+        # Chat is what a visitor sees; the control panel is behind a toggle.
+        self.view = "chat"
+        self.conversation_id = str(uuid.uuid4())
+        self.history: list[dict[str, str]] = []
+        self.chat_busy = False
+
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(120, self.drain_messages)
@@ -217,21 +230,278 @@ class DemoLauncher(tk.Tk):
     # -- layout ------------------------------------------------------------
 
     def _build(self):
-        header = ttk.Frame(self, padding=(14, 12, 14, 6))
+        switcher = ttk.Frame(self, padding=(14, 10, 14, 0))
+        switcher.pack(fill="x")
+        ttk.Label(
+            switcher, text="CV → MES Agentic Defect Detection",
+            font=("Segoe UI", 13, "bold"),
+        ).pack(side="left")
+        self.view_button = ttk.Button(
+            switcher, text="🛠  Developer mode", command=self.toggle_view,
+        )
+        self.view_button.pack(side="right")
+
+        self.chat_view = ttk.Frame(self)
+        self.dev_view = ttk.Frame(self)
+        self.chat_view.pack(fill="both", expand=True)
+
+        self._build_chat(self.chat_view)
+        self._build_dev(self.dev_view)
+
+        self.status = ttk.Label(
+            self, text="Ready.", relief="sunken", anchor="w", padding=(8, 4),
+        )
+        self.status.pack(fill="x", side="bottom")
+
+    def toggle_view(self):
+        if self.view == "chat":
+            self.chat_view.pack_forget()
+            self.dev_view.pack(fill="both", expand=True)
+            self.view = "dev"
+            self.view_button.configure(text="💬  Back to chat")
+        else:
+            self.dev_view.pack_forget()
+            self.chat_view.pack(fill="both", expand=True)
+            self.view = "chat"
+            self.view_button.configure(text="🛠  Developer mode")
+
+    # -- chat --------------------------------------------------------------
+
+    def _build_chat(self, root):
+        wrapper = ttk.Frame(root, padding=(14, 10, 14, 10))
+        wrapper.pack(fill="both", expand=True)
+        wrapper.rowconfigure(1, weight=1)
+        wrapper.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            wrapper,
+            text="Ask about the factory — defects, machines, work orders, "
+                 "downtime, quality history.",
+            foreground="#555",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        transcript_frame = ttk.Frame(wrapper)
+        transcript_frame.grid(row=1, column=0, sticky="nsew")
+        transcript_frame.rowconfigure(0, weight=1)
+        transcript_frame.columnconfigure(0, weight=1)
+
+        self.transcript = tk.Text(
+            transcript_frame, wrap="word", relief="flat", padx=14, pady=12,
+            background="#fbfbfd", font=("Segoe UI", 10), state="disabled",
+            spacing1=2, spacing3=6,
+        )
+        self.transcript.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Scrollbar(transcript_frame, command=self.transcript.yview)
+        bar.grid(row=0, column=1, sticky="ns")
+        self.transcript.configure(yscrollcommand=bar.set)
+
+        self.transcript.tag_configure(
+            "user", foreground="#0b4f9e", font=("Segoe UI", 10, "bold"),
+            spacing1=10)
+        self.transcript.tag_configure(
+            "assistant", foreground="#111", lmargin1=0, lmargin2=0)
+        self.transcript.tag_configure(
+            "system", foreground="#777", font=("Segoe UI", 9, "italic"),
+            spacing1=8)
+
+        composer = ttk.Frame(wrapper)
+        composer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        composer.columnconfigure(0, weight=1)
+
+        self.chat_entry = ttk.Entry(composer, font=("Segoe UI", 10))
+        self.chat_entry.grid(row=0, column=0, sticky="ew", ipady=5)
+        self.chat_entry.bind("<Return>", lambda _event: self.send_chat())
+
+        self.send_button = ttk.Button(
+            composer, text="Send", command=self.send_chat)
+        self.send_button.grid(row=0, column=1, padx=(8, 0))
+
+        self.assistant_button = ttk.Button(
+            composer, text="▶  Start the assistant",
+            command=self.start_assistant)
+        self.assistant_button.grid(row=0, column=2, padx=(8, 0))
+
+        self.say_chat(
+            "system",
+            "The assistant is not running yet. It answers by querying the "
+            "factory database through read-only tools, and each question "
+            "costs a little API credit.\n\n"
+            "Press “Start the assistant” to begin.\n\n"
+            "You can also open Developer mode (top right) to watch the "
+            "camera pipeline itself — the confidence gate, the batching and "
+            "the investigations as they run. That side is free.",
+        )
+
+    def say_chat(self, role: str, text: str):
+        def write():
+            self.transcript.configure(state="normal")
+            if role == "user":
+                self.transcript.insert("end", "You\n", "user")
+                self.transcript.insert("end", text + "\n", "assistant")
+            elif role == "assistant":
+                self.transcript.insert("end", "Assistant\n", "user")
+                self.transcript.insert("end", text + "\n", "assistant")
+            else:
+                self.transcript.insert("end", text + "\n", "system")
+            self.transcript.see("end")
+            self.transcript.configure(state="disabled")
+
+        if threading.current_thread() is threading.main_thread():
+            write()
+        else:
+            self.post(write)
+
+    def start_assistant(self):
+        if http_ok(f"http://127.0.0.1:{AGENT_PORT}/health"):
+            self.say_chat("system", "The assistant is already running.")
+            self.assistant_button.configure(state="disabled")
+            return
+        if len(self.values.get("ANTHROPIC_API_KEY", "").strip()) <= 10:
+            self.say_chat(
+                "system",
+                "No ANTHROPIC_API_KEY is set, so the assistant cannot start. "
+                "Add one to the .env file at the repository root.\n\n"
+                "Developer mode still works without a key.",
+            )
+            return
+
+        self.assistant_button.configure(state="disabled")
+        self.say_chat("system", "Starting the assistant… this takes a moment.")
+
+        parent = dict(self.values)
+        parent.update(os.environ)
+        parent.setdefault("MES_DB_BACKEND", "postgres")
+        if len(parent.get("MES_INTERNAL_API_TOKEN", "")) < 32:
+            parent["MES_INTERNAL_API_TOKEN"] = secrets.token_urlsafe(32)
+        self.values["MES_INTERNAL_API_TOKEN"] = parent["MES_INTERNAL_API_TOKEN"]
+
+        self.spawn(
+            "assistant", [sys.executable, "startup.py", "--api"],
+            BACKEND_DIR, launch.service_environment("backend", parent),
+        )
+
+        def wait():
+            for _ in range(90):
+                if http_ok(f"http://127.0.0.1:{AGENT_PORT}/health"):
+                    self.say_chat(
+                        "assistant",
+                        "Ready. Ask me about the factory — for example:\n"
+                        "  • Which machines had the most defects last month?\n"
+                        "  • What caused the Sensor Malfunction spike?\n"
+                        "  • Show me recent downtime on the motor line.",
+                    )
+                    self.post(lambda: self.stop_button.configure(state="normal"))
+                    return
+                time.sleep(2)
+            self.say_chat(
+                "system",
+                "The assistant did not come up. Open Developer mode and read "
+                "the activity log to see why.",
+            )
+            self.post(lambda: self.assistant_button.configure(state="normal"))
+
+        threading.Thread(target=wait, daemon=True).start()
+
+    def send_chat(self):
+        question = self.chat_entry.get().strip()
+        if not question or self.chat_busy:
+            return
+        if not http_ok(f"http://127.0.0.1:{AGENT_PORT}/health"):
+            self.say_chat(
+                "system",
+                "The assistant is not running. Press “Start the assistant”.",
+            )
+            return
+
+        self.chat_entry.delete(0, "end")
+        self.say_chat("user", question)
+        self.say_chat("system", "Thinking… this can take up to a couple of minutes.")
+        self.chat_busy = True
+        self.send_button.configure(state="disabled")
+
+        def work():
+            answer, failure = self.ask_backend(question)
+            if failure:
+                self.say_chat("system", failure)
+            else:
+                self.history.append({"role": "user", "content": question})
+                self.history.append({"role": "assistant", "content": answer})
+                del self.history[:-20]      # the endpoint bounds history too
+                self.say_chat("assistant", answer)
+
+            def done():
+                self.chat_busy = False
+                self.send_button.configure(state="normal")
+
+            self.post(done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def ask_backend(self, question: str) -> tuple[str, str | None]:
+        """POST /chat/ and read the NDJSON stream to its terminal event."""
+        token = self.values.get("MES_INTERNAL_API_TOKEN", "")
+        if len(token) < 32:
+            return "", "No internal service token available; restart the launcher."
+        body = json.dumps({
+            "conversation_id": self.conversation_id,
+            "user_input": question,
+            "history": self.history,
+        }).encode()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{AGENT_PORT}/chat/",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-MES-Internal-Token": token,
+                "X-MES-User-ID": CHAT_USER_ID,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=900) as response:
+                for raw in response:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    kind = event.get("type")
+                    if kind in ("started", "heartbeat"):
+                        continue
+                    data = event.get("data") or {}
+                    if data.get("analysis"):
+                        return data["analysis"], None
+                    if data.get("status") == "cancelled":
+                        return "", "That run was cancelled."
+                    return "", f"The assistant returned no answer ({data or kind})."
+            return "", "The assistant closed the connection without answering."
+        except urllib.error.HTTPError as error:
+            detail = {
+                429: "The hourly limit on paid runs was reached. This is a "
+                     "deliberate spending guard - try again later.",
+                409: "Another run is already in progress; only one runs at a time.",
+                503: "The assistant is not ready (check its API key and database).",
+            }.get(error.code, f"The assistant refused the request (HTTP {error.code}).")
+            return "", detail
+        except Exception as error:
+            return "", f"Could not reach the assistant: {error}"
+
+    # -- developer mode ----------------------------------------------------
+
+    def _build_dev(self, root):
+        header = ttk.Frame(root, padding=(14, 8, 14, 6))
         header.pack(fill="x")
         ttk.Label(
             header,
-            text="CV → MES Agentic Defect Detection",
-            font=("Segoe UI", 16, "bold"),
+            text="Developer mode",
+            font=("Segoe UI", 14, "bold"),
         ).pack(anchor="w")
         ttk.Label(
             header,
-            text="A YOLOv8 camera feeds a synthetic factory MES; Claude agents "
-                 "investigate each defect burst and write a root-cause report.",
+            text="The camera pipeline itself: the confidence gate, the 30-second "
+                 "batch window, and each investigation as it runs.",
             foreground="#555",
         ).pack(anchor="w")
 
-        body = ttk.Frame(self, padding=(14, 0, 14, 10))
+        body = ttk.Frame(root, padding=(14, 0, 14, 10))
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=0, minsize=330)
         body.columnconfigure(1, weight=1)
@@ -352,11 +622,6 @@ class DemoLauncher(tk.Tk):
         scroll.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scroll.set, state="disabled")
 
-        self.status = ttk.Label(
-            self, text="Ready.", relief="sunken", anchor="w", padding=(8, 4),
-        )
-        self.status.pack(fill="x", side="bottom")
-
     # -- plumbing ----------------------------------------------------------
 
     def say(self, text: str):
@@ -470,7 +735,6 @@ class DemoLauncher(tk.Tk):
         parent.update(os.environ)
         parent.setdefault("MES_DB_BACKEND", "postgres")
         if len(parent.get("MES_INTERNAL_API_TOKEN", "")) < 32:
-            import secrets
             parent["MES_INTERNAL_API_TOKEN"] = secrets.token_urlsafe(32)
 
         self.free_button.configure(state="disabled")

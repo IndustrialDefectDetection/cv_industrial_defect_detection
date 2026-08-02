@@ -163,19 +163,27 @@ with only the model call stubbed out. Start there.
 
 ### The short way: double-click `Start Demo.bat`
 
-No terminal required. A small launcher (`demo.py`, tkinter, standard library
-only) opens with:
+No terminal required. A launcher (`demo.py`, tkinter, standard library only)
+opens on a **chat interface** — ask about defects, machines, work orders,
+downtime or quality history and the agents answer by querying the MES through
+read-only tools. It says up front that answers cost API credit, and points at
+the free half.
 
-- a preflight panel that checks the database, the weights, the virtualenvs and
-  the `.env` **before** anything starts, and reports every problem at once
-  rather than one per restart;
+That free half is **Developer mode**, one button away in the top right, and it
+is where the pipeline itself is visible:
+
+- a preflight panel checking the database, the weights, the virtualenvs and the
+  `.env` **before** anything starts, reporting every problem at once rather than
+  one per restart;
 - **Free demo** and **Full demo** buttons, the paid one behind a confirmation;
 - a **Fire a camera burst** button;
-- a live table of investigations, so you watch an alert move to `done` without
+- a live table of investigations, so you watch an alert reach `done` without
   opening a database client;
 - **Stop everything**, which also clears any port a crashed run left held.
 
 Everything below still works exactly as it did — the launcher only drives it.
+The Next.js chat app on port 3000 is a separate, richer frontend; this one
+exists so the project demos with no `npm` and no browser.
 
 ### Setup, once
 
