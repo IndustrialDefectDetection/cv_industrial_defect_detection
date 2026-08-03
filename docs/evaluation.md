@@ -131,12 +131,34 @@ built on a correlation with a mundane technical explanation the agent had no way
 to know about. The fix is not a better prompt but better evidence: the agent
 should be told which latency samples are cold-start.
 
+**Done, 2026-08-02.** The evidence got better in two places rather than one.
+The inference API now runs a throwaway prediction at startup, so the artifact
+mostly stops existing — the first real request went from 2,861 ms to 71 ms.
+For data already stored, and for a restart under load, `get_recent_detections`
+returns an `inference_latency` block that separates steady state from cold
+starts. It deliberately does **not** dismiss all slow samples: if the slowness
+is widespread rather than one or two images against a healthy baseline, the
+tool says so and tells the agent to report it. A guard that suppressed real
+faults would be worse than the bug.
+
+The same run surfaced a second instance of the same underlying error. The agent
+searched for a defect type called `camera` — no such type exists — and turned
+the empty result into two root causes: an "integration failure" and a
+"nomenclature mismatch" between `VisionDetections` and `Defects`. Those tables
+are separate by design; nothing writes one into the other. Both prompt blocks
+now state that a failed lookup belongs in Gaps and never in Root Causes, and
+that two tables disagreeing is only a finding if they were meant to agree.
+
+Generalising: in all three cases the numbers were right and the inference was
+wrong, and twice the agent read **absence of evidence as evidence of a fault**.
+
 ## What is left
 
 1. Run the remaining defect types (`Battery Cell Variance`, `Motor Coil
    Problem`) and report all three against `localised_the_incident`.
-2. Feed the agent a cold-start marker so warm-up latency stops reading as a
-   process anomaly.
+2. Re-run a paid investigation to confirm the new prompt rules hold in
+   practice. The fixes are verified by unit-level checks and by the latency
+   measurement above, but no live multi-agent run has been scored since.
 
 ## Reproducing
 

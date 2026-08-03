@@ -275,7 +275,20 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def load_model() -> None:
-    """Load YOLOv8 model on startup."""
+    """Load YOLOv8 model on startup, then run one throwaway inference.
+
+    `YOLO(path)` only reads the weights. Ultralytics defers the rest of its
+    setup to the first `predict` call, so that call took 1.2-2.9 seconds while
+    every later one took 40-60 ms. That number is reported to the bridge as
+    `inference_time_ms` and stored per detection, and the agent twice read the
+    resulting outlier as evidence of a failing camera and wrote it into a
+    root-cause report as a HIGH-certainty finding.
+
+    Warming the model here costs about a second of startup and means no
+    request a caller makes is ever the first one. A failure to warm is logged
+    but not fatal: the model is loaded and serving a slow first request beats
+    refusing to start.
+    """
     global model
     try:
         verified_model_path = verify_model_integrity(MODEL_PATH)
@@ -284,6 +297,24 @@ async def load_model() -> None:
     except Exception:
         LOGGER.exception("Failed to load the inference model")
         raise
+
+    try:
+        blank = Image.new("RGB", (640, 640))
+        started = time.monotonic()
+        await asyncio.to_thread(
+            lambda: model.predict(source=blank, save=False, verbose=False)
+        )
+        LOGGER.info(
+            "Inference model warmed in %.0f ms; first real request will not "
+            "carry the cold-start cost",
+            (time.monotonic() - started) * 1000,
+        )
+    except Exception:
+        LOGGER.warning(
+            "Model warm-up failed; the first request will be slow and its "
+            "inference_time_ms should not be read as a process anomaly",
+            exc_info=True,
+        )
 
 
 @app.get("/", include_in_schema=False)

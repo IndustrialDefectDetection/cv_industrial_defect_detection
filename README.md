@@ -108,7 +108,7 @@ PostgreSQL on localhost. Not estimates.
 
 | Stage | Time |
 |---|---|
-| YOLO inference, warm | **~50 ms** per image (first request 1.3 s, model warm-up) |
+| YOLO inference | **~50 ms** per image, including the first — the API runs a throwaway prediction at startup, which cut the first real request from 2,861 ms to 71 ms |
 | Detection → stored in PostgreSQL | under 1 s |
 | `analyze_batch()` → returns AlertID | **under 1 s** (contract requires it) |
 | Batch window | 30 s, fixed |
@@ -141,11 +141,25 @@ because it contains two failures and one of them is mine:
   value scored "correct" without reasoning. Replaced with a composite that
   parroting cannot pass: name the cause **and** the affected machines **and** a
   date inside the injected window.
-- **A genuine agent failure, kept.** In a camera-burst investigation the agent
-  ranked "Vision System Processing Anomaly" as HIGH certainty on the strength of
-  a 1,200 ms inference time against a 41–45 ms baseline. Every number it cited
-  was true; the conclusion was wrong. That was model warm-up on the first
-  request.
+- **Two genuine agent failures, kept.** In a camera-burst investigation the
+  agent ranked "Vision System Processing Anomaly" HIGH certainty on the strength
+  of a 1,200 ms inference time against a 41–45 ms baseline — model warm-up on
+  the first request. It recurred at 2,861 ms. Separately, it invented a defect
+  type called `camera`, found no records of it, and reported both an
+  "integration failure" and a "nomenclature mismatch" between `VisionDetections`
+  and `Defects` — two tables that are separate by design, with nothing writing
+  one into the other. Every number in both reports was true; both conclusions
+  were wrong.
+
+  The shared shape is worth naming: **the agent treated "I could not find it" as
+  "it is broken."** Two of three root causes in the second report were artifacts
+  of its own failed lookup. The fixes attack it at three levels — remove the
+  artifact (warm the model at startup), label the data (`get_recent_detections`
+  separates steady-state latency from cold starts, while still calling
+  widespread slowness a real finding), and forbid the inference (both prompt
+  blocks now state that a failed lookup belongs in Gaps, never in Root Causes,
+  and that two tables disagreeing is only a finding if they were meant to
+  agree).
 
 Re-scoring a report already paid for is free, so the scorer is separable from
 the run:
